@@ -404,6 +404,41 @@ TEST(ProcNetSnmp, UdpIn_NoRandomSave) {
   EXPECT_EQ(oldInDatagrams, newInDatagrams - 1);
 }
 
+// Reads the file contents of `path` into `content`.
+// We use direct posix file io here as we want to allow this code to
+// execute before google init is done.
+std::string ReadFile(const std::string& path, std::string* content) {
+  content->clear();
+  int fd = open(path.c_str(), O_RDONLY);
+  if (fd < 0) {
+    return "open error";
+  }
+  for (;;) {
+    char buffer[4096];
+    ssize_t n = read(fd, buffer, sizeof(buffer));
+    if (n > 0) {
+      content->append(buffer, n);
+    } else if (n == 0) {
+      close(fd);
+      return "OK";
+    } else if (errno != EINTR) {
+      close(fd);
+      return "read error";
+    }
+  }
+}
+
+// Repro for b/155123175.
+TEST(ProcNetSnmp, Stat) {
+  std::string contents;
+  std::string s = ReadFile("/proc/net/snmp", &contents);
+  ASSERT_THAT(s, ::testing::Eq("OK"));
+  std::cout << "----------------------\n"
+            << contents << "\n----------------------\n";
+  struct stat st = {};
+  ASSERT_THAT(stat("/proc/net/snmp", &st), SyscallSucceeds());
+}
+
 }  // namespace
 }  // namespace testing
 }  // namespace gvisor
