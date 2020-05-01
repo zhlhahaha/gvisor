@@ -404,6 +404,12 @@ TEST(ProcNetSnmp, UdpIn_NoRandomSave) {
   EXPECT_EQ(oldInDatagrams, newInDatagrams - 1);
 }
 
+// Repro for b/155123175.
+TEST(ProcNetSnmp, Stat) {
+  struct stat st = {};
+  ASSERT_THAT(stat("/proc/net/snmp", &st), SyscallSucceeds());
+}
+
 }  // namespace
 }  // namespace testing
 }  // namespace gvisor
