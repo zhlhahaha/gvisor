@@ -48,6 +48,7 @@ go_library(
         "//pkg/abi/linux",
         "//pkg/context",
         "//pkg/fd",
+        "//pkg/fdnotifier",
         "//pkg/fspath",
         "//pkg/log",
         "//pkg/p9",
@@ -72,6 +73,7 @@ go_library(
         "//pkg/unet",
         "//pkg/usermem",
         "//pkg/waiter",
+        "@org_golang_x_sys//unix:go_default_library",
     ],
 )
 

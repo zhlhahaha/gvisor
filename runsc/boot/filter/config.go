@@ -227,6 +227,7 @@ var allowedSyscalls = seccomp.SyscallRules{
 	syscall.SYS_MPROTECT:  {},
 	syscall.SYS_MUNMAP:    {},
 	syscall.SYS_NANOSLEEP: {},
+	syscall.SYS_PIPE:      {},
 	syscall.SYS_PPOLL:     {},
 	syscall.SYS_PREAD64:   {},
 	syscall.SYS_PREADV:    {},
@@ -286,6 +287,14 @@ var allowedSyscalls = seccomp.SyscallRules{
 	syscall.SYS_SIGALTSTACK:     {},
 	unix.SYS_STATX:              {},
 	syscall.SYS_SYNC_FILE_RANGE: {},
+	syscall.SYS_TEE: []seccomp.Rule{
+		{
+			seccomp.AllowAny{},
+			seccomp.AllowAny{},
+			seccomp.AllowValue(1),                      /* len */
+			seccomp.AllowValue(unix.SPLICE_F_NONBLOCK), /* flags */
+		},
+	},
 	syscall.SYS_TGKILL: []seccomp.Rule{
 		{
 			seccomp.AllowValue(uint64(os.Getpid())),

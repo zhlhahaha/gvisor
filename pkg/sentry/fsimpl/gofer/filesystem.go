@@ -16,11 +16,15 @@ package gofer
 
 import (
 	"sync"
+	"time"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/p9"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/host"
+	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/pipe"
 	"gvisor.dev/gvisor/pkg/sentry/socket/unix/transport"
@@ -835,6 +839,9 @@ func (d *dentry) openLocked(ctx context.Context, rp *vfs.ResolvingPath, opts *vf
 		if d.isSynthetic() {
 			return nil, syserror.ENXIO
 		}
+		if d.fs.iopts.OpenSocketsByConnecting {
+			return d.connectSocketLocked(ctx, opts)
+		}
 	case linux.S_IFIFO:
 		if d.isSynthetic() {
 			return d.pipe.Open(ctx, mnt, &d.vfsd, opts.Flags)
@@ -843,25 +850,113 @@ func (d *dentry) openLocked(ctx context.Context, rp *vfs.ResolvingPath, opts *vf
 	return d.openSpecialFileLocked(ctx, mnt, opts)
 }
 
-func (d *dentry) openSpecialFileLocked(ctx context.Context, mnt *vfs.Mount, opts *vfs.OpenOptions) (*vfs.FileDescription, error) {
-	ats := vfs.AccessTypesForOpenFlags(opts)
-	// Treat as a special file. This is done for non-synthetic pipes as well as
-	// regular files when d.fs.opts.regularFilesUseSpecialFileFD is true.
+func (d *dentry) connectSocketLocked(ctx context.Context, opts *vfs.OpenOptions) (*vfs.FileDescription, error) {
 	if opts.Flags&linux.O_DIRECT != 0 {
 		return nil, syserror.EINVAL
 	}
-	h, err := openHandle(ctx, d.file, ats&vfs.MayRead != 0, ats&vfs.MayWrite != 0, opts.Flags&linux.O_TRUNC != 0)
+	fdObj, err := d.file.connect(ctx, p9.AnonymousSocket)
 	if err != nil {
 		return nil, err
 	}
-	fd := &specialFileFD{
-		handle: h,
+	fd, err := host.NewFD(ctx, kernel.KernelFromContext(ctx).HostMount(), fdObj.FD(), &host.NewFDOptions{
+		HaveFlags: true,
+		Flags:     opts.Flags,
+	})
+	if err != nil {
+		fdObj.Close()
+		return nil, err
 	}
-	if err := fd.vfsfd.Init(fd, opts.Flags, mnt, &d.vfsd, &vfs.FileDescriptionOptions{}); err != nil {
+	fdObj.Release()
+	return fd, nil
+}
+
+func (d *dentry) openSpecialFileLocked(ctx context.Context, mnt *vfs.Mount, opts *vfs.OpenOptions) (*vfs.FileDescription, error) {
+	ats := vfs.AccessTypesForOpenFlags(opts)
+	if opts.Flags&linux.O_DIRECT != 0 {
+		return nil, syserror.EINVAL
+	}
+	// We assume that the server silently inserts O_NONBLOCK in the open flags
+	// for all named pipes (because all existing gofers do this).
+	//
+	// NOTE(b/133875563): This makes named pipe opens racy, because the
+	// mechanisms for translating nonblocking to blocking opens can only detect
+	// the instantaneous presence of a peer holding the other end of the pipe
+	// open, not whether the pipe was *previously* opened by a peer that has
+	// since closed its end.
+	isBlockingOpenOfNamedPipe := d.fileType() == linux.S_IFIFO && opts.Flags&linux.O_NONBLOCK == 0
+retry:
+	h, err := openHandle(ctx, d.file, ats.MayRead(), ats.MayWrite(), opts.Flags&linux.O_TRUNC != 0)
+	if err != nil {
+		if isBlockingOpenOfNamedPipe && ats == vfs.MayWrite && err == syserror.ENXIO {
+			// An attempt to open a named pipe with O_WRONLY|O_NONBLOCK fails
+			// with ENXIO if opening the same named pipe with O_WRONLY would
+			// block because there are no readers of the pipe.
+			if err := sleepBetweenNamedPipeOpenChecks(ctx); err != nil {
+				return nil, err
+			}
+			goto retry
+		}
+		return nil, err
+	}
+	if isBlockingOpenOfNamedPipe && ats == vfs.MayRead && h.fd >= 0 {
+		if err := blockUntilNonblockingPipeHasWriter(ctx, h.fd); err != nil {
+			h.close(ctx)
+			return nil, err
+		}
+	}
+	fd, err := newSpecialFileFD(h, mnt, d, opts.Flags)
+	if err != nil {
 		h.close(ctx)
 		return nil, err
 	}
 	return &fd.vfsfd, nil
+}
+
+func blockUntilNonblockingPipeHasWriter(ctx context.Context, fd int32) error {
+	// Create a temporary pipe.
+	var pipeFDs [2]int
+	if err := unix.Pipe(pipeFDs[:]); err != nil {
+		return err
+	}
+	defer func() {
+		unix.Close(pipeFDs[0])
+		unix.Close(pipeFDs[1])
+	}()
+
+	for {
+		// Copy 1 byte from fd into the temporary pipe.
+		n, err := unix.Tee(int(fd), pipeFDs[1], 1, unix.SPLICE_F_NONBLOCK)
+		if err == syserror.EAGAIN {
+			// The pipe represented by fd is empty, but has a writer, so we're
+			// done.
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if n != 0 {
+			// The pipe represented by fd is non-empty, so it either has, or
+			// has previously had, a writer.
+			return nil
+		}
+		if err := sleepBetweenNamedPipeOpenChecks(ctx); err != nil {
+			return err
+		}
+	}
+}
+
+func sleepBetweenNamedPipeOpenChecks(ctx context.Context) error {
+	cancel := ctx.SleepStart()
+	t := time.NewTimer(100 * time.Millisecond)
+	defer t.Stop()
+	select {
+	case <-cancel:
+		ctx.SleepFinish(false)
+		return syserror.ErrInterrupted
+	case <-t.C:
+		ctx.SleepFinish(true)
+		return nil
+	}
 }
 
 // Preconditions: d.fs.renameMu must be locked. d.dirMu must be locked.
@@ -888,7 +983,11 @@ func (d *dentry) createAndOpenChildLocked(ctx context.Context, rp *vfs.Resolving
 	}
 	creds := rp.Credentials()
 	name := rp.Component()
-	fdobj, openFile, createQID, _, err := dirfile.create(ctx, name, (p9.OpenFlags)(opts.Flags), (p9.FileMode)(opts.Mode), (p9.UID)(creds.EffectiveKUID), (p9.GID)(creds.EffectiveKGID))
+	// Filter file creation flags and O_LARGEFILE out; the create RPC already
+	// has the semantics of O_CREAT|O_EXCL, while some servers will choke on
+	// O_LARGEFILE.
+	createFlags := p9.OpenFlags(opts.Flags &^ (linux.O_CREAT | linux.O_EXCL | linux.O_TRUNC | linux.O_LARGEFILE))
+	fdobj, openFile, createQID, _, err := dirfile.create(ctx, name, createFlags, (p9.FileMode)(opts.Mode), (p9.UID)(creds.EffectiveKUID), (p9.GID)(creds.EffectiveKGID))
 	if err != nil {
 		dirfile.close(ctx)
 		return nil, err
@@ -896,24 +995,13 @@ func (d *dentry) createAndOpenChildLocked(ctx context.Context, rp *vfs.Resolving
 	// Then we need to walk to the file we just created to get a non-open fid
 	// representing it, and to get its metadata. This must use d.file since, as
 	// explained above, dirfile was invalidated by dirfile.Create().
-	walkQID, nonOpenFile, attrMask, attr, err := d.file.walkGetAttrOne(ctx, name)
+	_, nonOpenFile, attrMask, attr, err := d.file.walkGetAttrOne(ctx, name)
 	if err != nil {
 		openFile.close(ctx)
 		if fdobj != nil {
 			fdobj.Close()
 		}
 		return nil, err
-	}
-	// Sanity-check that we walked to the file we created.
-	if createQID.Path != walkQID.Path {
-		// Probably due to concurrent remote filesystem mutation?
-		ctx.Warningf("gofer.dentry.createAndOpenChildLocked: created file has QID %v before walk, QID %v after (interop=%v)", createQID, walkQID, d.fs.opts.interop)
-		nonOpenFile.close(ctx)
-		openFile.close(ctx)
-		if fdobj != nil {
-			fdobj.Close()
-		}
-		return nil, syserror.EAGAIN
 	}
 
 	// Construct the new dentry.
@@ -960,17 +1048,16 @@ func (d *dentry) createAndOpenChildLocked(ctx context.Context, rp *vfs.Resolving
 		}
 		childVFSFD = &fd.vfsfd
 	} else {
-		fd := &specialFileFD{
-			handle: handle{
-				file: openFile,
-				fd:   -1,
-			},
+		h := handle{
+			file: openFile,
+			fd:   -1,
 		}
 		if fdobj != nil {
-			fd.handle.fd = int32(fdobj.Release())
+			h.fd = int32(fdobj.Release())
 		}
-		if err := fd.vfsfd.Init(fd, opts.Flags, mnt, &child.vfsd, &vfs.FileDescriptionOptions{}); err != nil {
-			fd.handle.close(ctx)
+		fd, err := newSpecialFileFD(h, mnt, child, opts.Flags)
+		if err != nil {
+			h.close(ctx)
 			return nil, err
 		}
 		childVFSFD = &fd.vfsfd
