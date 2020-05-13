@@ -22,6 +22,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/unimpl"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
+	"gvisor.dev/gvisor/pkg/sentry/vfs/lock"
 	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/pkg/waiter"
@@ -35,6 +36,8 @@ type masterInode struct {
 	kernfs.InodeNoopRefCount
 	kernfs.InodeNotDirectory
 	kernfs.InodeNotSymlink
+
+	locks lock.FileLocks
 
 	// Keep a reference to this inode's dentry.
 	dentry kernfs.Dentry
@@ -57,6 +60,7 @@ func (mi *masterInode) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vf
 		inode: mi,
 		t:     t,
 	}
+	fd.LockFD.Init(&mi.locks)
 	if err := fd.vfsfd.Init(fd, opts.Flags, rp.Mount(), vfsd, &vfs.FileDescriptionOptions{}); err != nil {
 		mi.DecRef()
 		return nil, err
@@ -87,6 +91,7 @@ func (mi *masterInode) SetStat(ctx context.Context, vfsfs *vfs.Filesystem, creds
 type masterFileDescription struct {
 	vfsfd vfs.FileDescription
 	vfs.FileDescriptionDefaultImpl
+	vfs.LockFD
 
 	inode *masterInode
 	t     *Terminal
