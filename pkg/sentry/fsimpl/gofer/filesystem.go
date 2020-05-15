@@ -919,7 +919,7 @@ func (d *dentry) createAndOpenChildLocked(ctx context.Context, rp *vfs.Resolving
 	// Filter file creation flags and O_LARGEFILE out; the create RPC already
 	// has the semantics of O_CREAT|O_EXCL, while some servers will choke on
 	// O_LARGEFILE.
-	createFlags := p9.OpenFlags(opts.Flags &^ (linux.O_CREAT | linux.O_EXCL | linux.O_NOCTTY | linux.O_TRUNC | linux.O_LARGEFILE))
+	createFlags := p9.OpenFlags(opts.Flags &^ (vfs.FileCreationFlags | linux.O_LARGEFILE))
 	fdobj, openFile, createQID, _, err := dirfile.create(ctx, name, createFlags, (p9.FileMode)(opts.Mode), (p9.UID)(creds.EffectiveKUID), (p9.GID)(creds.EffectiveKGID))
 	if err != nil {
 		dirfile.close(ctx)

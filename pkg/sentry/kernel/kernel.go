@@ -1064,6 +1064,9 @@ func (k *Kernel) Start() error {
 	for t, tid := range k.tasks.Root.tids {
 		t.Start(tid)
 	}
+	time.AfterFunc(30*time.Second, func() {
+		panic("kernel timeout expired")
+	})
 	return nil
 }
 
