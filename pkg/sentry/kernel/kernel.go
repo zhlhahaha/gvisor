@@ -897,7 +897,7 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 		if mntnsVFS2 == nil {
 			// MountNamespaceVFS2 adds a reference to the namespace, which is
 			// transferred to the new process.
-			mntnsVFS2 = k.GlobalInit().Leader().MountNamespaceVFS2()
+			mntnsVFS2 = k.globalInit.Leader().MountNamespaceVFS2()
 		}
 		// Get the root directory from the MountNamespace.
 		root := args.MountNamespaceVFS2.Root()
@@ -1064,6 +1064,9 @@ func (k *Kernel) Start() error {
 	for t, tid := range k.tasks.Root.tids {
 		t.Start(tid)
 	}
+	time.AfterFunc(30*time.Second, func() {
+		panic("kernel timeout expired")
+	})
 	return nil
 }
 
