@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package tcp_should_piggyback_test
+package tcp_send_window_segment_size_test
 
 import (
 	"flag"
@@ -28,7 +28,10 @@ func init() {
 	tb.RegisterFlags(flag.CommandLine)
 }
 
-func TestPiggyback(t *testing.T) {
+// TestSendWindowSegmentSizes does sanity checking of segment transmissions
+// when the advertized receive window by the remote is close to the segment
+// size.
+func TestSendWindowSegmentSizes(t *testing.T) {
 	dut := tb.NewDUT(t)
 	defer dut.TearDown()
 	listenFd, remotePort := dut.CreateListener(unix.SOCK_STREAM, unix.IPPROTO_TCP, 1)
@@ -37,7 +40,7 @@ func TestPiggyback(t *testing.T) {
 	sampleData := []byte("Sample Data")
 	payloadSize := uint16(len(sampleData))
 
-	conn := tb.NewTCPIPv4(t, tb.TCP{DstPort: &remotePort, WindowSize: tb.Uint16(payloadSize + 1)}, tb.TCP{SrcPort: &remotePort})
+	conn := tb.NewTCPIPv4(t, tb.TCP{DstPort: &remotePort, WindowSize: tb.Uint16(payloadSize)}, tb.TCP{SrcPort: &remotePort})
 	defer conn.Close()
 
 	conn.Handshake()
@@ -46,6 +49,7 @@ func TestPiggyback(t *testing.T) {
 
 	dut.SetSockOptInt(acceptFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
 
+	// Check if the segment that exactly fits in the receiver window.
 	dut.Send(acceptFd, sampleData, 0)
 	expectedTCP := tb.TCP{Flags: tb.Uint8(header.TCPFlagAck | header.TCPFlagPsh)}
 	expectedPayload := tb.Payload{Bytes: sampleData}
@@ -53,13 +57,23 @@ func TestPiggyback(t *testing.T) {
 		t.Fatalf("Expected %v but didn't get one: %s", tb.Layers{&expectedTCP, &expectedPayload}, err)
 	}
 
-	// Cause DUT to send us more data as soon as we ACK their first data segment because we have
-	// a small window.
+	// Check if the segment size is less than advertized receive window.
+	conn.Send(tb.TCP{Flags: tb.Uint8(header.TCPFlagAck), WindowSize: tb.Uint16(payloadSize - 1)})
 	dut.Send(acceptFd, sampleData, 0)
+	expectedPayload = tb.Payload{Bytes: sampleData[:(payloadSize - 1)]}
+	if _, err := conn.ExpectData(&expectedTCP, &expectedPayload, time.Second); err != nil {
+		t.Fatalf("Expected %v but didn't get one: %s", tb.Layers{&expectedTCP, &expectedPayload}, err)
+	}
+	conn.Send(tb.TCP{Flags: tb.Uint8(header.TCPFlagAck)})
+	expectedPayload = tb.Payload{Bytes: sampleData[(payloadSize - 1):]}
+	if _, err := conn.ExpectData(&expectedTCP, &expectedPayload, time.Second); err != nil {
+		t.Fatalf("Expected %v but didn't get one: %s", tb.Layers{&expectedTCP, &expectedPayload}, err)
+	}
 
-	// DUT should ACK our segment by piggybacking ACK to their outstanding data segment instead of
-	// sending a separate ACK packet.
-	conn.Send(expectedTCP, &expectedPayload)
+	// Check if the segment size is greater than advertized receive window.
+	conn.Send(tb.TCP{Flags: tb.Uint8(header.TCPFlagAck), WindowSize: tb.Uint16(payloadSize + 1)})
+	dut.Send(acceptFd, sampleData, 0)
+	expectedPayload = tb.Payload{Bytes: sampleData}
 	if _, err := conn.ExpectData(&expectedTCP, &expectedPayload, time.Second); err != nil {
 		t.Fatalf("Expected %v but didn't get one: %s", tb.Layers{&expectedTCP, &expectedPayload}, err)
 	}
