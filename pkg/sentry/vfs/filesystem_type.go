@@ -33,6 +33,9 @@ type FilesystemType interface {
 
 	// Name returns the name of this FilesystemType.
 	Name() string
+
+	// Release releases all resources held by this FilesystemType.
+	Release(ctx context.Context)
 }
 
 // GetFilesystemOptions contains options to FilesystemType.GetFilesystem.
@@ -55,6 +58,8 @@ type registeredFilesystemType struct {
 
 // RegisterFilesystemTypeOptions contains options to
 // VirtualFilesystem.RegisterFilesystem().
+//
+// +stateify savable
 type RegisterFilesystemTypeOptions struct {
 	// AllowUserMount determines whether users are allowed to mount a file system
 	// of this type, i.e. through mount(2). If AllowUserMount is true, allow calls

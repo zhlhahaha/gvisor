@@ -170,6 +170,7 @@ func (c *containerMounter) mountAll(conf *config.Config, procArgs *kernel.Create
 	rootProcArgs.MountNamespaceVFS2 = mns
 
 	root := mns.Root()
+	root.IncRef()
 	defer root.DecRef(rootCtx)
 	if root.Mount().ReadOnly() {
 		// Switch to ReadWrite while we setup submounts.
@@ -263,10 +264,38 @@ func (c *containerMounter) configureOverlay(ctx context.Context, creds *auth.Cre
 	}
 	cu.Add(func() { lower.DecRef(ctx) })
 
+	// Propagate the lower layer's root's owner, group, and mode to the upper
+	// layer's root for consistency with VFS1.
+	upperRootVD := vfs.MakeVirtualDentry(upper, upper.Root())
+	lowerRootVD := vfs.MakeVirtualDentry(lower, lower.Root())
+	stat, err := c.k.VFS().StatAt(ctx, creds, &vfs.PathOperation{
+		Root:  lowerRootVD,
+		Start: lowerRootVD,
+	}, &vfs.StatOptions{
+		Mask: linux.STATX_UID | linux.STATX_GID | linux.STATX_MODE,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	err = c.k.VFS().SetStatAt(ctx, creds, &vfs.PathOperation{
+		Root:  upperRootVD,
+		Start: upperRootVD,
+	}, &vfs.SetStatOptions{
+		Stat: linux.Statx{
+			Mask: (linux.STATX_UID | linux.STATX_GID | linux.STATX_MODE) & stat.Mask,
+			UID:  stat.UID,
+			GID:  stat.GID,
+			Mode: stat.Mode,
+		},
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+
 	// Configure overlay with both layers.
 	overlayOpts.GetFilesystemOptions.InternalData = overlay.FilesystemOptions{
-		UpperRoot:  vfs.MakeVirtualDentry(upper, upper.Root()),
-		LowerRoots: []vfs.VirtualDentry{vfs.MakeVirtualDentry(lower, lower.Root())},
+		UpperRoot:  upperRootVD,
+		LowerRoots: []vfs.VirtualDentry{lowerRootVD},
 	}
 	return &overlayOpts, cu.Release(), nil
 }
@@ -377,6 +406,7 @@ func (c *containerMounter) mountSubmountVFS2(ctx context.Context, conf *config.C
 	}
 
 	root := mns.Root()
+	root.IncRef()
 	defer root.DecRef(ctx)
 	target := &vfs.PathOperation{
 		Root:  root,
@@ -474,6 +504,7 @@ func (c *containerMounter) mountTmpVFS2(ctx context.Context, conf *config.Config
 	}
 
 	root := mns.Root()
+	root.IncRef()
 	defer root.DecRef(ctx)
 	pop := vfs.PathOperation{
 		Root:  root,
@@ -597,6 +628,7 @@ func (c *containerMounter) mountSharedSubmountVFS2(ctx context.Context, conf *co
 	defer newMnt.DecRef(ctx)
 
 	root := mns.Root()
+	root.IncRef()
 	defer root.DecRef(ctx)
 	target := &vfs.PathOperation{
 		Root:  root,
@@ -617,6 +649,7 @@ func (c *containerMounter) mountSharedSubmountVFS2(ctx context.Context, conf *co
 
 func (c *containerMounter) makeMountPoint(ctx context.Context, creds *auth.Credentials, mns *vfs.MountNamespace, dest string) error {
 	root := mns.Root()
+	root.IncRef()
 	defer root.DecRef(ctx)
 	target := &vfs.PathOperation{
 		Root:  root,

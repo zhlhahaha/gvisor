@@ -34,13 +34,15 @@ const Name = "proc"
 // +stateify savable
 type FilesystemType struct{}
 
-var _ vfs.FilesystemType = (*FilesystemType)(nil)
-
 // Name implements vfs.FilesystemType.Name.
 func (FilesystemType) Name() string {
 	return Name
 }
 
+// Release implements vfs.FilesystemType.Release.
+func (FilesystemType) Release(ctx context.Context) {}
+
+// +stateify savable
 type filesystem struct {
 	kernfs.Filesystem
 
@@ -72,7 +74,9 @@ func (ft FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.VirtualF
 		cgroups = data.Cgroups
 	}
 
-	_, dentry := procfs.newTasksInode(k, pidns, cgroups)
+	inode := procfs.newTasksInode(k, pidns, cgroups)
+	var dentry kernfs.Dentry
+	dentry.Init(&procfs.Filesystem, inode)
 	return procfs.VFSFilesystem(), dentry.VFSDentry(), nil
 }
 
@@ -84,6 +88,8 @@ func (fs *filesystem) Release(ctx context.Context) {
 
 // dynamicInode is an overfitted interface for common Inodes with
 // dynamicByteSource types used in procfs.
+//
+// +stateify savable
 type dynamicInode interface {
 	kernfs.Inode
 	vfs.DynamicBytesSource
@@ -91,14 +97,12 @@ type dynamicInode interface {
 	Init(creds *auth.Credentials, devMajor, devMinor uint32, ino uint64, data vfs.DynamicBytesSource, perm linux.FileMode)
 }
 
-func (fs *filesystem) newDentry(creds *auth.Credentials, ino uint64, perm linux.FileMode, inode dynamicInode) *kernfs.Dentry {
-	inode.Init(creds, linux.UNNAMED_MAJOR, fs.devMinor, ino, inode, perm)
-
-	d := &kernfs.Dentry{}
-	d.Init(inode)
-	return d
+func (fs *filesystem) newInode(creds *auth.Credentials, perm linux.FileMode, inode dynamicInode) dynamicInode {
+	inode.Init(creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), inode, perm)
+	return inode
 }
 
+// +stateify savable
 type staticFile struct {
 	kernfs.DynamicBytesFile
 	vfs.StaticData
@@ -110,18 +114,21 @@ func newStaticFile(data string) *staticFile {
 	return &staticFile{StaticData: vfs.StaticData{Data: data}}
 }
 
-func newStaticDir(creds *auth.Credentials, devMajor, devMinor uint32, ino uint64, perm linux.FileMode, children map[string]*kernfs.Dentry) *kernfs.Dentry {
-	return kernfs.NewStaticDir(creds, devMajor, devMinor, ino, perm, children, kernfs.GenericDirectoryFDOptions{
+func (fs *filesystem) newStaticDir(creds *auth.Credentials, children map[string]kernfs.Inode) kernfs.Inode {
+	return kernfs.NewStaticDir(creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), 0555, children, kernfs.GenericDirectoryFDOptions{
 		SeekEnd: kernfs.SeekEndZero,
 	})
 }
 
 // InternalData contains internal data passed in to the procfs mount via
 // vfs.GetFilesystemOptions.InternalData.
+//
+// +stateify savable
 type InternalData struct {
 	Cgroups map[string]string
 }
 
+// +stateify savable
 type implStatFS struct{}
 
 // StatFS implements kernfs.Inode.StatFS.

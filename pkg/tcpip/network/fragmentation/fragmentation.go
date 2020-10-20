@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // Package fragmentation contains the implementation of IP fragmentation.
-// It is based on RFC 791 and RFC 815.
+// It is based on RFC 791, RFC 815 and RFC 8200.
 package fragmentation
 
 import (
@@ -25,12 +25,10 @@ import (
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
+	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
 const (
-	// DefaultReassembleTimeout is based on the linux stack: net.ipv4.ipfrag_time.
-	DefaultReassembleTimeout = 30 * time.Second
-
 	// HighFragThreshold is the threshold at which we start trimming old
 	// fragmented packets. Linux uses a default value of 4 MB. See
 	// net.ipv4.ipfrag_high_thresh for more information.
@@ -81,6 +79,8 @@ type Fragmentation struct {
 	size         int
 	timeout      time.Duration
 	blockSize    uint16
+	clock        tcpip.Clock
+	releaseJob   *tcpip.Job
 }
 
 // NewFragmentation creates a new Fragmentation.
@@ -97,7 +97,7 @@ type Fragmentation struct {
 // reassemblingTimeout specifies the maximum time allowed to reassemble a packet.
 // Fragments are lazily evicted only when a new a packet with an
 // already existing fragmentation-id arrives after the timeout.
-func NewFragmentation(blockSize uint16, highMemoryLimit, lowMemoryLimit int, reassemblingTimeout time.Duration) *Fragmentation {
+func NewFragmentation(blockSize uint16, highMemoryLimit, lowMemoryLimit int, reassemblingTimeout time.Duration, clock tcpip.Clock) *Fragmentation {
 	if lowMemoryLimit >= highMemoryLimit {
 		lowMemoryLimit = highMemoryLimit
 	}
@@ -110,13 +110,17 @@ func NewFragmentation(blockSize uint16, highMemoryLimit, lowMemoryLimit int, rea
 		blockSize = minBlockSize
 	}
 
-	return &Fragmentation{
+	f := &Fragmentation{
 		reassemblers: make(map[FragmentID]*reassembler),
 		highLimit:    highMemoryLimit,
 		lowLimit:     lowMemoryLimit,
 		timeout:      reassemblingTimeout,
 		blockSize:    blockSize,
+		clock:        clock,
 	}
+	f.releaseJob = tcpip.NewJob(f.clock, &f.mu, f.releaseReassemblersLocked)
+
+	return f
 }
 
 // Process processes an incoming fragment belonging to an ID and returns a
@@ -155,15 +159,17 @@ func (f *Fragmentation) Process(
 
 	f.mu.Lock()
 	r, ok := f.reassemblers[id]
-	if ok && r.tooOld(f.timeout) {
-		// This is very likely to be an id-collision or someone performing a slow-rate attack.
-		f.release(r)
-		ok = false
-	}
 	if !ok {
-		r = newReassembler(id)
+		r = newReassembler(id, f.clock)
 		f.reassemblers[id] = r
+		wasEmpty := f.rList.Empty()
 		f.rList.PushFront(r)
+		if wasEmpty {
+			// If we have just pushed a first reassembler into an empty list, we
+			// should kickstart the release job. The release job will keep
+			// rescheduling itself until the list becomes empty.
+			f.releaseReassemblersLocked()
+		}
 	}
 	f.mu.Unlock()
 
@@ -210,4 +216,103 @@ func (f *Fragmentation) release(r *reassembler) {
 		log.Printf("memory counter < 0 (%d), this is an accounting bug that requires investigation", f.size)
 		f.size = 0
 	}
+}
+
+// releaseReassemblersLocked releases already-expired reassemblers, then
+// schedules the job to call back itself for the remaining reassemblers if
+// any. This function must be called with f.mu locked.
+func (f *Fragmentation) releaseReassemblersLocked() {
+	now := f.clock.NowMonotonic()
+	for {
+		// The reassembler at the end of the list is the oldest.
+		r := f.rList.Back()
+		if r == nil {
+			// The list is empty.
+			break
+		}
+		elapsed := time.Duration(now-r.creationTime) * time.Nanosecond
+		if f.timeout > elapsed {
+			// If the oldest reassembler has not expired, schedule the release
+			// job so that this function is called back when it has expired.
+			f.releaseJob.Schedule(f.timeout - elapsed)
+			break
+		}
+		// If the oldest reassembler has already expired, release it.
+		f.release(r)
+	}
+}
+
+// PacketFragmenter is the book-keeping struct for packet fragmentation.
+type PacketFragmenter struct {
+	transportHeader buffer.View
+	data            buffer.VectorisedView
+	reserve         int
+	innerMTU        int
+	fragmentCount   int
+	currentFragment int
+	fragmentOffset  int
+}
+
+// MakePacketFragmenter prepares the struct needed for packet fragmentation.
+//
+// pkt is the packet to be fragmented.
+//
+// innerMTU is the maximum number of bytes of fragmentable data a fragment can
+// have.
+//
+// reserve is the number of bytes that should be reserved for the headers in
+// each generated fragment.
+func MakePacketFragmenter(pkt *stack.PacketBuffer, innerMTU int, reserve int) PacketFragmenter {
+	// As per RFC 8200 Section 4.5, some IPv6 extension headers should not be
+	// repeated in each fragment. However we do not currently support any header
+	// of that kind yet, so the following computation is valid for both IPv4 and
+	// IPv6.
+	// TODO(gvisor.dev/issue/3912): Once Authentication or ESP Headers are
+	// supported for outbound packets, the fragmentable data should not include
+	// these headers.
+	var fragmentableData buffer.VectorisedView
+	fragmentableData.AppendView(pkt.TransportHeader().View())
+	fragmentableData.Append(pkt.Data)
+	fragmentCount := (fragmentableData.Size() + innerMTU - 1) / innerMTU
+
+	return PacketFragmenter{
+		data:          fragmentableData,
+		reserve:       reserve,
+		innerMTU:      innerMTU,
+		fragmentCount: fragmentCount,
+	}
+}
+
+// BuildNextFragment returns a packet with the payload of the next fragment,
+// along with the fragment's offset, the number of bytes copied and a boolean
+// indicating if there are more fragments left or not. If this function is
+// called again after it indicated that no more fragments were left, it will
+// panic.
+//
+// Note that the returned packet will not have its network and link headers
+// populated, but space for them will be reserved. The transport header will be
+// stored in the packet's data.
+func (pf *PacketFragmenter) BuildNextFragment() (*stack.PacketBuffer, int, int, bool) {
+	if pf.currentFragment >= pf.fragmentCount {
+		panic("BuildNextFragment should not be called again after the last fragment was returned")
+	}
+
+	fragPkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+		ReserveHeaderBytes: pf.reserve,
+	})
+
+	// Copy data for the fragment.
+	copied := pf.data.ReadToVV(&fragPkt.Data, pf.innerMTU)
+
+	offset := pf.fragmentOffset
+	pf.fragmentOffset += copied
+	pf.currentFragment++
+	more := pf.currentFragment != pf.fragmentCount
+
+	return fragPkt, offset, copied, more
+}
+
+// RemainingFragmentCount returns the number of fragments left to be built.
+func (pf *PacketFragmenter) RemainingFragmentCount() int {
+	return pf.fragmentCount - pf.currentFragment
 }

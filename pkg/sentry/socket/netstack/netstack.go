@@ -198,7 +198,6 @@ var Metrics = tcpip.Stats{
 		PacketsSent:              mustCreateMetric("/netstack/udp/packets_sent", "Number of UDP datagrams sent."),
 		PacketSendErrors:         mustCreateMetric("/netstack/udp/packet_send_errors", "Number of UDP datagrams failed to be sent."),
 		ChecksumErrors:           mustCreateMetric("/netstack/udp/checksum_errors", "Number of UDP datagrams dropped due to bad checksums."),
-		InvalidSourceAddress:     mustCreateMetric("/netstack/udp/invalid_source", "Number of UDP datagrams dropped due to invalid source address."),
 	},
 }
 
@@ -588,6 +587,11 @@ func (i *ioSequencePayload) Payload(size int) ([]byte, *tcpip.Error) {
 	}
 	v := buffer.NewView(size)
 	if _, err := i.src.CopyIn(i.ctx, v); err != nil {
+		// EOF can be returned only if src is a file and this means it
+		// is in a splice syscall and the error has to be ignored.
+		if err == io.EOF {
+			return v, nil
+		}
 		return nil, tcpip.ErrBadAddress
 	}
 	return v, nil
@@ -1513,8 +1517,17 @@ func getSockOptIPv6(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name 
 		return &vP, nil
 
 	case linux.IP6T_ORIGINAL_DST:
-		// TODO(gvisor.dev/issue/170): ip6tables.
-		return nil, syserr.ErrInvalidArgument
+		if outLen < int(binary.Size(linux.SockAddrInet6{})) {
+			return nil, syserr.ErrInvalidArgument
+		}
+
+		var v tcpip.OriginalDestinationOption
+		if err := ep.GetSockOpt(&v); err != nil {
+			return nil, syserr.TranslateNetstackError(err)
+		}
+
+		a, _ := ConvertAddress(linux.AF_INET6, tcpip.FullAddress(v))
+		return a.(*linux.SockAddrInet6), nil
 
 	case linux.IP6T_SO_GET_INFO:
 		if outLen < linux.SizeOfIPTGetinfo {
@@ -1555,6 +1568,26 @@ func getSockOptIPv6(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name 
 			return nil, err
 		}
 		return &entries, nil
+
+	case linux.IP6T_SO_GET_REVISION_TARGET:
+		if outLen < linux.SizeOfXTGetRevision {
+			return nil, syserr.ErrInvalidArgument
+		}
+
+		// Only valid for raw IPv6 sockets.
+		if family, skType, _ := s.Type(); family != linux.AF_INET6 || skType != linux.SOCK_RAW {
+			return nil, syserr.ErrProtocolNotAvailable
+		}
+
+		stack := inet.StackFromContext(t)
+		if stack == nil {
+			return nil, syserr.ErrNoDevice
+		}
+		ret, err := netfilter.TargetRevision(t, outPtr, header.IPv6ProtocolNumber)
+		if err != nil {
+			return nil, err
+		}
+		return &ret, nil
 
 	default:
 		emitUnimplementedEventIPv6(t, name)
@@ -1718,6 +1751,26 @@ func getSockOptIP(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name in
 			return nil, err
 		}
 		return &entries, nil
+
+	case linux.IPT_SO_GET_REVISION_TARGET:
+		if outLen < linux.SizeOfXTGetRevision {
+			return nil, syserr.ErrInvalidArgument
+		}
+
+		// Only valid for raw IPv4 sockets.
+		if family, skType, _ := s.Type(); family != linux.AF_INET || skType != linux.SOCK_RAW {
+			return nil, syserr.ErrProtocolNotAvailable
+		}
+
+		stack := inet.StackFromContext(t)
+		if stack == nil {
+			return nil, syserr.ErrNoDevice
+		}
+		ret, err := netfilter.TargetRevision(t, outPtr, header.IPv4ProtocolNumber)
+		if err != nil {
+			return nil, err
+		}
+		return &ret, nil
 
 	default:
 		emitUnimplementedEventIP(t, name)

@@ -15,17 +15,11 @@
 // Package arp implements the ARP network protocol. It is used to resolve
 // IPv4 addresses into link-local MAC addresses, and advertises IPv4
 // addresses of its stack with the local network.
-//
-// To use it in the networking stack, pass arp.NewProtocol() as one of the
-// network protocols when calling stack.New. Then add an "arp" address to every
-// NIC on the stack that should respond to ARP requests. That is:
-//
-//	if err := s.AddAddress(1, arp.ProtocolNumber, "arp"); err != nil {
-//		// handle err
-//	}
 package arp
 
 import (
+	"sync/atomic"
+
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
@@ -41,13 +35,54 @@ const (
 	ProtocolAddress = tcpip.Address("arp")
 )
 
-// endpoint implements stack.NetworkEndpoint.
+var _ stack.AddressableEndpoint = (*endpoint)(nil)
+var _ stack.NetworkEndpoint = (*endpoint)(nil)
+
 type endpoint struct {
-	protocol      *protocol
-	nicID         tcpip.NICID
-	linkEP        stack.LinkEndpoint
+	stack.AddressableEndpointState
+
+	protocol *protocol
+
+	// enabled is set to 1 when the NIC is enabled and 0 when it is disabled.
+	//
+	// Must be accessed using atomic operations.
+	enabled uint32
+
+	nic           stack.NetworkInterface
 	linkAddrCache stack.LinkAddressCache
 	nud           stack.NUDHandler
+}
+
+func (e *endpoint) Enable() *tcpip.Error {
+	if !e.nic.Enabled() {
+		return tcpip.ErrNotPermitted
+	}
+
+	e.setEnabled(true)
+	return nil
+}
+
+func (e *endpoint) Enabled() bool {
+	return e.nic.Enabled() && e.isEnabled()
+}
+
+// isEnabled returns true if the endpoint is enabled, regardless of the
+// enabled status of the NIC.
+func (e *endpoint) isEnabled() bool {
+	return atomic.LoadUint32(&e.enabled) == 1
+}
+
+// setEnabled sets the enabled status for the endpoint.
+func (e *endpoint) setEnabled(v bool) {
+	if v {
+		atomic.StoreUint32(&e.enabled, 1)
+	} else {
+		atomic.StoreUint32(&e.enabled, 0)
+	}
+}
+
+func (e *endpoint) Disable() {
+	e.setEnabled(false)
 }
 
 // DefaultTTL is unused for ARP. It implements stack.NetworkEndpoint.
@@ -56,23 +91,17 @@ func (e *endpoint) DefaultTTL() uint8 {
 }
 
 func (e *endpoint) MTU() uint32 {
-	lmtu := e.linkEP.MTU()
+	lmtu := e.nic.MTU()
 	return lmtu - uint32(e.MaxHeaderLength())
 }
 
-func (e *endpoint) NICID() tcpip.NICID {
-	return e.nicID
-}
-
-func (e *endpoint) Capabilities() stack.LinkEndpointCapabilities {
-	return e.linkEP.Capabilities()
-}
-
 func (e *endpoint) MaxHeaderLength() uint16 {
-	return e.linkEP.MaxHeaderLength() + header.ARPSize
+	return e.nic.MaxHeaderLength() + header.ARPSize
 }
 
-func (e *endpoint) Close() {}
+func (e *endpoint) Close() {
+	e.AddressableEndpointState.Cleanup()
+}
 
 func (e *endpoint) WritePacket(*stack.Route, *stack.GSO, stack.NetworkHeaderParams, *stack.PacketBuffer) *tcpip.Error {
 	return tcpip.ErrNotSupported
@@ -93,6 +122,10 @@ func (e *endpoint) WriteHeaderIncludedPacket(r *stack.Route, pkt *stack.PacketBu
 }
 
 func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
+	if !e.isEnabled() {
+		return
+	}
+
 	h := header.ARP(pkt.NetworkHeader().View())
 	if !h.IsValid() {
 		return
@@ -103,15 +136,15 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 		localAddr := tcpip.Address(h.ProtocolAddressTarget())
 
 		if e.nud == nil {
-			if e.linkAddrCache.CheckLocalAddress(e.nicID, header.IPv4ProtocolNumber, localAddr) == 0 {
+			if e.linkAddrCache.CheckLocalAddress(e.nic.ID(), header.IPv4ProtocolNumber, localAddr) == 0 {
 				return // we have no useful answer, ignore the request
 			}
 
 			addr := tcpip.Address(h.ProtocolAddressSender())
 			linkAddr := tcpip.LinkAddress(h.HardwareAddressSender())
-			e.linkAddrCache.AddLinkAddress(e.nicID, addr, linkAddr)
+			e.linkAddrCache.AddLinkAddress(e.nic.ID(), addr, linkAddr)
 		} else {
-			if r.Stack().CheckLocalAddress(e.nicID, header.IPv4ProtocolNumber, localAddr) == 0 {
+			if r.Stack().CheckLocalAddress(e.nic.ID(), header.IPv4ProtocolNumber, localAddr) == 0 {
 				return // we have no useful answer, ignore the request
 			}
 
@@ -120,24 +153,32 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 			e.nud.HandleProbe(remoteAddr, localAddr, ProtocolNumber, remoteLinkAddr, e.protocol)
 		}
 
-		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-			ReserveHeaderBytes: int(e.linkEP.MaxHeaderLength()) + header.ARPSize,
+		// As per RFC 826, under Packet Reception:
+		//   Swap hardware and protocol fields, putting the local hardware and
+		//   protocol addresses in the sender fields.
+		//
+		//   Send the packet to the (new) target hardware address on the same
+		//   hardware on which the request was received.
+		origSender := h.HardwareAddressSender()
+		r.RemoteLinkAddress = tcpip.LinkAddress(origSender)
+		respPkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+			ReserveHeaderBytes: int(e.nic.MaxHeaderLength()) + header.ARPSize,
 		})
-		packet := header.ARP(pkt.NetworkHeader().Push(header.ARPSize))
+		packet := header.ARP(respPkt.NetworkHeader().Push(header.ARPSize))
 		packet.SetIPv4OverEthernet()
 		packet.SetOp(header.ARPReply)
 		copy(packet.HardwareAddressSender(), r.LocalLinkAddress[:])
 		copy(packet.ProtocolAddressSender(), h.ProtocolAddressTarget())
-		copy(packet.HardwareAddressTarget(), h.HardwareAddressSender())
+		copy(packet.HardwareAddressTarget(), origSender)
 		copy(packet.ProtocolAddressTarget(), h.ProtocolAddressSender())
-		_ = e.linkEP.WritePacket(r, nil /* gso */, ProtocolNumber, pkt)
+		_ = e.nic.WritePacket(r, nil /* gso */, ProtocolNumber, respPkt)
 
 	case header.ARPReply:
 		addr := tcpip.Address(h.ProtocolAddressSender())
 		linkAddr := tcpip.LinkAddress(h.HardwareAddressSender())
 
 		if e.nud == nil {
-			e.linkAddrCache.AddLinkAddress(e.nicID, addr, linkAddr)
+			e.linkAddrCache.AddLinkAddress(e.nic.ID(), addr, linkAddr)
 			return
 		}
 
@@ -169,14 +210,15 @@ func (*protocol) ParseAddresses(v buffer.View) (src, dst tcpip.Address) {
 	return tcpip.Address(h.ProtocolAddressSender()), ProtocolAddress
 }
 
-func (p *protocol) NewEndpoint(nicID tcpip.NICID, linkAddrCache stack.LinkAddressCache, nud stack.NUDHandler, dispatcher stack.TransportDispatcher, sender stack.LinkEndpoint, st *stack.Stack) stack.NetworkEndpoint {
-	return &endpoint{
+func (p *protocol) NewEndpoint(nic stack.NetworkInterface, linkAddrCache stack.LinkAddressCache, nud stack.NUDHandler, dispatcher stack.TransportDispatcher) stack.NetworkEndpoint {
+	e := &endpoint{
 		protocol:      p,
-		nicID:         nicID,
-		linkEP:        sender,
+		nic:           nic,
 		linkAddrCache: linkAddrCache,
 		nud:           nud,
 	}
+	e.AddressableEndpointState.Init(e)
+	return e
 }
 
 // LinkAddressProtocol implements stack.LinkAddressResolver.LinkAddressProtocol.
@@ -187,6 +229,7 @@ func (*protocol) LinkAddressProtocol() tcpip.NetworkProtocolNumber {
 // LinkAddressRequest implements stack.LinkAddressResolver.LinkAddressRequest.
 func (*protocol) LinkAddressRequest(addr, localAddr tcpip.Address, remoteLinkAddr tcpip.LinkAddress, linkEP stack.LinkEndpoint) *tcpip.Error {
 	r := &stack.Route{
+		NetProto:          ProtocolNumber,
 		RemoteLinkAddress: remoteLinkAddr,
 	}
 	if len(r.RemoteLinkAddress) == 0 {
@@ -238,13 +281,11 @@ func (*protocol) Parse(pkt *stack.PacketBuffer) (proto tcpip.TransportProtocolNu
 	return 0, false, parse.ARP(pkt)
 }
 
-// ReturnError implements stack.TransportProtocol.ReturnError.
-func (*protocol) ReturnError(*stack.Route, tcpip.ICMPReason, *stack.PacketBuffer) *tcpip.Error {
-	// In ARP, there is no such response so do nothing.
-	return nil
-}
-
 // NewProtocol returns an ARP network protocol.
-func NewProtocol() stack.NetworkProtocol {
+//
+// Note, to make sure that the ARP endpoint receives ARP packets, the "arp"
+// address must be added to every NIC that should respond to ARP requests. See
+// ProtocolAddress for more details.
+func NewProtocol(*stack.Stack) stack.NetworkProtocol {
 	return &protocol{}
 }

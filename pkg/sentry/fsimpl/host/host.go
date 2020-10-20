@@ -118,7 +118,7 @@ func NewFD(ctx context.Context, mnt *vfs.Mount, hostFD int, opts *NewFDOptions) 
 	if err != nil {
 		return nil, err
 	}
-	d.Init(i)
+	d.Init(&fs.Filesystem, i)
 
 	// i.open will take a reference on d.
 	defer d.DecRef(ctx)
@@ -137,6 +137,8 @@ func ImportFD(ctx context.Context, mnt *vfs.Mount, hostFD int, isTTY bool) (*vfs
 }
 
 // filesystemType implements vfs.FilesystemType.
+//
+// +stateify savable
 type filesystemType struct{}
 
 // GetFilesystem implements vfs.FilesystemType.GetFilesystem.
@@ -148,6 +150,9 @@ func (filesystemType) GetFilesystem(context.Context, *vfs.VirtualFilesystem, *au
 func (filesystemType) Name() string {
 	return "none"
 }
+
+// Release implements vfs.FilesystemType.Release.
+func (filesystemType) Release(ctx context.Context) {}
 
 // NewFilesystem sets up and returns a new hostfs filesystem.
 //
@@ -166,6 +171,8 @@ func NewFilesystem(vfsObj *vfs.VirtualFilesystem) (*vfs.Filesystem, error) {
 }
 
 // filesystem implements vfs.FilesystemImpl.
+//
+// +stateify savable
 type filesystem struct {
 	kernfs.Filesystem
 
@@ -185,10 +192,13 @@ func (fs *filesystem) PrependPath(ctx context.Context, vfsroot, vd vfs.VirtualDe
 }
 
 // inode implements kernfs.Inode.
+//
+// +stateify savable
 type inode struct {
 	kernfs.InodeNoStatFS
 	kernfs.InodeNotDirectory
 	kernfs.InodeNotSymlink
+	kernfs.InodeTemporary // This holds no meaning as this inode can't be Looked up and is always valid.
 
 	locks vfs.FileLocks
 
@@ -233,7 +243,7 @@ type inode struct {
 	canMap bool
 
 	// mapsMu protects mappings.
-	mapsMu sync.Mutex
+	mapsMu sync.Mutex `state:"nosave"`
 
 	// If canMap is true, mappings tracks mappings of hostFD into
 	// memmap.MappingSpaces.
@@ -511,6 +521,8 @@ func (i *inode) open(ctx context.Context, d *kernfs.Dentry, mnt *vfs.Mount, flag
 }
 
 // fileDescription is embedded by host fd implementations of FileDescriptionImpl.
+//
+// +stateify savable
 type fileDescription struct {
 	vfsfd vfs.FileDescription
 	vfs.FileDescriptionDefaultImpl
@@ -525,7 +537,7 @@ type fileDescription struct {
 	inode *inode
 
 	// offsetMu protects offset.
-	offsetMu sync.Mutex
+	offsetMu sync.Mutex `state:"nosave"`
 
 	// offset specifies the current file offset. It is only meaningful when
 	// inode.seekable is true.

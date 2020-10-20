@@ -37,11 +37,13 @@ import (
 // FileDescription methods require that a reference is held.
 //
 // FileDescription is analogous to Linux's struct file.
+//
+// +stateify savable
 type FileDescription struct {
 	FileDescriptionRefs
 
 	// flagsMu protects statusFlags and asyncHandler below.
-	flagsMu sync.Mutex
+	flagsMu sync.Mutex `state:"nosave"`
 
 	// statusFlags contains status flags, "initialized by open(2) and possibly
 	// modified by fcntl()" - fcntl(2). statusFlags can be read using atomic
@@ -56,7 +58,7 @@ type FileDescription struct {
 
 	// epolls is the set of epollInterests registered for this FileDescription.
 	// epolls is protected by epollMu.
-	epollMu sync.Mutex
+	epollMu sync.Mutex `state:"nosave"`
 	epolls  map[*epollInterest]struct{}
 
 	// vd is the filesystem location at which this FileDescription was opened.
@@ -88,6 +90,8 @@ type FileDescription struct {
 }
 
 // FileDescriptionOptions contains options to FileDescription.Init().
+//
+// +stateify savable
 type FileDescriptionOptions struct {
 	// If AllowDirectIO is true, allow O_DIRECT to be set on the file.
 	AllowDirectIO bool
@@ -451,6 +455,8 @@ type FileDescriptionImpl interface {
 }
 
 // Dirent holds the information contained in struct linux_dirent64.
+//
+// +stateify savable
 type Dirent struct {
 	// Name is the filename.
 	Name string
@@ -821,7 +827,7 @@ func (fd *FileDescription) SetAsyncHandler(newHandler func() FileAsync) FileAsyn
 }
 
 // FileReadWriteSeeker is a helper struct to pass a FileDescription as
-// io.Reader/io.Writer/io.ReadSeeker/etc.
+// io.Reader/io.Writer/io.ReadSeeker/io.ReaderAt/io.WriterAt/etc.
 type FileReadWriteSeeker struct {
 	FD    *FileDescription
 	Ctx   context.Context
@@ -829,11 +835,18 @@ type FileReadWriteSeeker struct {
 	WOpts WriteOptions
 }
 
+// ReadAt implements io.ReaderAt.ReadAt.
+func (f *FileReadWriteSeeker) ReadAt(p []byte, off int64) (int, error) {
+	dst := usermem.BytesIOSequence(p)
+	n, err := f.FD.PRead(f.Ctx, dst, off, f.ROpts)
+	return int(n), err
+}
+
 // Read implements io.ReadWriteSeeker.Read.
 func (f *FileReadWriteSeeker) Read(p []byte) (int, error) {
 	dst := usermem.BytesIOSequence(p)
-	ret, err := f.FD.Read(f.Ctx, dst, f.ROpts)
-	return int(ret), err
+	n, err := f.FD.Read(f.Ctx, dst, f.ROpts)
+	return int(n), err
 }
 
 // Seek implements io.ReadWriteSeeker.Seek.
@@ -841,9 +854,16 @@ func (f *FileReadWriteSeeker) Seek(offset int64, whence int) (int64, error) {
 	return f.FD.Seek(f.Ctx, offset, int32(whence))
 }
 
+// WriteAt implements io.WriterAt.WriteAt.
+func (f *FileReadWriteSeeker) WriteAt(p []byte, off int64) (int, error) {
+	dst := usermem.BytesIOSequence(p)
+	n, err := f.FD.PWrite(f.Ctx, dst, off, f.WOpts)
+	return int(n), err
+}
+
 // Write implements io.ReadWriteSeeker.Write.
 func (f *FileReadWriteSeeker) Write(p []byte) (int, error) {
 	buf := usermem.BytesIOSequence(p)
-	ret, err := f.FD.Write(f.Ctx, buf, f.WOpts)
-	return int(ret), err
+	n, err := f.FD.Write(f.Ctx, buf, f.WOpts)
+	return int(n), err
 }

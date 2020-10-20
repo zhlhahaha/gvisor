@@ -55,6 +55,7 @@ type SocketOperations struct {
 	fsutil.FileNoopFlush            `state:"nosave"`
 	fsutil.FileUseInodeUnstableAttr `state:"nosave"`
 
+	socketOperationsRefs
 	socketOpsCommon
 }
 
@@ -84,11 +85,27 @@ func NewWithDirent(ctx context.Context, d *fs.Dirent, ep transport.Endpoint, sty
 	return fs.NewFile(ctx, d, flags, &s)
 }
 
+// DecRef implements RefCounter.DecRef.
+func (s *SocketOperations) DecRef(ctx context.Context) {
+	s.socketOperationsRefs.DecRef(func() {
+		s.ep.Close(ctx)
+		if s.abstractNamespace != nil {
+			s.abstractNamespace.Remove(s.abstractName, s)
+		}
+	})
+}
+
+// Release implemements fs.FileOperations.Release.
+func (s *SocketOperations) Release(ctx context.Context) {
+	// Release only decrements a reference on s because s may be referenced in
+	// the abstract socket namespace.
+	s.DecRef(ctx)
+}
+
 // socketOpsCommon contains the socket operations common to VFS1 and VFS2.
 //
 // +stateify savable
 type socketOpsCommon struct {
-	socketOpsCommonRefs
 	socket.SendReceiveTimeout
 
 	ep    transport.Endpoint
@@ -99,23 +116,6 @@ type socketOpsCommon struct {
 	// bound, they cannot be modified.
 	abstractName      string
 	abstractNamespace *kernel.AbstractSocketNamespace
-}
-
-// DecRef implements RefCounter.DecRef.
-func (s *socketOpsCommon) DecRef(ctx context.Context) {
-	s.socketOpsCommonRefs.DecRef(func() {
-		s.ep.Close(ctx)
-		if s.abstractNamespace != nil {
-			s.abstractNamespace.Remove(s.abstractName, s)
-		}
-	})
-}
-
-// Release implemements fs.FileOperations.Release.
-func (s *socketOpsCommon) Release(ctx context.Context) {
-	// Release only decrements a reference on s because s may be referenced in
-	// the abstract socket namespace.
-	s.DecRef(ctx)
 }
 
 func (s *socketOpsCommon) isPacket() bool {
@@ -573,13 +573,17 @@ func (s *SocketOperations) Read(ctx context.Context, _ *fs.File, dst usermem.IOS
 	if dst.NumBytes() == 0 {
 		return 0, nil
 	}
-	return dst.CopyOutFrom(ctx, &EndpointReader{
+	r := &EndpointReader{
 		Ctx:       ctx,
 		Endpoint:  s.ep,
 		NumRights: 0,
 		Peek:      false,
 		From:      nil,
-	})
+	}
+	n, err := dst.CopyOutFrom(ctx, r)
+	// Drop control messages.
+	r.Control.Release(ctx)
+	return n, err
 }
 
 // RecvMsg implements the linux syscall recvmsg(2) for sockets backed by

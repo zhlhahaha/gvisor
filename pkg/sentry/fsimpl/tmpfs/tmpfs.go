@@ -51,9 +51,13 @@ import (
 const Name = "tmpfs"
 
 // FilesystemType implements vfs.FilesystemType.
+//
+// +stateify savable
 type FilesystemType struct{}
 
 // filesystem implements vfs.FilesystemImpl.
+//
+// +stateify savable
 type filesystem struct {
 	vfsfs vfs.Filesystem
 
@@ -67,9 +71,11 @@ type filesystem struct {
 	devMinor uint32
 
 	// mu serializes changes to the Dentry tree.
-	mu sync.RWMutex
+	mu sync.RWMutex `state:"nosave"`
 
 	nextInoMinusOne uint64 // accessed using atomic memory operations
+
+	root *dentry
 }
 
 // Name implements vfs.FilesystemType.Name.
@@ -77,7 +83,12 @@ func (FilesystemType) Name() string {
 	return Name
 }
 
+// Release implements vfs.FilesystemType.Release.
+func (FilesystemType) Release(ctx context.Context) {}
+
 // FilesystemOpts is used to pass configuration data to tmpfs.
+//
+// +stateify savable
 type FilesystemOpts struct {
 	// RootFileType is the FileType of the filesystem root. Valid values
 	// are: S_IFDIR, S_IFREG, and S_IFLNK. Defaults to S_IFDIR.
@@ -188,6 +199,7 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		fs.vfsfs.DecRef(ctx)
 		return nil, nil, fmt.Errorf("invalid tmpfs root file type: %#o", rootFileType)
 	}
+	fs.root = root
 	return &fs.vfsfs, &root.vfsd, nil
 }
 
@@ -199,6 +211,37 @@ func NewFilesystem(ctx context.Context, vfsObj *vfs.VirtualFilesystem, creds *au
 // Release implements vfs.FilesystemImpl.Release.
 func (fs *filesystem) Release(ctx context.Context) {
 	fs.vfsfs.VirtualFilesystem().PutAnonBlockDevMinor(fs.devMinor)
+	fs.mu.Lock()
+	if fs.root.inode.isDir() {
+		fs.root.releaseChildrenLocked(ctx)
+	}
+	fs.mu.Unlock()
+}
+
+// releaseChildrenLocked is called on the mount point by filesystem.Release() to
+// destroy all objects in the mount. It performs a depth-first walk of the
+// filesystem and "unlinks" everything by decrementing link counts
+// appropriately. There should be no open file descriptors when this is called,
+// so each inode should only have one outstanding reference that is removed once
+// its link count hits zero.
+//
+// Note that we do not update filesystem state precisely while tearing down (for
+// instance, the child maps are ignored)--we only care to remove all remaining
+// references so that every filesystem object gets destroyed. Also note that we
+// do not need to trigger DecRef on the mount point itself or any child mount;
+// these are taken care of by the destructor of the enclosing MountNamespace.
+//
+// Precondition: filesystem.mu is held.
+func (d *dentry) releaseChildrenLocked(ctx context.Context) {
+	dir := d.inode.impl.(*directory)
+	for _, child := range dir.childMap {
+		if child.inode.isDir() {
+			child.releaseChildrenLocked(ctx)
+			child.inode.decLinksLocked(ctx) // link for child/.
+			dir.inode.decLinksLocked(ctx)   // link for child/..
+		}
+		child.inode.decLinksLocked(ctx) // link for child
+	}
 }
 
 // immutable
@@ -221,6 +264,8 @@ var globalStatfs = linux.Statfs{
 }
 
 // dentry implements vfs.DentryImpl.
+//
+// +stateify savable
 type dentry struct {
 	vfsd vfs.Dentry
 
@@ -300,6 +345,8 @@ func (d *dentry) Watches() *vfs.Watches {
 func (d *dentry) OnZeroWatches(context.Context) {}
 
 // inode represents a filesystem object.
+//
+// +stateify savable
 type inode struct {
 	// fs is the owning filesystem. fs is immutable.
 	fs *filesystem
@@ -316,12 +363,12 @@ type inode struct {
 
 	// Inode metadata. Writing multiple fields atomically requires holding
 	// mu, othewise atomic operations can be used.
-	mu    sync.Mutex
-	mode  uint32 // file type and mode
-	nlink uint32 // protected by filesystem.mu instead of inode.mu
-	uid   uint32 // auth.KUID, but stored as raw uint32 for sync/atomic
-	gid   uint32 // auth.KGID, but ...
-	ino   uint64 // immutable
+	mu    sync.Mutex `state:"nosave"`
+	mode  uint32     // file type and mode
+	nlink uint32     // protected by filesystem.mu instead of inode.mu
+	uid   uint32     // auth.KUID, but stored as raw uint32 for sync/atomic
+	gid   uint32     // auth.KGID, but ...
+	ino   uint64     // immutable
 
 	// Linux's tmpfs has no concept of btime.
 	atime int64 // nanoseconds
@@ -668,6 +715,8 @@ func (i *inode) checkXattrPermissions(creds *auth.Credentials, name string, ats 
 
 // fileDescription is embedded by tmpfs implementations of
 // vfs.FileDescriptionImpl.
+//
+// +stateify savable
 type fileDescription struct {
 	vfsfd vfs.FileDescription
 	vfs.FileDescriptionDefaultImpl

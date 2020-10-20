@@ -111,6 +111,7 @@ var (
 	ErrBroadcastDisabled         = &Error{msg: "broadcast socket option disabled"}
 	ErrNotPermitted              = &Error{msg: "operation not permitted"}
 	ErrAddressFamilyNotSupported = &Error{msg: "address family not supported by protocol"}
+	ErrMalformedHeader           = &Error{msg: "header is malformed"}
 )
 
 var messageToError map[string]*Error
@@ -159,6 +160,7 @@ func StringToError(s string) *Error {
 			ErrBroadcastDisabled,
 			ErrNotPermitted,
 			ErrAddressFamilyNotSupported,
+			ErrMalformedHeader,
 		}
 
 		messageToError = make(map[string]*Error)
@@ -236,6 +238,14 @@ type Timer interface {
 // Address is a byte slice cast as a string that represents the address of a
 // network node. Or, in the case of unix endpoints, it may represent a path.
 type Address string
+
+// WithPrefix returns the address with a prefix that represents a point subnet.
+func (a Address) WithPrefix() AddressWithPrefix {
+	return AddressWithPrefix{
+		Address:   a,
+		PrefixLen: len(a) * 8,
+	}
+}
 
 // AddressMask is a bitmask for an address.
 type AddressMask string
@@ -1614,9 +1624,6 @@ type UDPStats struct {
 
 	// ChecksumErrors is the number of datagrams dropped due to bad checksums.
 	ChecksumErrors *StatCounter
-
-	// InvalidSourceAddress is the number of invalid sourced datagrams dropped.
-	InvalidSourceAddress *StatCounter
 }
 
 // Stats holds statistics about the networking stack.
@@ -1987,14 +1994,3 @@ func DeleteDanglingEndpoint(e Endpoint) {
 // AsyncLoading is the global barrier for asynchronous endpoint loading
 // activities.
 var AsyncLoading sync.WaitGroup
-
-// ICMPReason is a marker interface for network protocol agnostic ICMP errors.
-type ICMPReason interface {
-	isICMP()
-}
-
-// ICMPReasonPortUnreachable is an error where the transport protocol has no
-// listener and no alternative means to inform the sender.
-type ICMPReasonPortUnreachable struct{}
-
-func (*ICMPReasonPortUnreachable) isICMP() {}

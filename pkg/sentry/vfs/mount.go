@@ -46,8 +46,9 @@ import (
 // +stateify savable
 type Mount struct {
 	// vfs, fs, root are immutable. References are held on fs and root.
+	// Note that for a disconnected mount, root may be nil.
 	//
-	// Invariant: root belongs to fs.
+	// Invariant: if not nil, root belongs to fs.
 	vfs  *VirtualFilesystem
 	fs   *Filesystem
 	root *Dentry
@@ -65,7 +66,7 @@ type Mount struct {
 	//
 	// Invariant: key.parent != nil iff key.point != nil. key.point belongs to
 	// key.parent.fs.
-	key mountKey
+	key mountKey `state:".(VirtualDentry)"`
 
 	// ns is the namespace in which this Mount was mounted. ns is protected by
 	// VirtualFilesystem.mountMu.
@@ -345,6 +346,7 @@ func (vfs *VirtualFilesystem) UmountAt(ctx context.Context, creds *auth.Credenti
 	return nil
 }
 
+// +stateify savable
 type umountRecursiveOptions struct {
 	// If eager is true, ensure that future calls to Mount.tryIncMountedRef()
 	// on umounted mounts fail.
@@ -414,7 +416,7 @@ func (vfs *VirtualFilesystem) connectLocked(mnt *Mount, vd VirtualDentry, mntns 
 		}
 	}
 	mnt.IncRef() // dropped by callers of umountRecursiveLocked
-	mnt.storeKey(vd)
+	mnt.setKey(vd)
 	if vd.mount.children == nil {
 		vd.mount.children = make(map[*Mount]struct{})
 	}
@@ -439,13 +441,13 @@ func (vfs *VirtualFilesystem) connectLocked(mnt *Mount, vd VirtualDentry, mntns 
 // * vfs.mounts.seq must be in a writer critical section.
 // * mnt.parent() != nil.
 func (vfs *VirtualFilesystem) disconnectLocked(mnt *Mount) VirtualDentry {
-	vd := mnt.loadKey()
+	vd := mnt.getKey()
 	if checkInvariants {
 		if vd.mount != nil {
 			panic("VFS.disconnectLocked called on disconnected mount")
 		}
 	}
-	mnt.storeKey(VirtualDentry{})
+	mnt.loadKey(VirtualDentry{})
 	delete(vd.mount.children, mnt)
 	atomic.AddUint32(&vd.dentry.mounts, math.MaxUint32) // -1
 	mnt.ns.mountpoints[vd.dentry]--
@@ -497,7 +499,9 @@ func (mnt *Mount) DecRef(ctx context.Context) {
 			mnt.vfs.mounts.seq.EndWrite()
 			mnt.vfs.mountMu.Unlock()
 		}
-		mnt.root.DecRef(ctx)
+		if mnt.root != nil {
+			mnt.root.DecRef(ctx)
+		}
 		mnt.fs.DecRef(ctx)
 		if vd.Ok() {
 			vd.DecRef(ctx)
@@ -723,14 +727,12 @@ func (mnt *Mount) Root() *Dentry {
 	return mnt.root
 }
 
-// Root returns mntns' root. A reference is taken on the returned
-// VirtualDentry.
+// Root returns mntns' root. It does not take a reference on the returned Dentry.
 func (mntns *MountNamespace) Root() VirtualDentry {
 	vd := VirtualDentry{
 		mount:  mntns.root,
 		dentry: mntns.root.root,
 	}
-	vd.IncRef()
 	return vd
 }
 

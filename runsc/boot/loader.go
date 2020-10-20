@@ -282,6 +282,7 @@ func New(args Args) (*Loader, error) {
 		args.NumCPU = runtime.NumCPU()
 	}
 	log.Infof("CPUs: %d", args.NumCPU)
+	runtime.GOMAXPROCS(args.NumCPU)
 
 	if args.TotalMem > 0 {
 		// Adjust the total memory returned by the Sentry so that applications that
@@ -471,9 +472,13 @@ func (l *Loader) Destroy() {
 	}
 	l.watchdog.Stop()
 
+	// Release all kernel resources. This is only safe after we can no longer
+	// save/restore.
+	l.k.Release()
+
 	// In the success case, stdioFDs and goferFDs will only contain
 	// released/closed FDs that ownership has been passed over to host FDs and
-	// gofer sessions. Close them here in case on failure.
+	// gofer sessions. Close them here in case of failure.
 	for _, fd := range l.root.stdioFDs {
 		_ = fd.Close()
 	}
@@ -797,7 +802,7 @@ func (l *Loader) createContainerProcess(root bool, cid string, info *containerIn
 }
 
 // startGoferMonitor runs a goroutine to monitor gofer's health. It polls on
-// the gofer FDs looking for disconnects, and destroys the container if a
+// the gofer FDs looking for disconnects, and kills the container processes if a
 // disconnect occurs in any of the gofer FDs.
 func (l *Loader) startGoferMonitor(cid string, goferFDs []*fd.FD) {
 	go func() {
@@ -818,18 +823,15 @@ func (l *Loader) startGoferMonitor(cid string, goferFDs []*fd.FD) {
 			panic(fmt.Sprintf("Error monitoring gofer FDs: %v", err))
 		}
 
-		// Check if the gofer has stopped as part of normal container destruction.
-		// This is done just to avoid sending an annoying error message to the log.
-		// Note that there is a small race window in between mu.Unlock() and the
-		// lock being reacquired in destroyContainer(), but it's harmless to call
-		// destroyContainer() multiple times.
 		l.mu.Lock()
-		_, ok := l.processes[execID{cid: cid}]
-		l.mu.Unlock()
-		if ok {
-			log.Infof("Gofer socket disconnected, destroying container %q", cid)
-			if err := l.destroyContainer(cid); err != nil {
-				log.Warningf("Error destroying container %q after gofer stopped: %v", cid, err)
+		defer l.mu.Unlock()
+
+		// The gofer could have been stopped due to a normal container shutdown.
+		// Check if the container has not stopped yet.
+		if tg, _ := l.tryThreadGroupFromIDLocked(execID{cid: cid}); tg != nil {
+			log.Infof("Gofer socket disconnected, killing container %q", cid)
+			if err := l.signalAllProcesses(cid, int32(linux.SIGKILL)); err != nil {
+				log.Warningf("Error killing container %q after gofer stopped: %v", cid, err)
 			}
 		}
 	}()
@@ -898,17 +900,24 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 		return 0, fmt.Errorf("container %q not started", args.ContainerID)
 	}
 
-	// Get the container MountNamespace from the Task.
+	// Get the container MountNamespace from the Task. Try to acquire ref may fail
+	// in case it raced with task exit.
 	if kernel.VFS2Enabled {
-		// task.MountNamespace() does not take a ref, so we must do so ourselves.
+		// task.MountNamespaceVFS2() does not take a ref, so we must do so ourselves.
 		args.MountNamespaceVFS2 = tg.Leader().MountNamespaceVFS2()
-		args.MountNamespaceVFS2.IncRef()
+		if !args.MountNamespaceVFS2.TryIncRef() {
+			return 0, fmt.Errorf("container %q has stopped", args.ContainerID)
+		}
 	} else {
+		var reffed bool
 		tg.Leader().WithMuLocked(func(t *kernel.Task) {
 			// task.MountNamespace() does not take a ref, so we must do so ourselves.
 			args.MountNamespace = t.MountNamespace()
-			args.MountNamespace.IncRef()
+			reffed = args.MountNamespace.TryIncRef()
 		})
+		if !reffed {
+			return 0, fmt.Errorf("container %q has stopped", args.ContainerID)
+		}
 	}
 
 	// Add the HOME environment variable if it is not already set.
@@ -916,7 +925,6 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 		root := args.MountNamespaceVFS2.Root()
 		ctx := vfs.WithRoot(l.k.SupervisorContext(), root)
 		defer args.MountNamespaceVFS2.DecRef(ctx)
-		defer root.DecRef(ctx)
 		envv, err := user.MaybeAddExecUserHomeVFS2(ctx, args.MountNamespaceVFS2, args.KUID, args.Envv)
 		if err != nil {
 			return 0, err
@@ -1059,8 +1067,8 @@ func newRootNetworkNamespace(conf *config.Config, clock tcpip.Clock, uniqueID st
 }
 
 func newEmptySandboxNetworkStack(clock tcpip.Clock, uniqueID stack.UniqueID) (inet.Stack, error) {
-	netProtos := []stack.NetworkProtocol{ipv4.NewProtocol(), ipv6.NewProtocol(), arp.NewProtocol()}
-	transProtos := []stack.TransportProtocol{tcp.NewProtocol(), udp.NewProtocol(), icmp.NewProtocol4()}
+	netProtos := []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol, arp.NewProtocol}
+	transProtos := []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol, icmp.NewProtocol4}
 	s := netstack.Stack{stack.New(stack.Options{
 		NetworkProtocols:   netProtos,
 		TransportProtocols: transProtos,

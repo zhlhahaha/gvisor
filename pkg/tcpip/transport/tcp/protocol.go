@@ -12,12 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package tcp contains the implementation of the TCP transport protocol. To use
-// it in the networking stack, this package must be added to the project, and
-// activated on the stack by passing tcp.NewProtocol() as one of the
-// transport protocols when calling stack.New(). Then endpoints can be created
-// by passing tcp.ProtocolNumber as the transport protocol number when calling
-// Stack.NewEndpoint().
+// Package tcp contains the implementation of the TCP transport protocol.
 package tcp
 
 import (
@@ -138,6 +133,8 @@ func (s *synRcvdCounter) Threshold() uint64 {
 }
 
 type protocol struct {
+	stack *stack.Stack
+
 	mu                         sync.RWMutex
 	sackEnabled                bool
 	recovery                   tcpip.TCPRecovery
@@ -164,14 +161,14 @@ func (*protocol) Number() tcpip.TransportProtocolNumber {
 }
 
 // NewEndpoint creates a new tcp endpoint.
-func (p *protocol) NewEndpoint(stack *stack.Stack, netProto tcpip.NetworkProtocolNumber, waiterQueue *waiter.Queue) (tcpip.Endpoint, *tcpip.Error) {
-	return newEndpoint(stack, netProto, waiterQueue), nil
+func (p *protocol) NewEndpoint(netProto tcpip.NetworkProtocolNumber, waiterQueue *waiter.Queue) (tcpip.Endpoint, *tcpip.Error) {
+	return newEndpoint(p.stack, netProto, waiterQueue), nil
 }
 
 // NewRawEndpoint creates a new raw TCP endpoint. Raw TCP sockets are currently
 // unsupported. It implements stack.TransportProtocol.NewRawEndpoint.
-func (p *protocol) NewRawEndpoint(stack *stack.Stack, netProto tcpip.NetworkProtocolNumber, waiterQueue *waiter.Queue) (tcpip.Endpoint, *tcpip.Error) {
-	return raw.NewEndpoint(stack, netProto, header.TCPProtocolNumber, waiterQueue)
+func (p *protocol) NewRawEndpoint(netProto tcpip.NetworkProtocolNumber, waiterQueue *waiter.Queue) (tcpip.Endpoint, *tcpip.Error) {
+	return raw.NewEndpoint(p.stack, netProto, header.TCPProtocolNumber, waiterQueue)
 }
 
 // MinimumPacketSize returns the minimum valid tcp packet size.
@@ -510,8 +507,9 @@ func (*protocol) Parse(pkt *stack.PacketBuffer) bool {
 }
 
 // NewProtocol returns a TCP transport protocol.
-func NewProtocol() stack.TransportProtocol {
+func NewProtocol(s *stack.Stack) stack.TransportProtocol {
 	p := protocol{
+		stack: s,
 		sendBufferSize: tcpip.TCPSendBufferSizeRangeOption{
 			Min:     MinBufferSize,
 			Default: DefaultSendBufferSize,

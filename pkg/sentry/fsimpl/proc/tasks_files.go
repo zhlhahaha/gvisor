@@ -31,6 +31,7 @@ import (
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
+// +stateify savable
 type selfSymlink struct {
 	implStatFS
 	kernfs.InodeAttrs
@@ -42,13 +43,10 @@ type selfSymlink struct {
 
 var _ kernfs.Inode = (*selfSymlink)(nil)
 
-func (fs *filesystem) newSelfSymlink(creds *auth.Credentials, ino uint64, pidns *kernel.PIDNamespace) *kernfs.Dentry {
-	inode := &selfSymlink{pidns: pidns}
-	inode.Init(creds, linux.UNNAMED_MAJOR, fs.devMinor, ino, linux.ModeSymlink|0777)
-
-	d := &kernfs.Dentry{}
-	d.Init(inode)
-	return d
+func (i *tasksInode) newSelfSymlink(creds *auth.Credentials) kernfs.Inode {
+	inode := &selfSymlink{pidns: i.pidns}
+	inode.Init(creds, linux.UNNAMED_MAJOR, i.fs.devMinor, i.fs.NextIno(), linux.ModeSymlink|0777)
+	return inode
 }
 
 func (s *selfSymlink) Readlink(ctx context.Context, _ *vfs.Mount) (string, error) {
@@ -74,6 +72,7 @@ func (*selfSymlink) SetStat(context.Context, *vfs.Filesystem, *auth.Credentials,
 	return syserror.EPERM
 }
 
+// +stateify savable
 type threadSelfSymlink struct {
 	implStatFS
 	kernfs.InodeAttrs
@@ -85,13 +84,10 @@ type threadSelfSymlink struct {
 
 var _ kernfs.Inode = (*threadSelfSymlink)(nil)
 
-func (fs *filesystem) newThreadSelfSymlink(creds *auth.Credentials, ino uint64, pidns *kernel.PIDNamespace) *kernfs.Dentry {
-	inode := &threadSelfSymlink{pidns: pidns}
-	inode.Init(creds, linux.UNNAMED_MAJOR, fs.devMinor, ino, linux.ModeSymlink|0777)
-
-	d := &kernfs.Dentry{}
-	d.Init(inode)
-	return d
+func (i *tasksInode) newThreadSelfSymlink(creds *auth.Credentials) kernfs.Inode {
+	inode := &threadSelfSymlink{pidns: i.pidns}
+	inode.Init(creds, linux.UNNAMED_MAJOR, i.fs.devMinor, i.fs.NextIno(), linux.ModeSymlink|0777)
+	return inode
 }
 
 func (s *threadSelfSymlink) Readlink(ctx context.Context, _ *vfs.Mount) (string, error) {
@@ -121,6 +117,8 @@ func (*threadSelfSymlink) SetStat(context.Context, *vfs.Filesystem, *auth.Creden
 // dynamicBytesFileSetAttr implements a special file that allows inode
 // attributes to be set. This is to support /proc files that are readonly, but
 // allow attributes to be set.
+//
+// +stateify savable
 type dynamicBytesFileSetAttr struct {
 	kernfs.DynamicBytesFile
 }
@@ -131,6 +129,8 @@ func (d *dynamicBytesFileSetAttr) SetStat(ctx context.Context, fs *vfs.Filesyste
 }
 
 // cpuStats contains the breakdown of CPU time for /proc/stat.
+//
+// +stateify savable
 type cpuStats struct {
 	// user is time spent in userspace tasks with non-positive niceness.
 	user uint64

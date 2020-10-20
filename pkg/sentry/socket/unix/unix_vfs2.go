@@ -37,12 +37,15 @@ import (
 
 // SocketVFS2 implements socket.SocketVFS2 (and by extension,
 // vfs.FileDescriptionImpl) for Unix sockets.
+//
+// +stateify savable
 type SocketVFS2 struct {
 	vfsfd vfs.FileDescription
 	vfs.FileDescriptionDefaultImpl
 	vfs.DentryMetadataFileDescriptionImpl
 	vfs.LockFD
 
+	socketVFS2Refs
 	socketOpsCommon
 }
 
@@ -53,6 +56,7 @@ var _ = socket.SocketVFS2(&SocketVFS2{})
 func NewSockfsFile(t *kernel.Task, ep transport.Endpoint, stype linux.SockType) (*vfs.FileDescription, *syserr.Error) {
 	mnt := t.Kernel().SocketMount()
 	d := sockfs.NewDentry(t.Credentials(), mnt)
+	defer d.DecRef(t)
 
 	fd, err := NewFileDescription(ep, stype, linux.O_RDWR, mnt, d, &vfs.FileLocks{})
 	if err != nil {
@@ -86,6 +90,25 @@ func NewFileDescription(ep transport.Endpoint, stype linux.SockType, flags uint3
 		return nil, err
 	}
 	return vfsfd, nil
+}
+
+// DecRef implements RefCounter.DecRef.
+func (s *SocketVFS2) DecRef(ctx context.Context) {
+	s.socketVFS2Refs.DecRef(func() {
+		t := kernel.TaskFromContext(ctx)
+		t.Kernel().DeleteSocketVFS2(&s.vfsfd)
+		s.ep.Close(ctx)
+		if s.abstractNamespace != nil {
+			s.abstractNamespace.Remove(s.abstractName, s)
+		}
+	})
+}
+
+// Release implements vfs.FileDescriptionImpl.Release.
+func (s *SocketVFS2) Release(ctx context.Context) {
+	// Release only decrements a reference on s because s may be referenced in
+	// the abstract socket namespace.
+	s.DecRef(ctx)
 }
 
 // GetSockOpt implements the linux syscall getsockopt(2) for sockets backed by
@@ -244,13 +267,17 @@ func (s *SocketVFS2) Read(ctx context.Context, dst usermem.IOSequence, opts vfs.
 	if dst.NumBytes() == 0 {
 		return 0, nil
 	}
-	return dst.CopyOutFrom(ctx, &EndpointReader{
+	r := &EndpointReader{
 		Ctx:       ctx,
 		Endpoint:  s.ep,
 		NumRights: 0,
 		Peek:      false,
 		From:      nil,
-	})
+	}
+	n, err := dst.CopyOutFrom(ctx, r)
+	// Drop control messages.
+	r.Control.Release(ctx)
+	return n, err
 }
 
 // PWrite implements vfs.FileDescriptionImpl.

@@ -24,6 +24,8 @@ import (
 
 // StaticSymlink provides an Inode implementation for symlinks that point to
 // a immutable target.
+//
+// +stateify savable
 type StaticSymlink struct {
 	InodeAttrs
 	InodeNoopRefCount
@@ -36,13 +38,10 @@ type StaticSymlink struct {
 var _ Inode = (*StaticSymlink)(nil)
 
 // NewStaticSymlink creates a new symlink file pointing to 'target'.
-func NewStaticSymlink(creds *auth.Credentials, devMajor, devMinor uint32, ino uint64, target string) *Dentry {
+func NewStaticSymlink(creds *auth.Credentials, devMajor, devMinor uint32, ino uint64, target string) Inode {
 	inode := &StaticSymlink{}
 	inode.Init(creds, devMajor, devMinor, ino, target)
-
-	d := &Dentry{}
-	d.Init(inode)
-	return d
+	return inode
 }
 
 // Init initializes the instance.

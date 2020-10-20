@@ -52,6 +52,7 @@ var _ = socket.SocketVFS2(&socketVFS2{})
 func newVFS2Socket(t *kernel.Task, family int, stype linux.SockType, protocol int, fd int, flags uint32) (*vfs.FileDescription, *syserr.Error) {
 	mnt := t.Kernel().SocketMount()
 	d := sockfs.NewDentry(t.Credentials(), mnt)
+	defer d.DecRef(t)
 
 	s := &socketVFS2{
 		socketOpsCommon: socketOpsCommon{
@@ -75,6 +76,13 @@ func newVFS2Socket(t *kernel.Task, family int, stype linux.SockType, protocol in
 		return nil, syserr.FromError(err)
 	}
 	return vfsfd, nil
+}
+
+// Release implements vfs.FileDescriptionImpl.Release.
+func (s *socketVFS2) Release(ctx context.Context) {
+	t := kernel.TaskFromContext(ctx)
+	t.Kernel().DeleteSocketVFS2(&s.vfsfd)
+	s.socketOpsCommon.Release(ctx)
 }
 
 // Readiness implements waiter.Waitable.Readiness.

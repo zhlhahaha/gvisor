@@ -35,29 +35,56 @@ import (
 const Name = "devpts"
 
 // FilesystemType implements vfs.FilesystemType.
-type FilesystemType struct{}
+//
+// +stateify savable
+type FilesystemType struct {
+	initOnce sync.Once `state:"nosave"` // FIXME(gvisor.dev/issue/1663): not yet supported.
+	initErr  error
+
+	// fs backs all mounts of this FilesystemType. root is fs' root. fs and root
+	// are immutable.
+	fs   *vfs.Filesystem
+	root *vfs.Dentry
+}
 
 // Name implements vfs.FilesystemType.Name.
-func (FilesystemType) Name() string {
+func (*FilesystemType) Name() string {
 	return Name
 }
 
-var _ vfs.FilesystemType = (*FilesystemType)(nil)
-
 // GetFilesystem implements vfs.FilesystemType.GetFilesystem.
-func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, source string, opts vfs.GetFilesystemOptions) (*vfs.Filesystem, *vfs.Dentry, error) {
+func (fstype *FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, source string, opts vfs.GetFilesystemOptions) (*vfs.Filesystem, *vfs.Dentry, error) {
 	// No data allowed.
 	if opts.Data != "" {
 		return nil, nil, syserror.EINVAL
 	}
 
-	fs, root, err := fstype.newFilesystem(vfsObj, creds)
-	if err != nil {
-		return nil, nil, err
+	fstype.initOnce.Do(func() {
+		fs, root, err := fstype.newFilesystem(vfsObj, creds)
+		if err != nil {
+			fstype.initErr = err
+			return
+		}
+		fstype.fs = fs.VFSFilesystem()
+		fstype.root = root.VFSDentry()
+	})
+	if fstype.initErr != nil {
+		return nil, nil, fstype.initErr
 	}
-	return fs.Filesystem.VFSFilesystem(), root.VFSDentry(), nil
+	fstype.fs.IncRef()
+	fstype.root.IncRef()
+	return fstype.fs, fstype.root, nil
 }
 
+// Release implements vfs.FilesystemType.Release.
+func (fstype *FilesystemType) Release(ctx context.Context) {
+	if fstype.fs != nil {
+		fstype.root.DecRef(ctx)
+		fstype.fs.DecRef(ctx)
+	}
+}
+
+// +stateify savable
 type filesystem struct {
 	kernfs.Filesystem
 
@@ -66,7 +93,7 @@ type filesystem struct {
 
 // newFilesystem creates a new devpts filesystem with root directory and ptmx
 // master inode. It returns the filesystem and root Dentry.
-func (fstype FilesystemType) newFilesystem(vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials) (*filesystem, *kernfs.Dentry, error) {
+func (fstype *FilesystemType) newFilesystem(vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials) (*filesystem, *kernfs.Dentry, error) {
 	devMinor, err := vfsObj.GetAnonBlockDevMinor()
 	if err != nil {
 		return nil, nil, err
@@ -84,7 +111,9 @@ func (fstype FilesystemType) newFilesystem(vfsObj *vfs.VirtualFilesystem, creds 
 	root.InodeAttrs.Init(creds, linux.UNNAMED_MAJOR, devMinor, 1, linux.ModeDirectory|0555)
 	root.OrderedChildren.Init(kernfs.OrderedChildrenOptions{})
 	root.EnableLeakCheck()
-	root.dentry.Init(root)
+
+	var rootD kernfs.Dentry
+	rootD.Init(&fs.Filesystem, root)
 
 	// Construct the pts master inode and dentry. Linux always uses inode
 	// id 2 for ptmx. See fs/devpts/inode.c:mknod_ptmx.
@@ -92,15 +121,14 @@ func (fstype FilesystemType) newFilesystem(vfsObj *vfs.VirtualFilesystem, creds 
 		root: root,
 	}
 	master.InodeAttrs.Init(creds, linux.UNNAMED_MAJOR, devMinor, 2, linux.ModeCharacterDevice|0666)
-	master.dentry.Init(master)
 
 	// Add the master as a child of the root.
-	links := root.OrderedChildren.Populate(&root.dentry, map[string]*kernfs.Dentry{
-		"ptmx": &master.dentry,
+	links := root.OrderedChildren.Populate(map[string]kernfs.Inode{
+		"ptmx": master,
 	})
 	root.IncLinks(links)
 
-	return fs, &root.dentry, nil
+	return fs, &rootD, nil
 }
 
 // Release implements vfs.FilesystemImpl.Release.
@@ -110,28 +138,25 @@ func (fs *filesystem) Release(ctx context.Context) {
 }
 
 // rootInode is the root directory inode for the devpts mounts.
+//
+// +stateify savable
 type rootInode struct {
 	implStatFS
-	kernfs.AlwaysValid
+	kernfs.InodeAlwaysValid
 	kernfs.InodeAttrs
 	kernfs.InodeDirectoryNoNewChildren
 	kernfs.InodeNotSymlink
+	kernfs.InodeTemporary // This holds no meaning as this inode can't be Looked up and is always valid.
 	kernfs.OrderedChildren
 	rootInodeRefs
 
 	locks vfs.FileLocks
 
-	// Keep a reference to this inode's dentry.
-	dentry kernfs.Dentry
-
 	// master is the master pty inode. Immutable.
 	master *masterInode
 
-	// root is the root directory inode for this filesystem. Immutable.
-	root *rootInode
-
 	// mu protects the fields below.
-	mu sync.Mutex
+	mu sync.Mutex `state:"nosave"`
 
 	// replicas maps pty ids to replica inodes.
 	replicas map[uint32]*replicaInode
@@ -168,21 +193,24 @@ func (i *rootInode) allocateTerminal(creds *auth.Credentials) (*Terminal, error)
 	// Linux always uses pty index + 3 as the inode id. See
 	// fs/devpts/inode.c:devpts_pty_new().
 	replica.InodeAttrs.Init(creds, i.InodeAttrs.DevMajor(), i.InodeAttrs.DevMinor(), uint64(idx+3), linux.ModeCharacterDevice|0600)
-	replica.dentry.Init(replica)
 	i.replicas[idx] = replica
 
 	return t, nil
 }
 
 // masterClose is called when the master end of t is closed.
-func (i *rootInode) masterClose(t *Terminal) {
+func (i *rootInode) masterClose(ctx context.Context, t *Terminal) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 
 	// Sanity check that replica with idx exists.
-	if _, ok := i.replicas[t.n]; !ok {
+	ri, ok := i.replicas[t.n]
+	if !ok {
 		panic(fmt.Sprintf("pty with index %d does not exist", t.n))
 	}
+
+	// Drop the ref on replica inode taken during rootInode.allocateTerminal.
+	ri.DecRef(ctx)
 	delete(i.replicas, t.n)
 }
 
@@ -198,16 +226,22 @@ func (i *rootInode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.D
 }
 
 // Lookup implements kernfs.Inode.Lookup.
-func (i *rootInode) Lookup(ctx context.Context, name string) (*kernfs.Dentry, error) {
+func (i *rootInode) Lookup(ctx context.Context, name string) (kernfs.Inode, error) {
+	// Check if a static entry was looked up.
+	if d, err := i.OrderedChildren.Lookup(ctx, name); err == nil {
+		return d, nil
+	}
+
+	// Not a static entry.
 	idx, err := strconv.ParseUint(name, 10, 32)
 	if err != nil {
 		return nil, syserror.ENOENT
 	}
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	if si, ok := i.replicas[uint32(idx)]; ok {
-		si.dentry.IncRef()
-		return &si.dentry, nil
+	if ri, ok := i.replicas[uint32(idx)]; ok {
+		ri.IncRef() // This ref is passed to the dentry upon creation via Init.
+		return ri, nil
 
 	}
 	return nil, syserror.ENOENT
@@ -238,10 +272,11 @@ func (i *rootInode) IterDirents(ctx context.Context, cb vfs.IterDirentsCallback,
 }
 
 // DecRef implements kernfs.Inode.DecRef.
-func (i *rootInode) DecRef(context.Context) {
-	i.rootInodeRefs.DecRef(i.Destroy)
+func (i *rootInode) DecRef(ctx context.Context) {
+	i.rootInodeRefs.DecRef(func() { i.Destroy(ctx) })
 }
 
+// +stateify savable
 type implStatFS struct{}
 
 // StatFS implements kernfs.Inode.StatFS.
