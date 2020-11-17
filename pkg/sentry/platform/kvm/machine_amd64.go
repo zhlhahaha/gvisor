@@ -252,38 +252,6 @@ func (c *vCPU) setSystemTime() error {
 	}
 }
 
-// setSystemTimeLegacy calibrates and sets an approximate system time.
-func (c *vCPU) setSystemTimeLegacy() error {
-	const minIterations = 10
-	minimum := uint64(0)
-	for iter := 0; ; iter++ {
-		// Try to set the TSC to an estimate of where it will be
-		// on the host during a "fast" system call iteration.
-		start := uint64(ktime.Rdtsc())
-		if err := c.setTSC(start + (minimum / 2)); err != nil {
-			return err
-		}
-		// See if this is our new minimum call time. Note that this
-		// serves two functions: one, we make sure that we are
-		// accurately predicting the offset we need to set. Second, we
-		// don't want to do the final set on a slow call, which could
-		// produce a really bad result.
-		end := uint64(ktime.Rdtsc())
-		if end < start {
-			continue // Totally bogus: unstable TSC?
-		}
-		current := end - start
-		if current < minimum || iter == 0 {
-			minimum = current // Set our new minimum.
-		}
-		// Is this past minIterations and within ~10% of minimum?
-		upperThreshold := (((minimum << 3) + minimum) >> 3)
-		if iter >= minIterations && current <= upperThreshold {
-			return nil
-		}
-	}
-}
-
 // nonCanonical generates a canonical address return.
 //
 //go:nosplit
@@ -464,30 +432,27 @@ func availableRegionsForSetMem() (phyRegions []physicalRegion) {
 	return physicalRegions
 }
 
-var execRegions = func() (regions []region) {
+func (m *machine) mapUpperHalf(pageTable *pagetables.PageTables) {
+	// Map all the executible regions so that all the entry functions
+	// are mapped in the upper half.
 	applyVirtualRegions(func(vr virtualRegion) {
 		if excludeVirtualRegion(vr) || vr.filename == "[vsyscall]" {
 			return
 		}
+
 		if vr.accessType.Execute {
-			regions = append(regions, vr.region)
+			r := vr.region
+			physical, length, ok := translateToPhysical(r.virtual)
+			if !ok || length < r.length {
+				panic("impossible translation")
+			}
+			pageTable.Map(
+				usermem.Addr(ring0.KernelStartAddress|r.virtual),
+				r.length,
+				pagetables.MapOpts{AccessType: usermem.Execute},
+				physical)
 		}
 	})
-	return
-}()
-
-func (m *machine) mapUpperHalf(pageTable *pagetables.PageTables) {
-	for _, r := range execRegions {
-		physical, length, ok := translateToPhysical(r.virtual)
-		if !ok || length < r.length {
-			panic("impossilbe translation")
-		}
-		pageTable.Map(
-			usermem.Addr(ring0.KernelStartAddress|r.virtual),
-			r.length,
-			pagetables.MapOpts{AccessType: usermem.Execute},
-			physical)
-	}
 	for start, end := range m.kernel.EntryRegions() {
 		regionLen := end - start
 		physical, length, ok := translateToPhysical(start)

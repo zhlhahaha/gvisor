@@ -102,21 +102,26 @@ type handshake struct {
 	// been received. This is required to stop retransmitting the
 	// original SYN-ACK when deferAccept is enabled.
 	acked bool
+
+	// sendSYNOpts is the cached values for the SYN options to be sent.
+	sendSYNOpts header.TCPSynOptions
 }
 
-func newHandshake(ep *endpoint, rcvWnd seqnum.Size) handshake {
-	h := handshake{
-		ep:          ep,
+func (e *endpoint) newHandshake() *handshake {
+	h := &handshake{
+		ep:          e,
 		active:      true,
-		rcvWnd:      rcvWnd,
-		rcvWndScale: ep.rcvWndScaleForHandshake(),
+		rcvWnd:      seqnum.Size(e.initialReceiveWindow()),
+		rcvWndScale: e.rcvWndScaleForHandshake(),
 	}
 	h.resetState()
+	// Store reference to handshake state in endpoint.
+	e.h = h
 	return h
 }
 
-func newPassiveHandshake(ep *endpoint, rcvWnd seqnum.Size, isn, irs seqnum.Value, opts *header.TCPSynOptions, deferAccept time.Duration) handshake {
-	h := newHandshake(ep, rcvWnd)
+func (e *endpoint) newPassiveHandshake(isn, irs seqnum.Value, opts *header.TCPSynOptions, deferAccept time.Duration) *handshake {
+	h := e.newHandshake()
 	h.resetToSynRcvd(isn, irs, opts, deferAccept)
 	return h
 }
@@ -293,9 +298,9 @@ func (h *handshake) synSentState(s *segment) *tcpip.Error {
 		MSS:           amss,
 	}
 	if ttl == 0 {
-		ttl = s.route.DefaultTTL()
+		ttl = h.ep.route.DefaultTTL()
 	}
-	h.ep.sendSynTCP(&s.route, tcpFields{
+	h.ep.sendSynTCP(&h.ep.route, tcpFields{
 		id:     h.ep.ID,
 		ttl:    ttl,
 		tos:    h.ep.sendTOS,
@@ -356,7 +361,7 @@ func (h *handshake) synRcvdState(s *segment) *tcpip.Error {
 			SACKPermitted: h.ep.sackPermitted,
 			MSS:           h.ep.amss,
 		}
-		h.ep.sendSynTCP(&s.route, tcpFields{
+		h.ep.sendSynTCP(&h.ep.route, tcpFields{
 			id:     h.ep.ID,
 			ttl:    h.ep.ttl,
 			tos:    h.ep.sendTOS,
@@ -496,12 +501,15 @@ func (h *handshake) resolveRoute() *tcpip.Error {
 		}
 
 		// Wait for notification.
-		index, _ = s.Fetch(true)
+		h.ep.mu.Unlock()
+		index, _ = s.Fetch(true /* block */)
+		h.ep.mu.Lock()
 	}
 }
 
-// execute executes the TCP 3-way handshake.
-func (h *handshake) execute() *tcpip.Error {
+// start resolves the route if necessary and sends the first
+// SYN/SYN-ACK.
+func (h *handshake) start() *tcpip.Error {
 	if h.ep.route.IsResolutionRequired() {
 		if err := h.resolveRoute(); err != nil {
 			return err
@@ -509,29 +517,13 @@ func (h *handshake) execute() *tcpip.Error {
 	}
 
 	h.startTime = time.Now()
-	// Initialize the resend timer.
-	resendWaker := sleep.Waker{}
-	timeOut := time.Duration(time.Second)
-	rt := time.AfterFunc(timeOut, resendWaker.Assert)
-	defer rt.Stop()
-
-	// Set up the wakers.
-	s := sleep.Sleeper{}
-	s.AddWaker(&resendWaker, wakerForResend)
-	s.AddWaker(&h.ep.notificationWaker, wakerForNotification)
-	s.AddWaker(&h.ep.newSegmentWaker, wakerForNewSegment)
-	defer s.Done()
-
+	h.ep.amss = calculateAdvertisedMSS(h.ep.userMSS, h.ep.route)
 	var sackEnabled tcpip.TCPSACKEnabled
 	if err := h.ep.stack.TransportProtocolOption(ProtocolNumber, &sackEnabled); err != nil {
 		// If stack returned an error when checking for SACKEnabled
 		// status then just default to switching off SACK negotiation.
 		sackEnabled = false
 	}
-
-	// Send the initial SYN segment and loop until the handshake is
-	// completed.
-	h.ep.amss = calculateAdvertisedMSS(h.ep.userMSS, h.ep.route)
 
 	synOpts := header.TCPSynOptions{
 		WS:            h.rcvWndScale,
@@ -542,9 +534,8 @@ func (h *handshake) execute() *tcpip.Error {
 		MSS:           h.ep.amss,
 	}
 
-	// Execute is also called in a listen context so we want to make sure we
-	// only send the TS/SACK option when we received the TS/SACK in the
-	// initial SYN.
+	// start() is also called in a listen context so we want to make sure we only
+	// send the TS/SACK option when we received the TS/SACK in the initial SYN.
 	if h.state == handshakeSynRcvd {
 		synOpts.TS = h.ep.sendTSOk
 		synOpts.SACKPermitted = h.ep.sackPermitted && bool(sackEnabled)
@@ -555,6 +546,7 @@ func (h *handshake) execute() *tcpip.Error {
 		}
 	}
 
+	h.sendSYNOpts = synOpts
 	h.ep.sendSynTCP(&h.ep.route, tcpFields{
 		id:     h.ep.ID,
 		ttl:    h.ep.ttl,
@@ -564,19 +556,38 @@ func (h *handshake) execute() *tcpip.Error {
 		ack:    h.ackNum,
 		rcvWnd: h.rcvWnd,
 	}, synOpts)
+	return nil
+}
+
+// complete completes the TCP 3-way handshake initiated by h.start().
+func (h *handshake) complete() *tcpip.Error {
+	// Set up the wakers.
+	s := sleep.Sleeper{}
+	resendWaker := sleep.Waker{}
+	s.AddWaker(&resendWaker, wakerForResend)
+	s.AddWaker(&h.ep.notificationWaker, wakerForNotification)
+	s.AddWaker(&h.ep.newSegmentWaker, wakerForNewSegment)
+	defer s.Done()
+
+	// Initialize the resend timer.
+	timer, err := newBackoffTimer(time.Second, MaxRTO, resendWaker.Assert)
+	if err != nil {
+		return err
+	}
+	defer timer.stop()
 
 	for h.state != handshakeCompleted {
+		// Unlock before blocking, and reacquire again afterwards (h.ep.mu is held
+		// throughout handshake processing).
 		h.ep.mu.Unlock()
-		index, _ := s.Fetch(true)
+		index, _ := s.Fetch(true /* block */)
 		h.ep.mu.Lock()
 		switch index {
 
 		case wakerForResend:
-			timeOut *= 2
-			if timeOut > MaxRTO {
-				return tcpip.ErrTimeout
+			if err := timer.reset(); err != nil {
+				return err
 			}
-			rt.Reset(timeOut)
 			// Resend the SYN/SYN-ACK only if the following conditions hold.
 			//  - It's an active handshake (deferAccept does not apply)
 			//  - It's a passive handshake and we have not yet got the final-ACK.
@@ -594,7 +605,7 @@ func (h *handshake) execute() *tcpip.Error {
 					seq:    h.iss,
 					ack:    h.ackNum,
 					rcvWnd: h.rcvWnd,
-				}, synOpts)
+				}, h.sendSYNOpts)
 			}
 
 		case wakerForNotification:
@@ -631,6 +642,34 @@ func (h *handshake) execute() *tcpip.Error {
 	}
 
 	return nil
+}
+
+type backoffTimer struct {
+	timeout    time.Duration
+	maxTimeout time.Duration
+	t          *time.Timer
+}
+
+func newBackoffTimer(timeout, maxTimeout time.Duration, f func()) (*backoffTimer, *tcpip.Error) {
+	if timeout > maxTimeout {
+		return nil, tcpip.ErrTimeout
+	}
+	bt := &backoffTimer{timeout: timeout, maxTimeout: maxTimeout}
+	bt.t = time.AfterFunc(timeout, f)
+	return bt, nil
+}
+
+func (bt *backoffTimer) reset() *tcpip.Error {
+	bt.timeout *= 2
+	if bt.timeout > MaxRTO {
+		return tcpip.ErrTimeout
+	}
+	bt.t.Reset(bt.timeout)
+	return nil
+}
+
+func (bt *backoffTimer) stop() {
+	bt.t.Stop()
 }
 
 func parseSynSegmentOptions(s *segment) header.TCPSynOptions {
@@ -767,7 +806,7 @@ func buildTCPHdr(r *stack.Route, tf tcpFields, pkt *stack.PacketBuffer, gso *sta
 		// TCP header, then the kernel calculate a checksum of the
 		// header and data and get the right sum of the TCP packet.
 		tcp.SetChecksum(xsum)
-	} else if r.Capabilities()&stack.CapabilityTXChecksumOffload == 0 {
+	} else if r.RequiresTXTransportChecksum() {
 		xsum = header.ChecksumVV(pkt.Data, xsum)
 		tcp.SetChecksum(^tcp.CalculateChecksum(xsum))
 	}
@@ -1040,13 +1079,13 @@ func (e *endpoint) transitionToStateCloseLocked() {
 // only when the endpoint is in StateClose and we want to deliver the segment
 // to any other listening endpoint. We reply with RST if we cannot find one.
 func (e *endpoint) tryDeliverSegmentFromClosedEndpoint(s *segment) {
-	ep := e.stack.FindTransportEndpoint(e.NetProto, e.TransProto, e.ID, &s.route)
+	ep := e.stack.FindTransportEndpoint(e.NetProto, e.TransProto, e.ID, s.nicID)
 	if ep == nil && e.NetProto == header.IPv6ProtocolNumber && e.EndpointInfo.TransportEndpointInfo.ID.LocalAddress.To4() != "" {
 		// Dual-stack socket, try IPv4.
-		ep = e.stack.FindTransportEndpoint(header.IPv4ProtocolNumber, e.TransProto, e.ID, &s.route)
+		ep = e.stack.FindTransportEndpoint(header.IPv4ProtocolNumber, e.TransProto, e.ID, s.nicID)
 	}
 	if ep == nil {
-		replyWithReset(s, stack.DefaultTOS, s.route.DefaultTTL())
+		replyWithReset(e.stack, s, stack.DefaultTOS, 0 /* ttl */)
 		s.decRef()
 		return
 	}
@@ -1338,14 +1377,7 @@ func (e *endpoint) protocolMainLoop(handshake bool, wakerInitDone chan<- struct{
 	}
 
 	if handshake {
-		// This is an active connection, so we must initiate the 3-way
-		// handshake, and then inform potential waiters about its
-		// completion.
-		initialRcvWnd := e.initialReceiveWindow()
-		h := newHandshake(e, seqnum.Size(initialRcvWnd))
-		h.ep.setEndpointState(StateSynSent)
-
-		if err := h.execute(); err != nil {
+		if err := e.h.complete(); err != nil {
 			e.lastErrorMu.Lock()
 			e.lastError = err
 			e.lastErrorMu.Unlock()
@@ -1360,13 +1392,12 @@ func (e *endpoint) protocolMainLoop(handshake bool, wakerInitDone chan<- struct{
 		}
 	}
 
-	e.keepalive.timer.init(&e.keepalive.waker)
-	defer e.keepalive.timer.cleanup()
-
 	drained := e.drainDone != nil
 	if drained {
 		close(e.drainDone)
+		e.mu.Unlock()
 		<-e.undrain
+		e.mu.Lock()
 	}
 
 	// Set up the functions that will be called when the main protocol loop
@@ -1445,7 +1476,6 @@ func (e *endpoint) protocolMainLoop(handshake bool, wakerInitDone chan<- struct{
 						// The socket has been closed and we are in FIN_WAIT2
 						// so start the FIN_WAIT2 timer.
 						closeTimer = time.AfterFunc(e.tcpLingerTimeout, closeWaker.Assert)
-						e.waiterQueue.Notify(waiter.EventHUp | waiter.EventErr | waiter.EventIn | waiter.EventOut)
 					}
 				}
 
@@ -1535,7 +1565,7 @@ loop:
 		}
 
 		e.mu.Unlock()
-		v, _ := s.Fetch(true)
+		v, _ := s.Fetch(true /* block */)
 		e.mu.Lock()
 
 		// We need to double check here because the notification may be
@@ -1620,7 +1650,7 @@ func (e *endpoint) handleTimeWaitSegments() (extendTimeWait bool, reuseTW func()
 				netProtos = []tcpip.NetworkProtocolNumber{header.IPv4ProtocolNumber, header.IPv6ProtocolNumber}
 			}
 			for _, netProto := range netProtos {
-				if listenEP := e.stack.FindTransportEndpoint(netProto, info.TransProto, newID, &s.route); listenEP != nil {
+				if listenEP := e.stack.FindTransportEndpoint(netProto, info.TransProto, newID, s.nicID); listenEP != nil {
 					tcpEP := listenEP.(*endpoint)
 					if EndpointState(tcpEP.State()) == StateListen {
 						reuseTW = func() {
@@ -1683,7 +1713,7 @@ func (e *endpoint) doTimeWait() (twReuse func()) {
 
 	for {
 		e.mu.Unlock()
-		v, _ := s.Fetch(true)
+		v, _ := s.Fetch(true /* block */)
 		e.mu.Lock()
 		switch v {
 		case newSegment:

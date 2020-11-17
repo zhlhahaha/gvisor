@@ -24,6 +24,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/refsvfs2"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/syserror"
 )
@@ -106,6 +107,7 @@ func newMount(vfs *VirtualFilesystem, fs *Filesystem, root *Dentry, mntns *Mount
 	if opts.ReadOnly {
 		mnt.setReadOnlyLocked(true)
 	}
+	refsvfs2.Register(mnt)
 	return mnt
 }
 
@@ -167,7 +169,7 @@ func (vfs *VirtualFilesystem) NewMountNamespace(ctx context.Context, creds *auth
 		Owner:       creds.UserNamespace,
 		mountpoints: make(map[*Dentry]uint32),
 	}
-	mntns.EnableLeakCheck()
+	mntns.InitRefs()
 	mntns.root = newMount(vfs, fs, root, mntns, opts)
 	return mntns, nil
 }
@@ -470,11 +472,14 @@ func (vfs *VirtualFilesystem) disconnectLocked(mnt *Mount) VirtualDentry {
 // tryIncMountedRef does not require that a reference is held on mnt.
 func (mnt *Mount) tryIncMountedRef() bool {
 	for {
-		refs := atomic.LoadInt64(&mnt.refs)
-		if refs <= 0 { // refs < 0 => MSB set => eagerly unmounted
+		r := atomic.LoadInt64(&mnt.refs)
+		if r <= 0 { // r < 0 => MSB set => eagerly unmounted
 			return false
 		}
-		if atomic.CompareAndSwapInt64(&mnt.refs, refs, refs+1) {
+		if atomic.CompareAndSwapInt64(&mnt.refs, r, r+1) {
+			if mnt.LogRefs() {
+				refsvfs2.LogTryIncRef(mnt, r+1)
+			}
 			return true
 		}
 	}
@@ -484,29 +489,58 @@ func (mnt *Mount) tryIncMountedRef() bool {
 func (mnt *Mount) IncRef() {
 	// In general, negative values for mnt.refs are valid because the MSB is
 	// the eager-unmount bit.
-	atomic.AddInt64(&mnt.refs, 1)
+	r := atomic.AddInt64(&mnt.refs, 1)
+	if mnt.LogRefs() {
+		refsvfs2.LogIncRef(mnt, r)
+	}
 }
 
 // DecRef decrements mnt's reference count.
 func (mnt *Mount) DecRef(ctx context.Context) {
-	refs := atomic.AddInt64(&mnt.refs, -1)
-	if refs&^math.MinInt64 == 0 { // mask out MSB
-		var vd VirtualDentry
-		if mnt.parent() != nil {
-			mnt.vfs.mountMu.Lock()
-			mnt.vfs.mounts.seq.BeginWrite()
-			vd = mnt.vfs.disconnectLocked(mnt)
-			mnt.vfs.mounts.seq.EndWrite()
-			mnt.vfs.mountMu.Unlock()
-		}
-		if mnt.root != nil {
-			mnt.root.DecRef(ctx)
-		}
-		mnt.fs.DecRef(ctx)
-		if vd.Ok() {
-			vd.DecRef(ctx)
-		}
+	r := atomic.AddInt64(&mnt.refs, -1)
+	if mnt.LogRefs() {
+		refsvfs2.LogDecRef(mnt, r)
 	}
+	if r&^math.MinInt64 == 0 { // mask out MSB
+		refsvfs2.Unregister(mnt)
+		mnt.destroy(ctx)
+	}
+}
+
+func (mnt *Mount) destroy(ctx context.Context) {
+	var vd VirtualDentry
+	if mnt.parent() != nil {
+		mnt.vfs.mountMu.Lock()
+		mnt.vfs.mounts.seq.BeginWrite()
+		vd = mnt.vfs.disconnectLocked(mnt)
+		mnt.vfs.mounts.seq.EndWrite()
+		mnt.vfs.mountMu.Unlock()
+	}
+	if mnt.root != nil {
+		mnt.root.DecRef(ctx)
+	}
+	mnt.fs.DecRef(ctx)
+	if vd.Ok() {
+		vd.DecRef(ctx)
+	}
+}
+
+// RefType implements refsvfs2.CheckedObject.Type.
+func (mnt *Mount) RefType() string {
+	return "vfs.Mount"
+}
+
+// LeakMessage implements refsvfs2.CheckedObject.LeakMessage.
+func (mnt *Mount) LeakMessage() string {
+	return fmt.Sprintf("[vfs.Mount %p] reference count of %d instead of 0", mnt, atomic.LoadInt64(&mnt.refs))
+}
+
+// LogRefs implements refsvfs2.CheckedObject.LogRefs.
+//
+// This should only be set to true for debugging purposes, as it can generate an
+// extremely large amount of output and drastically degrade performance.
+func (mnt *Mount) LogRefs() bool {
+	return false
 }
 
 // DecRef decrements mntns' reference count.

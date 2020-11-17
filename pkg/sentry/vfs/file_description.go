@@ -133,7 +133,7 @@ func (fd *FileDescription) Init(impl FileDescriptionImpl, flags uint32, mnt *Mou
 		}
 	}
 
-	fd.EnableLeakCheck()
+	fd.InitRefs()
 
 	// Remove "file creation flags" to mirror the behavior from file.f_flags in
 	// fs/open.c:do_dentry_open.
@@ -183,7 +183,6 @@ func (fd *FileDescription) DecRef(ctx context.Context) {
 		}
 		fd.vd.DecRef(ctx)
 		fd.flagsMu.Lock()
-		// TODO(gvisor.dev/issue/1663): We may need to unregister during save, as we do in VFS1.
 		if fd.statusFlags&linux.O_ASYNC != 0 && fd.asyncHandler != nil {
 			fd.asyncHandler.Unregister(fd)
 		}

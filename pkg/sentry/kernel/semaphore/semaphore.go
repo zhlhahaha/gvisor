@@ -103,6 +103,7 @@ type waiter struct {
 	waiterEntry
 
 	// value represents how much resource the waiter needs to wake up.
+	// The value is either 0 or negative.
 	value int16
 	ch    chan struct{}
 }
@@ -283,6 +284,33 @@ func (s *Set) Change(ctx context.Context, creds *auth.Credentials, owner fs.File
 	return nil
 }
 
+// GetStat extracts semid_ds information from the set.
+func (s *Set) GetStat(creds *auth.Credentials) (*linux.SemidDS, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// "The calling process must have read permission on the semaphore set."
+	if !s.checkPerms(creds, fs.PermMask{Read: true}) {
+		return nil, syserror.EACCES
+	}
+
+	ds := &linux.SemidDS{
+		SemPerm: linux.IPCPerm{
+			Key:  uint32(s.key),
+			UID:  uint32(creds.UserNamespace.MapFromKUID(s.owner.UID)),
+			GID:  uint32(creds.UserNamespace.MapFromKGID(s.owner.GID)),
+			CUID: uint32(creds.UserNamespace.MapFromKUID(s.creator.UID)),
+			CGID: uint32(creds.UserNamespace.MapFromKGID(s.creator.GID)),
+			Mode: uint16(s.perms.LinuxMode()),
+			Seq:  0, // IPC sequence not supported.
+		},
+		SemOTime: s.opTime.TimeT(),
+		SemCTime: s.changeTime.TimeT(),
+		SemNSems: uint64(s.Size()),
+	}
+	return ds, nil
+}
+
 // SetVal overrides a semaphore value, waking up waiters as needed.
 func (s *Set) SetVal(ctx context.Context, num int32, val int16, creds *auth.Credentials, pid int32) error {
 	if val < 0 || val > valueMax {
@@ -320,7 +348,7 @@ func (s *Set) SetValAll(ctx context.Context, vals []uint16, creds *auth.Credenti
 	}
 
 	for _, val := range vals {
-		if val < 0 || val > valueMax {
+		if val > valueMax {
 			return syserror.ERANGE
 		}
 	}
@@ -394,6 +422,42 @@ func (s *Set) GetPID(num int32, creds *auth.Credentials) (int32, error) {
 		return 0, syserror.ERANGE
 	}
 	return sem.pid, nil
+}
+
+func (s *Set) countWaiters(num int32, creds *auth.Credentials, pred func(w *waiter) bool) (uint16, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// The calling process must have read permission on the semaphore set.
+	if !s.checkPerms(creds, fs.PermMask{Read: true}) {
+		return 0, syserror.EACCES
+	}
+
+	sem := s.findSem(num)
+	if sem == nil {
+		return 0, syserror.ERANGE
+	}
+	var cnt uint16
+	for w := sem.waiters.Front(); w != nil; w = w.Next() {
+		if pred(w) {
+			cnt++
+		}
+	}
+	return cnt, nil
+}
+
+// CountZeroWaiters returns number of waiters waiting for the sem's value to increase.
+func (s *Set) CountZeroWaiters(num int32, creds *auth.Credentials) (uint16, error) {
+	return s.countWaiters(num, creds, func(w *waiter) bool {
+		return w.value == 0
+	})
+}
+
+// CountNegativeWaiters returns number of waiters waiting for the sem to go to zero.
+func (s *Set) CountNegativeWaiters(num int32, creds *auth.Credentials) (uint16, error) {
+	return s.countWaiters(num, creds, func(w *waiter) bool {
+		return w.value < 0
+	})
 }
 
 // ExecuteOps attempts to execute a list of operations to the set. It only
@@ -548,11 +612,18 @@ func (s *Set) destroy() {
 	}
 }
 
+func abs(val int16) int16 {
+	if val < 0 {
+		return -val
+	}
+	return val
+}
+
 // wakeWaiters goes over all waiters and checks which of them can be notified.
 func (s *sem) wakeWaiters() {
 	// Note that this will release all waiters waiting for 0 too.
 	for w := s.waiters.Front(); w != nil; {
-		if s.value < w.value {
+		if s.value < abs(w.value) {
 			// Still blocked, skip it.
 			w = w.Next()
 			continue

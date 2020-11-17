@@ -127,7 +127,13 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		log.Warningf("%s.GetFilesystem: couldn't get kernel task from context", fsType.Name())
 		return nil, nil, syserror.EINVAL
 	}
-	fuseFd := kernelTask.GetFileVFS2(int32(deviceDescriptor))
+	fuseFDGeneric := kernelTask.GetFileVFS2(int32(deviceDescriptor))
+	defer fuseFDGeneric.DecRef(ctx)
+	fuseFD, ok := fuseFDGeneric.Impl().(*DeviceFD)
+	if !ok {
+		log.Warningf("%s.GetFilesystem: device FD is %T, not a FUSE device", fsType.Name, fuseFDGeneric)
+		return nil, nil, syserror.EINVAL
+	}
 
 	// Parse and set all the other supported FUSE mount options.
 	// TODO(gVisor.dev/issue/3229): Expand the supported mount options.
@@ -189,44 +195,47 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	}
 
 	// Create a new FUSE filesystem.
-	fs, err := newFUSEFilesystem(ctx, devMinor, &fsopts, fuseFd)
+	fs, err := newFUSEFilesystem(ctx, vfsObj, &fsType, fuseFD, devMinor, &fsopts)
 	if err != nil {
 		log.Warningf("%s.NewFUSEFilesystem: failed with error: %v", fsType.Name(), err)
 		return nil, nil, err
 	}
 
-	fs.VFSFilesystem().Init(vfsObj, &fsType, fs)
-
 	// Send a FUSE_INIT request to the FUSE daemon server before returning.
 	// This call is not blocking.
 	if err := fs.conn.InitSend(creds, uint32(kernelTask.ThreadID())); err != nil {
 		log.Warningf("%s.InitSend: failed with error: %v", fsType.Name(), err)
+		fs.VFSFilesystem().DecRef(ctx) // returned by newFUSEFilesystem
 		return nil, nil, err
 	}
 
 	// root is the fusefs root directory.
-	root := fs.newRootInode(creds, fsopts.rootMode)
+	root := fs.newRoot(ctx, creds, fsopts.rootMode)
 
 	return fs.VFSFilesystem(), root.VFSDentry(), nil
 }
 
 // newFUSEFilesystem creates a new FUSE filesystem.
-func newFUSEFilesystem(ctx context.Context, devMinor uint32, opts *filesystemOptions, device *vfs.FileDescription) (*filesystem, error) {
-	conn, err := newFUSEConnection(ctx, device, opts)
+func newFUSEFilesystem(ctx context.Context, vfsObj *vfs.VirtualFilesystem, fsType *FilesystemType, fuseFD *DeviceFD, devMinor uint32, opts *filesystemOptions) (*filesystem, error) {
+	conn, err := newFUSEConnection(ctx, fuseFD, opts)
 	if err != nil {
 		log.Warningf("fuse.NewFUSEFilesystem: NewFUSEConnection failed with error: %v", err)
 		return nil, syserror.EINVAL
 	}
-
-	fuseFD := device.Impl().(*DeviceFD)
 
 	fs := &filesystem{
 		devMinor: devMinor,
 		opts:     opts,
 		conn:     conn,
 	}
+	fs.VFSFilesystem().Init(vfsObj, fsType, fs)
 
-	fs.VFSFilesystem().IncRef()
+	// FIXME(gvisor.dev/issue/4813): Doesn't conn or fs need to hold a
+	// reference on fuseFD, since conn uses fuseFD for communication with the
+	// server? Wouldn't doing so create a circular reference?
+	fs.VFSFilesystem().IncRef() // for fuseFD.fs
+	// FIXME(gvisor.dev/issue/4813): fuseFD.fs is accessed without
+	// synchronization.
 	fuseFD.fs = fs
 
 	return fs, nil
@@ -284,24 +293,24 @@ type inode struct {
 	link string
 }
 
-func (fs *filesystem) newRootInode(creds *auth.Credentials, mode linux.FileMode) *kernfs.Dentry {
+func (fs *filesystem) newRoot(ctx context.Context, creds *auth.Credentials, mode linux.FileMode) *kernfs.Dentry {
 	i := &inode{fs: fs, nodeID: 1}
-	i.InodeAttrs.Init(creds, linux.UNNAMED_MAJOR, fs.devMinor, 1, linux.ModeDirectory|0755)
+	i.InodeAttrs.Init(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, 1, linux.ModeDirectory|0755)
 	i.OrderedChildren.Init(kernfs.OrderedChildrenOptions{})
-	i.EnableLeakCheck()
+	i.InitRefs()
 
 	var d kernfs.Dentry
-	d.Init(&fs.Filesystem, i)
+	d.InitRoot(&fs.Filesystem, i)
 	return &d
 }
 
-func (fs *filesystem) newInode(nodeID uint64, attr linux.FUSEAttr) kernfs.Inode {
+func (fs *filesystem) newInode(ctx context.Context, nodeID uint64, attr linux.FUSEAttr) kernfs.Inode {
 	i := &inode{fs: fs, nodeID: nodeID}
 	creds := auth.Credentials{EffectiveKGID: auth.KGID(attr.UID), EffectiveKUID: auth.KUID(attr.UID)}
-	i.InodeAttrs.Init(&creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), linux.FileMode(attr.Mode))
+	i.InodeAttrs.Init(ctx, &creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), linux.FileMode(attr.Mode))
 	atomic.StoreUint64(&i.size, attr.Size)
 	i.OrderedChildren.Init(kernfs.OrderedChildrenOptions{})
-	i.EnableLeakCheck()
+	i.InitRefs()
 	return i
 }
 
@@ -424,7 +433,7 @@ func (i *inode) Keep() bool {
 }
 
 // IterDirents implements kernfs.Inode.IterDirents.
-func (*inode) IterDirents(ctx context.Context, callback vfs.IterDirentsCallback, offset, relOffset int64) (int64, error) {
+func (*inode) IterDirents(ctx context.Context, mnt *vfs.Mount, callback vfs.IterDirentsCallback, offset, relOffset int64) (int64, error) {
 	return offset, nil
 }
 
@@ -544,7 +553,7 @@ func (i *inode) newEntry(ctx context.Context, name string, fileType linux.FileMo
 	if opcode != linux.FUSE_LOOKUP && ((out.Attr.Mode&linux.S_IFMT)^uint32(fileType) != 0 || out.NodeID == 0 || out.NodeID == linux.FUSE_ROOT_ID) {
 		return nil, syserror.EIO
 	}
-	child := i.fs.newInode(out.NodeID, out.Attr)
+	child := i.fs.newInode(ctx, out.NodeID, out.Attr)
 	return child, nil
 }
 
@@ -696,7 +705,7 @@ func (i *inode) getAttr(ctx context.Context, fs *vfs.Filesystem, opts vfs.StatOp
 	}
 
 	// Set the metadata of kernfs.InodeAttrs.
-	if err := i.SetInodeStat(ctx, fs, creds, vfs.SetStatOptions{
+	if err := i.InodeAttrs.SetStat(ctx, fs, creds, vfs.SetStatOptions{
 		Stat: statFromFUSEAttr(out.Attr, linux.STATX_ALL, i.fs.devMinor),
 	}); err != nil {
 		return linux.FUSEAttr{}, err
@@ -812,7 +821,7 @@ func (i *inode) setAttr(ctx context.Context, fs *vfs.Filesystem, creds *auth.Cre
 	}
 
 	// Set the metadata of kernfs.InodeAttrs.
-	if err := i.SetInodeStat(ctx, fs, creds, vfs.SetStatOptions{
+	if err := i.InodeAttrs.SetStat(ctx, fs, creds, vfs.SetStatOptions{
 		Stat: statFromFUSEAttr(out.Attr, linux.STATX_ALL, i.fs.devMinor),
 	}); err != nil {
 		return err

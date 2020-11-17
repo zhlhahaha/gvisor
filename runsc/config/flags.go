@@ -29,7 +29,7 @@ import (
 
 var registration sync.Once
 
-// This is the set of flags used to populate Config.
+// RegisterFlags registers flags used to populate Config.
 func RegisterFlags() {
 	registration.Do(func() {
 		// Although these flags are not part of the OCI spec, they are used by
@@ -49,6 +49,7 @@ func RegisterFlags() {
 		flag.String("debug-log-format", "text", "log format: text (default), json, or json-k8s.")
 		flag.Bool("alsologtostderr", false, "send log messages to stderr.")
 		flag.Bool("allow-flag-override", false, "allow OCI annotations (dev.gvisor.flag.<name>) to override flags for debugging.")
+		flag.String("traceback", "system", "golang runtime's traceback level")
 
 		// Debugging flags: strace related
 		flag.Bool("strace", false, "enable strace.")
@@ -70,7 +71,7 @@ func RegisterFlags() {
 		flag.Bool("overlay", false, "wrap filesystem mounts with writable overlay. All modifications are stored in memory inside the sandbox.")
 		flag.Bool("overlayfs-stale-read", true, "assume root mount is an overlay filesystem")
 		flag.Bool("fsgofer-host-uds", false, "allow the gofer to mount Unix Domain Sockets.")
-		flag.Bool("vfs2", false, "TEST ONLY; use while VFSv2 is landing. This uses the new experimental VFS layer.")
+		flag.Bool("vfs2", false, "enables VFSv2. This uses the new VFS layer that is faster than the previous one.")
 		flag.Bool("fuse", false, "TEST ONLY; use while FUSE in VFSv2 is landing. This allows the use of the new experimental FUSE filesystem.")
 
 		// Flags that control sandbox runtime behavior: network related.

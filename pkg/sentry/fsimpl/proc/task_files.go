@@ -31,6 +31,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/mm"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
+	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
@@ -247,9 +248,9 @@ type commInode struct {
 	task *kernel.Task
 }
 
-func (fs *filesystem) newComm(task *kernel.Task, ino uint64, perm linux.FileMode) kernfs.Inode {
+func (fs *filesystem) newComm(ctx context.Context, task *kernel.Task, ino uint64, perm linux.FileMode) kernfs.Inode {
 	inode := &commInode{task: task}
-	inode.DynamicBytesFile.Init(task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, ino, &commData{task: task}, perm)
+	inode.DynamicBytesFile.Init(ctx, task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, ino, &commData{task: task}, perm)
 	return inode
 }
 
@@ -364,6 +365,162 @@ func (d *idMapData) Write(ctx context.Context, src usermem.IOSequence, offset in
 	// On success, Linux's kernel/user_namespace.c:map_write() always returns
 	// count, even if fewer bytes were used.
 	return int64(srclen), nil
+}
+
+var _ kernfs.Inode = (*memInode)(nil)
+
+// memInode implements kernfs.Inode for /proc/[pid]/mem.
+//
+// +stateify savable
+type memInode struct {
+	kernfs.InodeAttrs
+	kernfs.InodeNoStatFS
+	kernfs.InodeNoopRefCount
+	kernfs.InodeNotDirectory
+	kernfs.InodeNotSymlink
+
+	task  *kernel.Task
+	locks vfs.FileLocks
+}
+
+func (fs *filesystem) newMemInode(ctx context.Context, task *kernel.Task, ino uint64, perm linux.FileMode) kernfs.Inode {
+	// Note: credentials are overridden by taskOwnedInode.
+	inode := &memInode{task: task}
+	inode.init(ctx, task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, ino, perm)
+	return &taskOwnedInode{Inode: inode, owner: task}
+}
+
+func (f *memInode) init(ctx context.Context, creds *auth.Credentials, devMajor, devMinor uint32, ino uint64, perm linux.FileMode) {
+	if perm&^linux.PermissionsMask != 0 {
+		panic(fmt.Sprintf("Only permission mask must be set: %x", perm&linux.PermissionsMask))
+	}
+	f.InodeAttrs.Init(ctx, creds, devMajor, devMinor, ino, linux.ModeRegular|perm)
+}
+
+// Open implements kernfs.Inode.Open.
+func (f *memInode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
+	// TODO(gvisor.dev/issue/260): Add check for PTRACE_MODE_ATTACH_FSCREDS
+	// Permission to read this file is governed by PTRACE_MODE_ATTACH_FSCREDS
+	// Since we dont implement setfsuid/setfsgid we can just use PTRACE_MODE_ATTACH
+	if !kernel.ContextCanTrace(ctx, f.task, true) {
+		return nil, syserror.EACCES
+	}
+	if err := checkTaskState(f.task); err != nil {
+		return nil, err
+	}
+	fd := &memFD{}
+	if err := fd.Init(rp.Mount(), d, f, opts.Flags); err != nil {
+		return nil, err
+	}
+	return &fd.vfsfd, nil
+}
+
+// SetStat implements kernfs.Inode.SetStat.
+func (*memInode) SetStat(context.Context, *vfs.Filesystem, *auth.Credentials, vfs.SetStatOptions) error {
+	return syserror.EPERM
+}
+
+var _ vfs.FileDescriptionImpl = (*memFD)(nil)
+
+// memFD implements vfs.FileDescriptionImpl for /proc/[pid]/mem.
+//
+// +stateify savable
+type memFD struct {
+	vfsfd vfs.FileDescription
+	vfs.FileDescriptionDefaultImpl
+	vfs.LockFD
+
+	inode *memInode
+
+	// mu guards the fields below.
+	mu     sync.Mutex `state:"nosave"`
+	offset int64
+}
+
+// Init initializes memFD.
+func (fd *memFD) Init(m *vfs.Mount, d *kernfs.Dentry, inode *memInode, flags uint32) error {
+	fd.LockFD.Init(&inode.locks)
+	if err := fd.vfsfd.Init(fd, flags, m, d.VFSDentry(), &vfs.FileDescriptionOptions{}); err != nil {
+		return err
+	}
+	fd.inode = inode
+	return nil
+}
+
+// Seek implements vfs.FileDescriptionImpl.Seek.
+func (fd *memFD) Seek(ctx context.Context, offset int64, whence int32) (int64, error) {
+	fd.mu.Lock()
+	defer fd.mu.Unlock()
+	switch whence {
+	case linux.SEEK_SET:
+	case linux.SEEK_CUR:
+		offset += fd.offset
+	default:
+		return 0, syserror.EINVAL
+	}
+	if offset < 0 {
+		return 0, syserror.EINVAL
+	}
+	fd.offset = offset
+	return offset, nil
+}
+
+// PRead implements vfs.FileDescriptionImpl.PRead.
+func (fd *memFD) PRead(ctx context.Context, dst usermem.IOSequence, offset int64, opts vfs.ReadOptions) (int64, error) {
+	if dst.NumBytes() == 0 {
+		return 0, nil
+	}
+	m, err := getMMIncRef(fd.inode.task)
+	if err != nil {
+		return 0, nil
+	}
+	defer m.DecUsers(ctx)
+	// Buffer the read data because of MM locks
+	buf := make([]byte, dst.NumBytes())
+	n, readErr := m.CopyIn(ctx, usermem.Addr(offset), buf, usermem.IOOpts{IgnorePermissions: true})
+	if n > 0 {
+		if _, err := dst.CopyOut(ctx, buf[:n]); err != nil {
+			return 0, syserror.EFAULT
+		}
+		return int64(n), nil
+	}
+	if readErr != nil {
+		return 0, syserror.EIO
+	}
+	return 0, nil
+}
+
+// Read implements vfs.FileDescriptionImpl.Read.
+func (fd *memFD) Read(ctx context.Context, dst usermem.IOSequence, opts vfs.ReadOptions) (int64, error) {
+	fd.mu.Lock()
+	n, err := fd.PRead(ctx, dst, fd.offset, opts)
+	fd.offset += n
+	fd.mu.Unlock()
+	return n, err
+}
+
+// Stat implements vfs.FileDescriptionImpl.Stat.
+func (fd *memFD) Stat(ctx context.Context, opts vfs.StatOptions) (linux.Statx, error) {
+	fs := fd.vfsfd.VirtualDentry().Mount().Filesystem()
+	return fd.inode.Stat(ctx, fs, opts)
+}
+
+// SetStat implements vfs.FileDescriptionImpl.SetStat.
+func (fd *memFD) SetStat(context.Context, vfs.SetStatOptions) error {
+	return syserror.EPERM
+}
+
+// Release implements vfs.FileDescriptionImpl.Release.
+func (fd *memFD) Release(context.Context) {}
+
+// LockPOSIX implements vfs.FileDescriptionImpl.LockPOSIX.
+func (fd *memFD) LockPOSIX(ctx context.Context, uid fslock.UniqueID, t fslock.LockType, start, length uint64, whence int16, block fslock.Blocker) error {
+	return fd.Locks().LockPOSIX(ctx, &fd.vfsfd, uid, t, start, length, whence, block)
+}
+
+// UnlockPOSIX implements vfs.FileDescriptionImpl.UnlockPOSIX.
+func (fd *memFD) UnlockPOSIX(ctx context.Context, uid fslock.UniqueID, start, length uint64, whence int16) error {
+	return fd.Locks().UnlockPOSIX(ctx, &fd.vfsfd, uid, start, length, whence)
 }
 
 // mapsData implements vfs.DynamicBytesSource for /proc/[pid]/maps.
@@ -655,9 +812,9 @@ type exeSymlink struct {
 
 var _ kernfs.Inode = (*exeSymlink)(nil)
 
-func (fs *filesystem) newExeSymlink(task *kernel.Task, ino uint64) kernfs.Inode {
+func (fs *filesystem) newExeSymlink(ctx context.Context, task *kernel.Task, ino uint64) kernfs.Inode {
 	inode := &exeSymlink{task: task}
-	inode.Init(task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, ino, linux.ModeSymlink|0777)
+	inode.Init(ctx, task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, ino, linux.ModeSymlink|0777)
 	return inode
 }
 
@@ -731,9 +888,9 @@ type cwdSymlink struct {
 
 var _ kernfs.Inode = (*cwdSymlink)(nil)
 
-func (fs *filesystem) newCwdSymlink(task *kernel.Task, ino uint64) kernfs.Inode {
+func (fs *filesystem) newCwdSymlink(ctx context.Context, task *kernel.Task, ino uint64) kernfs.Inode {
 	inode := &cwdSymlink{task: task}
-	inode.Init(task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, ino, linux.ModeSymlink|0777)
+	inode.Init(ctx, task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, ino, linux.ModeSymlink|0777)
 	return inode
 }
 
@@ -842,7 +999,7 @@ type namespaceSymlink struct {
 	task *kernel.Task
 }
 
-func (fs *filesystem) newNamespaceSymlink(task *kernel.Task, ino uint64, ns string) kernfs.Inode {
+func (fs *filesystem) newNamespaceSymlink(ctx context.Context, task *kernel.Task, ino uint64, ns string) kernfs.Inode {
 	// Namespace symlinks should contain the namespace name and the inode number
 	// for the namespace instance, so for example user:[123456]. We currently fake
 	// the inode number by sticking the symlink inode in its place.
@@ -850,7 +1007,7 @@ func (fs *filesystem) newNamespaceSymlink(task *kernel.Task, ino uint64, ns stri
 
 	inode := &namespaceSymlink{task: task}
 	// Note: credentials are overridden by taskOwnedInode.
-	inode.Init(task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, ino, target)
+	inode.Init(ctx, task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, ino, target)
 
 	taskInode := &taskOwnedInode{Inode: inode, owner: task}
 	return taskInode
@@ -872,8 +1029,10 @@ func (s *namespaceSymlink) Getlink(ctx context.Context, mnt *vfs.Mount) (vfs.Vir
 
 	// Create a synthetic inode to represent the namespace.
 	fs := mnt.Filesystem().Impl().(*filesystem)
+	nsInode := &namespaceInode{}
+	nsInode.Init(ctx, auth.CredentialsFromContext(ctx), linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), 0444)
 	dentry := &kernfs.Dentry{}
-	dentry.Init(&fs.Filesystem, &namespaceInode{})
+	dentry.Init(&fs.Filesystem, nsInode)
 	vd := vfs.MakeVirtualDentry(mnt, dentry.VFSDentry())
 	// Only IncRef vd.Mount() because vd.Dentry() already holds a ref of 1.
 	mnt.IncRef()
@@ -897,11 +1056,11 @@ type namespaceInode struct {
 var _ kernfs.Inode = (*namespaceInode)(nil)
 
 // Init initializes a namespace inode.
-func (i *namespaceInode) Init(creds *auth.Credentials, devMajor, devMinor uint32, ino uint64, perm linux.FileMode) {
+func (i *namespaceInode) Init(ctx context.Context, creds *auth.Credentials, devMajor, devMinor uint32, ino uint64, perm linux.FileMode) {
 	if perm&^linux.PermissionsMask != 0 {
 		panic(fmt.Sprintf("Only permission mask must be set: %x", perm&linux.PermissionsMask))
 	}
-	i.InodeAttrs.Init(creds, devMajor, devMinor, ino, linux.ModeRegular|perm)
+	i.InodeAttrs.Init(ctx, creds, devMajor, devMinor, ino, linux.ModeRegular|perm)
 }
 
 // Open implements kernfs.Inode.Open.

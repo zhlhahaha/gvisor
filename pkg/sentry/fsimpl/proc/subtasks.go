@@ -50,7 +50,7 @@ type subtasksInode struct {
 
 var _ kernfs.Inode = (*subtasksInode)(nil)
 
-func (fs *filesystem) newSubtasks(task *kernel.Task, pidns *kernel.PIDNamespace, cgroupControllers map[string]string) kernfs.Inode {
+func (fs *filesystem) newSubtasks(ctx context.Context, task *kernel.Task, pidns *kernel.PIDNamespace, cgroupControllers map[string]string) kernfs.Inode {
 	subInode := &subtasksInode{
 		fs:                fs,
 		task:              task,
@@ -58,9 +58,9 @@ func (fs *filesystem) newSubtasks(task *kernel.Task, pidns *kernel.PIDNamespace,
 		cgroupControllers: cgroupControllers,
 	}
 	// Note: credentials are overridden by taskOwnedInode.
-	subInode.InodeAttrs.Init(task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), linux.ModeDirectory|0555)
+	subInode.InodeAttrs.Init(ctx, task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), linux.ModeDirectory|0555)
 	subInode.OrderedChildren.Init(kernfs.OrderedChildrenOptions{})
-	subInode.EnableLeakCheck()
+	subInode.InitRefs()
 
 	inode := &taskOwnedInode{Inode: subInode, owner: task}
 	return inode
@@ -80,11 +80,11 @@ func (i *subtasksInode) Lookup(ctx context.Context, name string) (kernfs.Inode, 
 	if subTask.ThreadGroup() != i.task.ThreadGroup() {
 		return nil, syserror.ENOENT
 	}
-	return i.fs.newTaskInode(subTask, i.pidns, false, i.cgroupControllers)
+	return i.fs.newTaskInode(ctx, subTask, i.pidns, false, i.cgroupControllers)
 }
 
 // IterDirents implements kernfs.inodeDirectory.IterDirents.
-func (i *subtasksInode) IterDirents(ctx context.Context, cb vfs.IterDirentsCallback, offset, relOffset int64) (int64, error) {
+func (i *subtasksInode) IterDirents(ctx context.Context, mnt *vfs.Mount, cb vfs.IterDirentsCallback, offset, relOffset int64) (int64, error) {
 	tasks := i.task.ThreadGroup().MemberIDs(i.pidns)
 	if len(tasks) == 0 {
 		return offset, syserror.ENOENT

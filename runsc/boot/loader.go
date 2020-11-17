@@ -35,6 +35,7 @@ import (
 	"gvisor.dev/gvisor/pkg/memutil"
 	"gvisor.dev/gvisor/pkg/rand"
 	"gvisor.dev/gvisor/pkg/refs"
+	"gvisor.dev/gvisor/pkg/refsvfs2"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/sentry/fdimport"
@@ -49,6 +50,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/sighandling"
+	"gvisor.dev/gvisor/pkg/sentry/socket/netfilter"
 	"gvisor.dev/gvisor/pkg/sentry/syscalls/linux/vfs2"
 	"gvisor.dev/gvisor/pkg/sentry/time"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
@@ -476,6 +478,10 @@ func (l *Loader) Destroy() {
 	// save/restore.
 	l.k.Release()
 
+	// All sentry-created resources should have been released at this point;
+	// check for reference leaks.
+	refsvfs2.DoLeakCheck()
+
 	// In the success case, stdioFDs and goferFDs will only contain
 	// released/closed FDs that ownership has been passed over to host FDs and
 	// gofer sessions. Close them here in case of failure.
@@ -737,7 +743,7 @@ func (l *Loader) createContainerProcess(root bool, cid string, info *containerIn
 		return nil, err
 	}
 
-	// Add the HOME enviroment variable if it is not already set.
+	// Add the HOME environment variable if it is not already set.
 	var envv []string
 	if kernel.VFS2Enabled {
 		envv, err = user.MaybeAddExecUserHomeVFS2(ctx, info.procArgs.MountNamespaceVFS2,
@@ -882,7 +888,7 @@ func (l *Loader) destroyContainer(cid string) error {
 		}
 	}
 
-	log.Debugf("Container destroyed %q", cid)
+	log.Debugf("Container destroyed, cid: %s", cid)
 	return nil
 }
 
@@ -1079,6 +1085,7 @@ func newEmptySandboxNetworkStack(clock tcpip.Clock, uniqueID stack.UniqueID) (in
 		// privileges.
 		RawFactory: raw.EndpointFactory{},
 		UniqueID:   uniqueID,
+		IPTables:   netfilter.DefaultLinuxTables(),
 	})}
 
 	// Enable SACK Recovery.

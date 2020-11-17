@@ -19,6 +19,7 @@ package specutils
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"os"
 	"path"
@@ -169,7 +170,7 @@ func ReadSpec(bundleDir string, conf *config.Config) (*specs.Spec, error) {
 // ReadSpecFromFile reads an OCI runtime spec from the given File, and
 // normalizes all relative paths into absolute by prepending the bundle dir.
 func ReadSpecFromFile(bundleDir string, specFile *os.File, conf *config.Config) (*specs.Spec, error) {
-	if _, err := specFile.Seek(0, os.SEEK_SET); err != nil {
+	if _, err := specFile.Seek(0, io.SeekStart); err != nil {
 		return nil, fmt.Errorf("error seeking to beginning of file %q: %v", specFile.Name(), err)
 	}
 	specBytes, err := ioutil.ReadAll(specFile)
@@ -344,15 +345,9 @@ func IsSupportedDevMount(m specs.Mount) bool {
 	var existingDevices = []string{
 		"/dev/fd", "/dev/stdin", "/dev/stdout", "/dev/stderr",
 		"/dev/null", "/dev/zero", "/dev/full", "/dev/random",
-		"/dev/urandom", "/dev/shm", "/dev/pts", "/dev/ptmx",
+		"/dev/urandom", "/dev/shm", "/dev/ptmx",
 	}
 	dst := filepath.Clean(m.Destination)
-	if dst == "/dev" {
-		// OCI spec uses many different mounts for the things inside of '/dev'. We
-		// have a single mount at '/dev' that is always mounted, regardless of
-		// whether it was asked for, as the spec says we SHOULD.
-		return false
-	}
 	for _, dev := range existingDevices {
 		if dst == dev || strings.HasPrefix(dst, dev+"/") {
 			return false
@@ -425,7 +420,7 @@ func Mount(src, dst, typ string, flags uint32) error {
 		// Special case, as there is no source directory for proc mounts.
 		isDir = true
 	} else if fi, err := os.Stat(src); err != nil {
-		return fmt.Errorf("Stat(%q) failed: %v", src, err)
+		return fmt.Errorf("stat(%q) failed: %v", src, err)
 	} else {
 		isDir = fi.IsDir()
 	}
@@ -433,25 +428,25 @@ func Mount(src, dst, typ string, flags uint32) error {
 	if isDir {
 		// Create the destination directory.
 		if err := os.MkdirAll(dst, 0777); err != nil {
-			return fmt.Errorf("Mkdir(%q) failed: %v", dst, err)
+			return fmt.Errorf("mkdir(%q) failed: %v", dst, err)
 		}
 	} else {
 		// Create the parent destination directory.
 		parent := path.Dir(dst)
 		if err := os.MkdirAll(parent, 0777); err != nil {
-			return fmt.Errorf("Mkdir(%q) failed: %v", parent, err)
+			return fmt.Errorf("mkdir(%q) failed: %v", parent, err)
 		}
 		// Create the destination file if it does not exist.
 		f, err := os.OpenFile(dst, syscall.O_CREAT, 0777)
 		if err != nil {
-			return fmt.Errorf("Open(%q) failed: %v", dst, err)
+			return fmt.Errorf("open(%q) failed: %v", dst, err)
 		}
 		f.Close()
 	}
 
 	// Do the mount.
 	if err := syscall.Mount(src, dst, typ, uintptr(flags), ""); err != nil {
-		return fmt.Errorf("Mount(%q, %q, %d) failed: %v", src, dst, flags, err)
+		return fmt.Errorf("mount(%q, %q, %d) failed: %v", src, dst, flags, err)
 	}
 	return nil
 }
@@ -484,35 +479,6 @@ func GetOOMScoreAdj(pid int) (int, error) {
 		return 0, err
 	}
 	return strconv.Atoi(strings.TrimSpace(string(data)))
-}
-
-// GetParentPid gets the parent process ID of the specified PID.
-func GetParentPid(pid int) (int, error) {
-	data, err := ioutil.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
-	if err != nil {
-		return 0, err
-	}
-
-	var cpid string
-	var name string
-	var state string
-	var ppid int
-	// Parse after the binary name.
-	_, err = fmt.Sscanf(string(data),
-		"%v %v %v %d",
-		// cpid is ignored.
-		&cpid,
-		// name is ignored.
-		&name,
-		// state is ignored.
-		&state,
-		&ppid)
-
-	if err != nil {
-		return 0, err
-	}
-
-	return ppid, nil
 }
 
 // EnvVar looks for a varible value in the env slice assuming the following

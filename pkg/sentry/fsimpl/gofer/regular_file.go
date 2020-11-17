@@ -18,7 +18,6 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"sync"
 	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -31,6 +30,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
+	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
@@ -326,7 +326,7 @@ func (rw *dentryReadWriter) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) 
 	// dentry.readHandleLocked() without locking dentry.dataMu.
 	rw.d.handleMu.RLock()
 	h := rw.d.readHandleLocked()
-	if (rw.d.hostFD >= 0 && !rw.d.fs.opts.forcePageCache) || rw.d.fs.opts.interop == InteropModeShared || rw.direct {
+	if (rw.d.mmapFD >= 0 && !rw.d.fs.opts.forcePageCache) || rw.d.fs.opts.interop == InteropModeShared || rw.direct {
 		n, err := h.readToBlocksAt(rw.ctx, dsts, rw.off)
 		rw.d.handleMu.RUnlock()
 		rw.off += n
@@ -446,7 +446,7 @@ func (rw *dentryReadWriter) WriteFromBlocks(srcs safemem.BlockSeq) (uint64, erro
 	// without locking dentry.dataMu.
 	rw.d.handleMu.RLock()
 	h := rw.d.writeHandleLocked()
-	if (rw.d.hostFD >= 0 && !rw.d.fs.opts.forcePageCache) || rw.d.fs.opts.interop == InteropModeShared || rw.direct {
+	if (rw.d.mmapFD >= 0 && !rw.d.fs.opts.forcePageCache) || rw.d.fs.opts.interop == InteropModeShared || rw.direct {
 		n, err := h.writeFromBlocksAt(rw.ctx, srcs, rw.off)
 		rw.off += n
 		rw.d.dataMu.Lock()
@@ -624,23 +624,7 @@ func regularFileSeekLocked(ctx context.Context, d *dentry, fdOffset, offset int6
 
 // Sync implements vfs.FileDescriptionImpl.Sync.
 func (fd *regularFileFD) Sync(ctx context.Context) error {
-	return fd.dentry().syncCachedFile(ctx)
-}
-
-func (d *dentry) syncCachedFile(ctx context.Context) error {
-	d.handleMu.RLock()
-	defer d.handleMu.RUnlock()
-
-	if h := d.writeHandleLocked(); h.isOpen() {
-		d.dataMu.Lock()
-		// Write dirty cached data to the remote file.
-		err := fsutil.SyncDirtyAll(ctx, &d.cache, &d.dirty, d.size, d.fs.mfp.MemoryFile(), h.writeFromBlocksAt)
-		d.dataMu.Unlock()
-		if err != nil {
-			return err
-		}
-	}
-	return d.syncRemoteFileLocked(ctx)
+	return fd.dentry().syncCachedFile(ctx, false /* lowSyncExpectations */)
 }
 
 // ConfigureMMap implements vfs.FileDescriptionImpl.ConfigureMMap.
@@ -664,7 +648,7 @@ func (fd *regularFileFD) ConfigureMMap(ctx context.Context, opts *memmap.MMapOpt
 			return syserror.ENODEV
 		}
 		d.handleMu.RLock()
-		haveFD := d.hostFD >= 0
+		haveFD := d.mmapFD >= 0
 		d.handleMu.RUnlock()
 		if !haveFD {
 			return syserror.ENODEV
@@ -685,7 +669,7 @@ func (d *dentry) mayCachePages() bool {
 		return true
 	}
 	d.handleMu.RLock()
-	haveFD := d.hostFD >= 0
+	haveFD := d.mmapFD >= 0
 	d.handleMu.RUnlock()
 	return haveFD
 }
@@ -743,7 +727,7 @@ func (d *dentry) CopyMapping(ctx context.Context, ms memmap.MappingSpace, srcAR,
 // Translate implements memmap.Mappable.Translate.
 func (d *dentry) Translate(ctx context.Context, required, optional memmap.MappableRange, at usermem.AccessType) ([]memmap.Translation, error) {
 	d.handleMu.RLock()
-	if d.hostFD >= 0 && !d.fs.opts.forcePageCache {
+	if d.mmapFD >= 0 && !d.fs.opts.forcePageCache {
 		d.handleMu.RUnlock()
 		mr := optional
 		if d.fs.opts.limitHostFDTranslation {
@@ -897,7 +881,7 @@ func (d *dentry) Evict(ctx context.Context, er pgalloc.EvictableRange) {
 // cannot implement both vfs.DentryImpl.IncRef and memmap.File.IncRef.
 //
 // dentryPlatformFile is only used when a host FD representing the remote file
-// is available (i.e. dentry.hostFD >= 0), and that FD is used for application
+// is available (i.e. dentry.mmapFD >= 0), and that FD is used for application
 // memory mappings (i.e. !filesystem.opts.forcePageCache).
 //
 // +stateify savable
@@ -908,12 +892,12 @@ type dentryPlatformFile struct {
 	// by dentry.dataMu.
 	fdRefs fsutil.FrameRefSet
 
-	// If this dentry represents a regular file, and dentry.hostFD >= 0,
-	// hostFileMapper caches mappings of dentry.hostFD.
+	// If this dentry represents a regular file, and dentry.mmapFD >= 0,
+	// hostFileMapper caches mappings of dentry.mmapFD.
 	hostFileMapper fsutil.HostFileMapper
 
 	// hostFileMapperInitOnce is used to lazily initialize hostFileMapper.
-	hostFileMapperInitOnce sync.Once `state:"nosave"` // FIXME(gvisor.dev/issue/1663): not yet supported.
+	hostFileMapperInitOnce sync.Once `state:"nosave"`
 }
 
 // IncRef implements memmap.File.IncRef.
@@ -934,12 +918,12 @@ func (d *dentryPlatformFile) DecRef(fr memmap.FileRange) {
 func (d *dentryPlatformFile) MapInternal(fr memmap.FileRange, at usermem.AccessType) (safemem.BlockSeq, error) {
 	d.handleMu.RLock()
 	defer d.handleMu.RUnlock()
-	return d.hostFileMapper.MapInternal(fr, int(d.hostFD), at.Write)
+	return d.hostFileMapper.MapInternal(fr, int(d.mmapFD), at.Write)
 }
 
 // FD implements memmap.File.FD.
 func (d *dentryPlatformFile) FD() int {
 	d.handleMu.RLock()
 	defer d.handleMu.RUnlock()
-	return int(d.hostFD)
+	return int(d.mmapFD)
 }

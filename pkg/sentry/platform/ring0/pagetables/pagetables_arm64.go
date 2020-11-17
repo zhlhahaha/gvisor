@@ -36,7 +36,7 @@ const (
 	pudSize = 1 << pudShift
 	pgdSize = 1 << pgdShift
 
-	ttbrASIDOffset = 55
+	ttbrASIDOffset = 48
 	ttbrASIDMask   = 0xff
 
 	entriesPerPage = 512
@@ -49,8 +49,17 @@ func (p *PageTables) Init(allocator Allocator) {
 	p.Allocator = allocator
 	p.root = p.Allocator.NewPTEs()
 	p.rootPhysical = p.Allocator.PhysicalFor(p.root)
-	p.archPageTables.root = p.Allocator.NewPTEs()
-	p.archPageTables.rootPhysical = p.Allocator.PhysicalFor(p.archPageTables.root)
+}
+
+// cloneUpperShared clone the upper from the upper shared page tables.
+//
+//go:nosplit
+func (p *PageTables) cloneUpperShared() {
+	if p.upperStart != upperBottom {
+		panic("upperStart should be the same as upperBottom")
+	}
+
+	// nothing to do for arm.
 }
 
 // PTEs is a collection of entries.

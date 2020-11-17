@@ -75,7 +75,7 @@ func (c *Checkpoint) Execute(_ context.Context, f *flag.FlagSet, args ...interfa
 	conf := args[0].(*config.Config)
 	waitStatus := args[1].(*syscall.WaitStatus)
 
-	cont, err := container.Load(conf.RootDir, id)
+	cont, err := container.LoadAndCheck(conf.RootDir, id)
 	if err != nil {
 		Fatalf("loading container: %v", err)
 	}
@@ -149,6 +149,9 @@ func (c *Checkpoint) Execute(_ context.Context, f *flag.FlagSet, args ...interfa
 	}
 
 	ws, err := cont.Wait()
+	if err != nil {
+		Fatalf("Error waiting for container: %v", err)
+	}
 	*waitStatus = ws
 
 	return subcommands.ExitSuccess

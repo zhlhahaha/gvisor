@@ -356,10 +356,9 @@ func (s *Subnet) IsBroadcast(address Address) bool {
 	return s.Prefix() <= 30 && s.Broadcast() == address
 }
 
-// Equal returns true if s equals o.
-//
-// Needed to use cmp.Equal on Subnet as its fields are unexported.
+// Equal returns true if this Subnet is equal to the given Subnet.
 func (s Subnet) Equal(o Subnet) bool {
+	// If this changes, update Route.Equal accordingly.
 	return s == o
 }
 
@@ -635,6 +634,10 @@ type Endpoint interface {
 
 	// LastError clears and returns the last error reported by the endpoint.
 	LastError() *Error
+
+	// SocketOptions returns the structure which contains all the socket
+	// level options.
+	SocketOptions() *SocketOptions
 }
 
 // LinkPacketInfo holds Link layer information for a received packet.
@@ -695,15 +698,10 @@ type WriteOptions struct {
 type SockOptBool int
 
 const (
-	// BroadcastOption is used by SetSockOptBool/GetSockOptBool to specify
-	// whether datagram sockets are allowed to send packets to a broadcast
-	// address.
-	BroadcastOption SockOptBool = iota
-
 	// CorkOption is used by SetSockOptBool/GetSockOptBool to specify if
 	// data should be held until segments are full by the TCP transport
 	// protocol.
-	CorkOption
+	CorkOption SockOptBool = iota
 
 	// DelayOption is used by SetSockOptBool/GetSockOptBool to specify if
 	// data should be sent out immediately by the transport protocol. For
@@ -763,6 +761,10 @@ const (
 	// endpoint that all packets being written have an IP header and the
 	// endpoint should not attach an IP header.
 	IPHdrIncludedOption
+
+	// AcceptConnOption is used by GetSockOptBool to indicate if the
+	// socket is a listening socket.
+	AcceptConnOption
 )
 
 // SockOptInt represents socket options which values have the int type.
@@ -1256,6 +1258,12 @@ func (r Route) String() string {
 	return out.String()
 }
 
+// Equal returns true if the given Route is equal to this Route.
+func (r Route) Equal(to Route) bool {
+	// NOTE: This relies on the fact that r.Destination == to.Destination
+	return r == to
+}
+
 // TransportProtocolNumber is the number of a transport protocol.
 type TransportProtocolNumber uint32
 
@@ -1455,8 +1463,12 @@ type ICMPStats struct {
 // IPStats collects IP-specific stats (both v4 and v6).
 type IPStats struct {
 	// PacketsReceived is the total number of IP packets received from the
-	// link layer in nic.DeliverNetworkPacket.
+	// link layer.
 	PacketsReceived *StatCounter
+
+	// DisabledPacketsReceived is the total number of IP packets received from the
+	// link layer when the IP layer is disabled.
+	DisabledPacketsReceived *StatCounter
 
 	// InvalidDestinationAddressesReceived is the total number of IP packets
 	// received with an unknown or invalid destination address.
@@ -1496,6 +1508,15 @@ type IPStats struct {
 	// IPTablesOutputDropped is the total number of IP packets dropped in
 	// the Output chain.
 	IPTablesOutputDropped *StatCounter
+
+	// OptionTSReceived is the number of Timestamp options seen.
+	OptionTSReceived *StatCounter
+
+	// OptionRRReceived is the number of Record Route options seen.
+	OptionRRReceived *StatCounter
+
+	// OptionUnknownReceived is the number of unknown IP options seen.
+	OptionUnknownReceived *StatCounter
 }
 
 // TCPStats collects TCP-specific stats.

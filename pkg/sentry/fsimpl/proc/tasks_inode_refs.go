@@ -2,27 +2,23 @@ package proc
 
 import (
 	"fmt"
-	"runtime"
 	"sync/atomic"
 
-	"gvisor.dev/gvisor/pkg/log"
-	refs_vfs1 "gvisor.dev/gvisor/pkg/refs"
+	"gvisor.dev/gvisor/pkg/refsvfs2"
 )
 
-// ownerType is used to customize logging. Note that we use a pointer to T so
-// that we do not copy the entire object when passed as a format parameter.
-var tasksInodeownerType *tasksInode
+// enableLogging indicates whether reference-related events should be logged (with
+// stack traces). This is false by default and should only be set to true for
+// debugging purposes, as it can generate an extremely large amount of output
+// and drastically degrade performance.
+const tasksInodeenableLogging = false
+
+// obj is used to customize logging. Note that we use a pointer to T so that
+// we do not copy the entire object when passed as a format parameter.
+var tasksInodeobj *tasksInode
 
 // Refs implements refs.RefCounter. It keeps a reference count using atomic
 // operations and calls the destructor when the count reaches zero.
-//
-// Note that the number of references is actually refCount + 1 so that a default
-// zero-value Refs object contains one reference.
-//
-// TODO(gvisor.dev/issue/1486): Store stack traces when leak check is enabled in
-// a map with 16-bit hashes, and store the hash in the top 16 bits of refCount.
-// This will allow us to add stack trace information to the leak messages
-// without growing the size of Refs.
 //
 // +stateify savable
 type tasksInodeRefs struct {
@@ -36,39 +32,49 @@ type tasksInodeRefs struct {
 	refCount int64
 }
 
-func (r *tasksInodeRefs) finalize() {
-	var note string
-	switch refs_vfs1.GetLeakMode() {
-	case refs_vfs1.NoLeakChecking:
-		return
-	case refs_vfs1.UninitializedLeakChecking:
-		note = "(Leak checker uninitialized): "
-	}
-	if n := r.ReadRefs(); n != 0 {
-		log.Warningf("%sRefs %p owned by %T garbage collected with ref count of %d (want 0)", note, r, tasksInodeownerType, n)
-	}
+// InitRefs initializes r with one reference and, if enabled, activates leak
+// checking.
+func (r *tasksInodeRefs) InitRefs() {
+	atomic.StoreInt64(&r.refCount, 1)
+	refsvfs2.Register(r)
 }
 
-// EnableLeakCheck checks for reference leaks when Refs gets garbage collected.
+// RefType implements refsvfs2.CheckedObject.RefType.
+func (r *tasksInodeRefs) RefType() string {
+	return fmt.Sprintf("%T", tasksInodeobj)[1:]
+}
+
+// LeakMessage implements refsvfs2.CheckedObject.LeakMessage.
+func (r *tasksInodeRefs) LeakMessage() string {
+	return fmt.Sprintf("[%s %p] reference count of %d instead of 0", r.RefType(), r, r.ReadRefs())
+}
+
+// LogRefs implements refsvfs2.CheckedObject.LogRefs.
+func (r *tasksInodeRefs) LogRefs() bool {
+	return tasksInodeenableLogging
+}
+
+// EnableLeakCheck enables reference leak checking on r.
 func (r *tasksInodeRefs) EnableLeakCheck() {
-	if refs_vfs1.GetLeakMode() != refs_vfs1.NoLeakChecking {
-		runtime.SetFinalizer(r, (*tasksInodeRefs).finalize)
-	}
+	refsvfs2.Register(r)
 }
 
 // ReadRefs returns the current number of references. The returned count is
 // inherently racy and is unsafe to use without external synchronization.
 func (r *tasksInodeRefs) ReadRefs() int64 {
-
-	return atomic.LoadInt64(&r.refCount) + 1
+	return atomic.LoadInt64(&r.refCount)
 }
 
 // IncRef implements refs.RefCounter.IncRef.
 //
 //go:nosplit
 func (r *tasksInodeRefs) IncRef() {
-	if v := atomic.AddInt64(&r.refCount, 1); v <= 0 {
-		panic(fmt.Sprintf("Incrementing non-positive ref count %p owned by %T", r, tasksInodeownerType))
+	v := atomic.AddInt64(&r.refCount, 1)
+	if tasksInodeenableLogging {
+		refsvfs2.LogIncRef(r, v)
+	}
+	if v <= 1 {
+		panic(fmt.Sprintf("Incrementing non-positive count %p on %s", r, r.RefType()))
 	}
 }
 
@@ -81,14 +87,16 @@ func (r *tasksInodeRefs) IncRef() {
 //go:nosplit
 func (r *tasksInodeRefs) TryIncRef() bool {
 	const speculativeRef = 1 << 32
-	v := atomic.AddInt64(&r.refCount, speculativeRef)
-	if int32(v) < 0 {
+	if v := atomic.AddInt64(&r.refCount, speculativeRef); int32(v) == 0 {
 
 		atomic.AddInt64(&r.refCount, -speculativeRef)
 		return false
 	}
 
-	atomic.AddInt64(&r.refCount, -speculativeRef+1)
+	v := atomic.AddInt64(&r.refCount, -speculativeRef+1)
+	if tasksInodeenableLogging {
+		refsvfs2.LogTryIncRef(r, v)
+	}
 	return true
 }
 
@@ -105,14 +113,25 @@ func (r *tasksInodeRefs) TryIncRef() bool {
 //
 //go:nosplit
 func (r *tasksInodeRefs) DecRef(destroy func()) {
-	switch v := atomic.AddInt64(&r.refCount, -1); {
-	case v < -1:
-		panic(fmt.Sprintf("Decrementing non-positive ref count %p, owned by %T", r, tasksInodeownerType))
+	v := atomic.AddInt64(&r.refCount, -1)
+	if tasksInodeenableLogging {
+		refsvfs2.LogDecRef(r, v+1)
+	}
+	switch {
+	case v < 0:
+		panic(fmt.Sprintf("Decrementing non-positive ref count %p, owned by %s", r, r.RefType()))
 
-	case v == -1:
+	case v == 0:
+		refsvfs2.Unregister(r)
 
 		if destroy != nil {
 			destroy()
 		}
+	}
+}
+
+func (r *tasksInodeRefs) afterLoad() {
+	if r.ReadRefs() > 0 {
+		r.EnableLeakCheck()
 	}
 }

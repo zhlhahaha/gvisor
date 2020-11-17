@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Package runsc provides an API to interact with runsc command line.
 package runsc
 
 import (
@@ -28,14 +29,36 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/containerd/containerd/log"
 	runc "github.com/containerd/go-runc"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
-var Monitor runc.ProcessMonitor = runc.Monitor
-
 // DefaultCommand is the default command for Runsc.
 const DefaultCommand = "runsc"
+
+// Monitor is the default process monitor to be used by runsc.
+var Monitor runc.ProcessMonitor = &LogMonitor{Next: runc.Monitor}
+
+// LogMonitor implements the runc.ProcessMonitor interface, logging the command
+// that is getting executed, and then forwarding the call to another
+// implementation.
+type LogMonitor struct {
+	Next runc.ProcessMonitor
+}
+
+// Start implements runc.ProcessMonitor.
+func (l *LogMonitor) Start(cmd *exec.Cmd) (chan runc.Exit, error) {
+	log.L.Debugf("Executing: %s", cmd.Args)
+	return l.Next.Start(cmd)
+}
+
+// Wait implements runc.ProcessMonitor.
+func (l *LogMonitor) Wait(cmd *exec.Cmd, ch chan runc.Exit) (int, error) {
+	status, err := l.Next.Wait(cmd, ch)
+	log.L.Debugf("Command exit code: %d, err: %v", status, err)
+	return status, err
+}
 
 // Runsc is the client to the runsc cli.
 type Runsc struct {
@@ -74,6 +97,7 @@ func (r *Runsc) State(context context.Context, id string) (*runc.Container, erro
 	return &c, nil
 }
 
+// CreateOpts is a set of options to Runsc.Create().
 type CreateOpts struct {
 	runc.IO
 	ConsoleSocket runc.ConsoleSocket
@@ -197,6 +221,7 @@ func (r *Runsc) Wait(context context.Context, id string) (int, error) {
 	return res.ExitStatus, nil
 }
 
+// ExecOpts is a set of options to runsc.Exec().
 type ExecOpts struct {
 	runc.IO
 	PidFile         string
@@ -301,6 +326,7 @@ func (r *Runsc) Run(context context.Context, id, bundle string, opts *CreateOpts
 	return Monitor.Wait(cmd, ec)
 }
 
+// DeleteOpts is a set of options to runsc.Delete().
 type DeleteOpts struct {
 	Force bool
 }
@@ -365,7 +391,15 @@ func (r *Runsc) Stats(context context.Context, id string) (*runc.Stats, error) {
 	}()
 	var e runc.Event
 	if err := json.NewDecoder(rd).Decode(&e); err != nil {
+		log.L.Debugf("Parsing events error: %v", err)
 		return nil, err
+	}
+	log.L.Debugf("Stats returned, type: %s, stats: %+v", e.Type, e.Stats)
+	if e.Type != "stats" {
+		return nil, fmt.Errorf(`unexpected event type %q, wanted "stats"`, e.Type)
+	}
+	if e.Stats == nil {
+		return nil, fmt.Errorf(`"runsc events -stat" succeeded but no stat was provided`)
 	}
 	return e.Stats, nil
 }

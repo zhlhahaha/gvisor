@@ -207,24 +207,23 @@ func (fs *Filesystem) walkParentDirLocked(ctx context.Context, rp *vfs.Resolving
 // Preconditions:
 // * Filesystem.mu must be locked for at least reading.
 // * isDir(parentInode) == true.
-func checkCreateLocked(ctx context.Context, rp *vfs.ResolvingPath, parent *Dentry) (string, error) {
-	if err := parent.inode.CheckPermissions(ctx, rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
-		return "", err
+func checkCreateLocked(ctx context.Context, creds *auth.Credentials, name string, parent *Dentry) error {
+	if err := parent.inode.CheckPermissions(ctx, creds, vfs.MayWrite|vfs.MayExec); err != nil {
+		return err
 	}
-	pc := rp.Component()
-	if pc == "." || pc == ".." {
-		return "", syserror.EEXIST
+	if name == "." || name == ".." {
+		return syserror.EEXIST
 	}
-	if len(pc) > linux.NAME_MAX {
-		return "", syserror.ENAMETOOLONG
+	if len(name) > linux.NAME_MAX {
+		return syserror.ENAMETOOLONG
 	}
-	if _, ok := parent.children[pc]; ok {
-		return "", syserror.EEXIST
+	if _, ok := parent.children[name]; ok {
+		return syserror.EEXIST
 	}
 	if parent.VFSDentry().IsDead() {
-		return "", syserror.ENOENT
+		return syserror.ENOENT
 	}
-	return pc, nil
+	return nil
 }
 
 // checkDeleteLocked checks that the file represented by vfsd may be deleted.
@@ -245,7 +244,41 @@ func checkDeleteLocked(ctx context.Context, rp *vfs.ResolvingPath, d *Dentry) er
 }
 
 // Release implements vfs.FilesystemImpl.Release.
-func (fs *Filesystem) Release(context.Context) {
+func (fs *Filesystem) Release(ctx context.Context) {
+	root := fs.root
+	if root == nil {
+		return
+	}
+	fs.mu.Lock()
+	root.releaseKeptDentriesLocked(ctx)
+	for fs.cachedDentriesLen != 0 {
+		fs.evictCachedDentryLocked(ctx)
+	}
+	fs.mu.Unlock()
+	// Drop ref acquired in Dentry.InitRoot().
+	root.DecRef(ctx)
+}
+
+// releaseKeptDentriesLocked recursively drops all dentry references created by
+// Lookup when Dentry.inode.Keep() is true.
+//
+// Precondition: Filesystem.mu is held.
+func (d *Dentry) releaseKeptDentriesLocked(ctx context.Context) {
+	if d.inode.Keep() && d != d.fs.root {
+		d.decRefLocked(ctx)
+	}
+
+	if d.isDir() {
+		var children []*Dentry
+		d.dirMu.Lock()
+		for _, child := range d.children {
+			children = append(children, child)
+		}
+		d.dirMu.Unlock()
+		for _, child := range children {
+			child.releaseKeptDentriesLocked(ctx)
+		}
+	}
 }
 
 // Sync implements vfs.FilesystemImpl.Sync.
@@ -318,9 +351,12 @@ func (fs *Filesystem) LinkAt(ctx context.Context, rp *vfs.ResolvingPath, vd vfs.
 
 	parent.dirMu.Lock()
 	defer parent.dirMu.Unlock()
-	pc, err := checkCreateLocked(ctx, rp, parent)
-	if err != nil {
+	pc := rp.Component()
+	if err := checkCreateLocked(ctx, rp.Credentials(), pc, parent); err != nil {
 		return err
+	}
+	if rp.MustBeDir() {
+		return syserror.ENOENT
 	}
 	if rp.Mount() != vd.Mount() {
 		return syserror.EXDEV
@@ -360,8 +396,8 @@ func (fs *Filesystem) MkdirAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 
 	parent.dirMu.Lock()
 	defer parent.dirMu.Unlock()
-	pc, err := checkCreateLocked(ctx, rp, parent)
-	if err != nil {
+	pc := rp.Component()
+	if err := checkCreateLocked(ctx, rp.Credentials(), pc, parent); err != nil {
 		return err
 	}
 	if err := rp.Mount().CheckBeginWrite(); err != nil {
@@ -373,7 +409,7 @@ func (fs *Filesystem) MkdirAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 		if !opts.ForSyntheticMountpoint || err == syserror.EEXIST {
 			return err
 		}
-		childI = newSyntheticDirectory(rp.Credentials(), opts.Mode)
+		childI = newSyntheticDirectory(ctx, rp.Credentials(), opts.Mode)
 	}
 	var child Dentry
 	child.Init(fs, childI)
@@ -396,9 +432,12 @@ func (fs *Filesystem) MknodAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 
 	parent.dirMu.Lock()
 	defer parent.dirMu.Unlock()
-	pc, err := checkCreateLocked(ctx, rp, parent)
-	if err != nil {
+	pc := rp.Component()
+	if err := checkCreateLocked(ctx, rp.Credentials(), pc, parent); err != nil {
 		return err
+	}
+	if rp.MustBeDir() {
+		return syserror.ENOENT
 	}
 	if err := rp.Mount().CheckBeginWrite(); err != nil {
 		return err
@@ -517,9 +556,6 @@ afterTrailingSymlink:
 		}
 		var child Dentry
 		child.Init(fs, childI)
-		// FIXME(gvisor.dev/issue/1193): Race between checking existence with
-		// fs.stepExistingLocked and parent.insertChild. If possible, we should hold
-		// dirMu from one to the other.
 		parent.insertChild(pc, &child)
 		// Open may block so we need to unlock fs.mu. IncRef child to prevent
 		// its destruction while fs.mu is unlocked.
@@ -626,8 +662,8 @@ func (fs *Filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 
 	// Can we create the dst dentry?
 	var dst *Dentry
-	pc, err := checkCreateLocked(ctx, rp, dstDir)
-	switch err {
+	pc := rp.Component()
+	switch err := checkCreateLocked(ctx, rp.Credentials(), pc, dstDir); err {
 	case nil:
 		// Ok, continue with rename as replacement.
 	case syserror.EEXIST:
@@ -791,9 +827,12 @@ func (fs *Filesystem) SymlinkAt(ctx context.Context, rp *vfs.ResolvingPath, targ
 	parent.dirMu.Lock()
 	defer parent.dirMu.Unlock()
 
-	pc, err := checkCreateLocked(ctx, rp, parent)
-	if err != nil {
+	pc := rp.Component()
+	if err := checkCreateLocked(ctx, rp.Credentials(), pc, parent); err != nil {
 		return err
+	}
+	if rp.MustBeDir() {
+		return syserror.ENOENT
 	}
 	if err := rp.Mount().CheckBeginWrite(); err != nil {
 		return err

@@ -358,6 +358,10 @@
 #define ESR_ELx_WFx_ISS_WFE	(UL(1) << 0)
 #define ESR_ELx_xVC_IMM_MASK	((1UL << 16) - 1)
 
+/* ISS field definitions for system error */
+#define ESR_ELx_SERR_MASK	(0x1)
+#define ESR_ELx_SERR_NMI	(0x1)
+
 // LOAD_KERNEL_ADDRESS loads a kernel address.
 #define LOAD_KERNEL_ADDRESS(from, to) \
 	MOVD from, to; \
@@ -435,6 +439,19 @@
 	MOVD RSP, R4; \
 	MOVD R4, CPU_REGISTERS+PTRACE_SP(RSV_REG); \
 	LOAD_KERNEL_STACK(RSV_REG);  // Load the temporary stack.
+
+// EXCEPTION_WITH_ERROR is a common exception handler function.
+#define EXCEPTION_WITH_ERROR(user, vector) \
+	WORD $0xd538d092; \	//MRS   TPIDR_EL1, R18
+	WORD $0xd538601a; \	//MRS   FAR_EL1, R26
+	MOVD R26, CPU_FAULT_ADDR(RSV_REG); \
+	MOVD $user, R3; \
+	MOVD R3, CPU_ERROR_TYPE(RSV_REG); \	// Set error type to user.
+	MOVD $vector, R3; \
+	MOVD R3, CPU_VECTOR_CODE(RSV_REG); \
+	MRS ESR_EL1, R3; \
+	MOVD R3, CPU_ERROR_CODE(RSV_REG); \
+	B ·kernelExitToEl1(SB);
 
 // storeAppASID writes the application's asid value.
 TEXT ·storeAppASID(SB),NOSPLIT,$0-8
@@ -572,6 +589,10 @@ TEXT ·kernelExitToEl1(SB),NOSPLIT,$0
 
 	MOVD CPU_REGISTERS+PTRACE_PC(RSV_REG), R1
 	MSR R1, ELR_EL1
+
+	// restore sentry's tls.
+	MOVD CPU_REGISTERS+PTRACE_TLS(RSV_REG), R1
+	MSR R1, TPIDR_EL0
 
 	MOVD CPU_REGISTERS+PTRACE_SP(RSV_REG), R1
 	MOVD R1, RSP
@@ -729,21 +750,7 @@ el0_svc:
 
 el0_da:
 el0_ia:
-	WORD $0xd538d092     //MRS   TPIDR_EL1, R18
-	WORD $0xd538601a     //MRS   FAR_EL1, R26
-
-	MOVD R26, CPU_FAULT_ADDR(RSV_REG)
-
-	MOVD $1, R3
-	MOVD R3, CPU_ERROR_TYPE(RSV_REG) // Set error type to user.
-
-	MOVD $PageFault, R3
-	MOVD R3, CPU_VECTOR_CODE(RSV_REG)
-
-	MRS ESR_EL1, R3
-	MOVD R3, CPU_ERROR_CODE(RSV_REG)
-
-	B ·kernelExitToEl1(SB)
+	EXCEPTION_WITH_ERROR(1, PageFault)
 
 el0_fpsimd_acc:
 	B ·Shutdown(SB)
@@ -758,10 +765,7 @@ el0_sp_pc:
 	B ·Shutdown(SB)
 
 el0_undef:
-	MOVD $El0Sync_undef, R3
-	MOVD R3, CPU_VECTOR_CODE(RSV_REG)
-
-	B ·kernelExitToEl1(SB)
+	EXCEPTION_WITH_ERROR(1, El0SyncUndef)
 
 el0_dbg:
 	B ·Shutdown(SB)
@@ -777,6 +781,29 @@ TEXT ·El0_fiq(SB),NOSPLIT,$0
 
 TEXT ·El0_error(SB),NOSPLIT,$0
 	KERNEL_ENTRY_FROM_EL0
+	WORD $0xd5385219        // MRS ESR_EL1, R25
+	AND $ESR_ELx_SERR_MASK, R25, R24
+	CMP $ESR_ELx_SERR_NMI, R24
+	BEQ el0_nmi
+	B el0_bounce
+el0_nmi:
+        WORD $0xd538d092     //MRS   TPIDR_EL1, R18
+        WORD $0xd538601a     //MRS   FAR_EL1, R26
+
+        MOVD R26, CPU_FAULT_ADDR(RSV_REG)
+
+        MOVD $1, R3
+        MOVD R3, CPU_ERROR_TYPE(RSV_REG) // Set error type to user.
+
+        MOVD $El0ErrNMI, R3
+        MOVD R3, CPU_VECTOR_CODE(RSV_REG)
+
+        MRS ESR_EL1, R3
+        MOVD R3, CPU_ERROR_CODE(RSV_REG)
+
+        B ·kernelExitToEl1(SB)
+
+el0_bounce:
 	WORD $0xd538d092     //MRS   TPIDR_EL1, R18
 	WORD $0xd538601a     //MRS   FAR_EL1, R26
 
@@ -788,7 +815,7 @@ TEXT ·El0_error(SB),NOSPLIT,$0
 	MOVD $VirtualizationException, R3
 	MOVD R3, CPU_VECTOR_CODE(RSV_REG)
 
-	B ·HaltAndResume(SB)
+	B ·kernelExitToEl1(SB)
 
 TEXT ·El0_sync_invalid(SB),NOSPLIT,$0
 	B ·Shutdown(SB)

@@ -79,6 +79,9 @@ type endpoint struct {
 
 	// owner is used to get uid and gid of the packet.
 	owner tcpip.PacketOwner
+
+	// ops is used to get socket level options.
+	ops tcpip.SocketOptions
 }
 
 func newEndpoint(s *stack.Stack, netProto tcpip.NetworkProtocolNumber, transProto tcpip.TransportProtocolNumber, waiterQueue *waiter.Queue) (tcpip.Endpoint, *tcpip.Error) {
@@ -378,7 +381,7 @@ func (e *endpoint) SetSockOptInt(opt tcpip.SockOptInt, v int) *tcpip.Error {
 // GetSockOptBool implements tcpip.Endpoint.GetSockOptBool.
 func (e *endpoint) GetSockOptBool(opt tcpip.SockOptBool) (bool, *tcpip.Error) {
 	switch opt {
-	case tcpip.KeepaliveEnabledOption:
+	case tcpip.KeepaliveEnabledOption, tcpip.AcceptConnOption:
 		return false, nil
 
 	default:
@@ -755,7 +758,7 @@ func (e *endpoint) Readiness(mask waiter.EventMask) waiter.EventMask {
 
 // HandlePacket is called by the stack when new packets arrive to this transport
 // endpoint.
-func (e *endpoint) HandlePacket(r *stack.Route, id stack.TransportEndpointID, pkt *stack.PacketBuffer) {
+func (e *endpoint) HandlePacket(id stack.TransportEndpointID, pkt *stack.PacketBuffer) {
 	// Only accept echo replies.
 	switch e.NetProto {
 	case header.IPv4ProtocolNumber:
@@ -800,7 +803,7 @@ func (e *endpoint) HandlePacket(r *stack.Route, id stack.TransportEndpointID, pk
 	// Push new packet into receive list and increment the buffer size.
 	packet := &icmpPacket{
 		senderAddress: tcpip.FullAddress{
-			NIC:  r.NICID(),
+			NIC:  pkt.NICID,
 			Addr: id.RemoteAddress,
 		},
 	}
@@ -852,4 +855,8 @@ func (*endpoint) Wait() {}
 // LastError implements tcpip.Endpoint.LastError.
 func (*endpoint) LastError() *tcpip.Error {
 	return nil
+}
+
+func (e *endpoint) SocketOptions() *tcpip.SocketOptions {
+	return &e.ops
 }

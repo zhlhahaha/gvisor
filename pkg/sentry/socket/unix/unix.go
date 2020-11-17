@@ -80,8 +80,7 @@ func NewWithDirent(ctx context.Context, d *fs.Dirent, ep transport.Endpoint, sty
 			stype: stype,
 		},
 	}
-	s.EnableLeakCheck()
-
+	s.InitRefs()
 	return fs.NewFile(ctx, d, flags, &s)
 }
 
@@ -116,6 +115,9 @@ type socketOpsCommon struct {
 	// bound, they cannot be modified.
 	abstractName      string
 	abstractNamespace *kernel.AbstractSocketNamespace
+
+	// ops is used to get socket level options.
+	ops tcpip.SocketOptions
 }
 
 func (s *socketOpsCommon) isPacket() bool {

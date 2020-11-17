@@ -54,7 +54,7 @@ type IPv6Fields struct {
 	// NextHeader is the "next header" field of an IPv6 packet.
 	NextHeader uint8
 
-	// HopLimit is the "hop limit" field of an IPv6 packet.
+	// HopLimit is the "Hop Limit" field of an IPv6 packet.
 	HopLimit uint8
 
 	// SrcAddr is the "source ip address" of an IPv6 packet.
@@ -101,8 +101,10 @@ const (
 	// The address is ff02::2.
 	IPv6AllRoutersMulticastAddress tcpip.Address = "\xff\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02"
 
-	// IPv6MinimumMTU is the minimum MTU required by IPv6, per RFC 2460,
-	// section 5.
+	// IPv6MinimumMTU is the minimum MTU required by IPv6, per RFC 8200,
+	// section 5:
+	//   IPv6 requires that every link in the Internet have an MTU of 1280 octets
+	//   or greater.  This is known as the IPv6 minimum link MTU.
 	IPv6MinimumMTU = 1280
 
 	// IPv6Loopback is the IPv6 Loopback address.
@@ -169,7 +171,7 @@ func (b IPv6) PayloadLength() uint16 {
 	return binary.BigEndian.Uint16(b[IPv6PayloadLenOffset:])
 }
 
-// HopLimit returns the value of the "hop limit" field of the ipv6 header.
+// HopLimit returns the value of the "Hop Limit" field of the ipv6 header.
 func (b IPv6) HopLimit() uint8 {
 	return b[hopLimit]
 }
@@ -232,6 +234,11 @@ func (b IPv6) SetSourceAddress(addr tcpip.Address) {
 // header.
 func (b IPv6) SetDestinationAddress(addr tcpip.Address) {
 	copy(b[v6DstAddr:][:IPv6AddressSize], addr)
+}
+
+// SetHopLimit sets the value of the "Hop Limit" field.
+func (b IPv6) SetHopLimit(v uint8) {
+	b[hopLimit] = v
 }
 
 // SetNextHeader sets the value of the "next header" field of the ipv6 header.
@@ -371,6 +378,12 @@ func IsV6LinkLocalAddress(addr tcpip.Address) bool {
 		return false
 	}
 	return addr[0] == 0xfe && (addr[1]&0xc0) == 0x80
+}
+
+// IsV6LoopbackAddress determines if the provided address is an IPv6 loopback
+// address.
+func IsV6LoopbackAddress(addr tcpip.Address) bool {
+	return addr == IPv6Loopback
 }
 
 // IsV6LinkLocalMulticastAddress determines if the provided address is an IPv6

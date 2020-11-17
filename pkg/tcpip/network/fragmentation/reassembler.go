@@ -22,6 +22,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
+	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
 type hole struct {
@@ -41,6 +42,7 @@ type reassembler struct {
 	heap         fragHeap
 	done         bool
 	creationTime int64
+	pkt          *stack.PacketBuffer
 }
 
 func newReassembler(id FragmentID, clock tcpip.Clock) *reassembler {
@@ -78,7 +80,7 @@ func (r *reassembler) updateHoles(first, last uint16, more bool) bool {
 	return used
 }
 
-func (r *reassembler) process(first, last uint16, more bool, proto uint8, vv buffer.VectorisedView) (buffer.VectorisedView, uint8, bool, int, error) {
+func (r *reassembler) process(first, last uint16, more bool, proto uint8, pkt *stack.PacketBuffer) (buffer.VectorisedView, uint8, bool, int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	consumed := 0
@@ -88,18 +90,20 @@ func (r *reassembler) process(first, last uint16, more bool, proto uint8, vv buf
 		// was waiting on the mutex. We don't have to do anything in this case.
 		return buffer.VectorisedView{}, 0, false, consumed, nil
 	}
-	// For IPv6, it is possible to have different Protocol values between
-	// fragments of a packet (because, unlike IPv4, the Protocol is not used to
-	// identify a fragment). In this case, only the Protocol of the first
-	// fragment must be used as per RFC 8200 Section 4.5.
-	//
-	// TODO(gvisor.dev/issue/3648): The entire first IP header should be recorded
-	// here (instead of just the protocol) because most IP options should be
-	// derived from the first fragment.
-	if first == 0 {
-		r.proto = proto
-	}
 	if r.updateHoles(first, last, more) {
+		// For IPv6, it is possible to have different Protocol values between
+		// fragments of a packet (because, unlike IPv4, the Protocol is not used to
+		// identify a fragment). In this case, only the Protocol of the first
+		// fragment must be used as per RFC 8200 Section 4.5.
+		//
+		// TODO(gvisor.dev/issue/3648): During reassembly of an IPv6 packet, IP
+		// options received in the first fragment should be used - and they should
+		// override options from following fragments.
+		if first == 0 {
+			r.pkt = pkt
+			r.proto = proto
+		}
+		vv := pkt.Data
 		// We store the incoming packet only if it filled some holes.
 		heap.Push(&r.heap, fragment{offset: first, vv: vv.Clone(nil)})
 		consumed = vv.Size()

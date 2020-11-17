@@ -61,8 +61,9 @@ type FilesystemType struct{}
 type filesystem struct {
 	vfsfs vfs.Filesystem
 
-	// memFile is used to allocate pages to for regular files.
-	memFile *pgalloc.MemoryFile
+	// mfp is used to allocate memory that stores regular file contents. mfp is
+	// immutable.
+	mfp pgalloc.MemoryFileProvider
 
 	// clock is a realtime clock used to set timestamps in file operations.
 	clock time.Clock
@@ -106,8 +107,8 @@ type FilesystemOpts struct {
 
 // GetFilesystem implements vfs.FilesystemType.GetFilesystem.
 func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, _ string, opts vfs.GetFilesystemOptions) (*vfs.Filesystem, *vfs.Dentry, error) {
-	memFileProvider := pgalloc.MemoryFileProviderFromContext(ctx)
-	if memFileProvider == nil {
+	mfp := pgalloc.MemoryFileProviderFromContext(ctx)
+	if mfp == nil {
 		panic("MemoryFileProviderFromContext returned nil")
 	}
 
@@ -181,7 +182,7 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	}
 	clock := time.RealtimeClockFromContext(ctx)
 	fs := filesystem{
-		memFile:  memFileProvider.MemoryFile(),
+		mfp:      mfp,
 		clock:    clock,
 		devMinor: devMinor,
 	}
@@ -401,7 +402,7 @@ func (i *inode) init(impl interface{}, fs *filesystem, kuid auth.KUID, kgid auth
 	i.mtime = now
 	// i.nlink initialized by caller
 	i.impl = impl
-	i.refs.EnableLeakCheck()
+	i.refs.InitRefs()
 }
 
 // incLinksLocked increments i's link count.
@@ -477,9 +478,9 @@ func (i *inode) statTo(stat *linux.Statx) {
 	stat.GID = atomic.LoadUint32(&i.gid)
 	stat.Mode = uint16(atomic.LoadUint32(&i.mode))
 	stat.Ino = i.ino
-	stat.Atime = linux.NsecToStatxTimestamp(i.atime)
-	stat.Ctime = linux.NsecToStatxTimestamp(i.ctime)
-	stat.Mtime = linux.NsecToStatxTimestamp(i.mtime)
+	stat.Atime = linux.NsecToStatxTimestamp(atomic.LoadInt64(&i.atime))
+	stat.Ctime = linux.NsecToStatxTimestamp(atomic.LoadInt64(&i.ctime))
+	stat.Mtime = linux.NsecToStatxTimestamp(atomic.LoadInt64(&i.mtime))
 	stat.DevMajor = linux.UNNAMED_MAJOR
 	stat.DevMinor = i.fs.devMinor
 	switch impl := i.impl.(type) {
@@ -630,7 +631,8 @@ func (i *inode) direntType() uint8 {
 }
 
 func (i *inode) isDir() bool {
-	return linux.FileMode(i.mode).FileType() == linux.S_IFDIR
+	mode := linux.FileMode(atomic.LoadUint32(&i.mode))
+	return mode.FileType() == linux.S_IFDIR
 }
 
 func (i *inode) touchAtime(mnt *vfs.Mount) {

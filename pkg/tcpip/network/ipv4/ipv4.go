@@ -16,7 +16,9 @@
 package ipv4
 
 import (
+	"errors"
 	"fmt"
+	"math"
 	"sync/atomic"
 	"time"
 
@@ -31,6 +33,8 @@ import (
 )
 
 const (
+	// ReassembleTimeout is the time a packet stays in the reassembly
+	// system before being evicted.
 	// As per RFC 791 section 3.2:
 	//   The current recommendation for the initial timer setting is 15 seconds.
 	//   This may be changed as experience with this protocol accumulates.
@@ -38,7 +42,7 @@ const (
 	// Considering that it is an old recommendation, we use the same reassembly
 	// timeout that linux defines, which is 30 seconds:
 	// https://github.com/torvalds/linux/blob/47ec5303d73ea344e84f46660fff693c57641386/include/net/ip.h#L138
-	reassembleTimeout = 30 * time.Second
+	ReassembleTimeout = 30 * time.Second
 
 	// ProtocolNumber is the ipv4 protocol number.
 	ProtocolNumber = header.IPv4ProtocolNumber
@@ -176,7 +180,11 @@ func (e *endpoint) DefaultTTL() uint8 {
 // MTU implements stack.NetworkEndpoint.MTU. It returns the link-layer MTU minus
 // the network layer max header length.
 func (e *endpoint) MTU() uint32 {
-	return calculateMTU(e.nic.MTU())
+	networkMTU, err := calculateNetworkMTU(e.nic.MTU(), header.IPv4MinimumSize)
+	if err != nil {
+		return 0
+	}
+	return networkMTU
 }
 
 // MaxHeaderLength returns the maximum length needed by ipv4 headers (and
@@ -191,14 +199,28 @@ func (e *endpoint) NetworkProtocolNumber() tcpip.NetworkProtocolNumber {
 }
 
 func (e *endpoint) addIPHeader(r *stack.Route, pkt *stack.PacketBuffer, params stack.NetworkHeaderParams) {
-	ip := header.IPv4(pkt.NetworkHeader().Push(header.IPv4MinimumSize))
+	hdrLen := header.IPv4MinimumSize
+	var opts header.IPv4Options
+	if params.Options != nil {
+		var ok bool
+		if opts, ok = params.Options.(header.IPv4Options); !ok {
+			panic(fmt.Sprintf("want IPv4Options, got %T", params.Options))
+		}
+		hdrLen += opts.SizeWithPadding()
+		if hdrLen > header.IPv4MaximumHeaderSize {
+			// Since we have no way to report an error we must either panic or create
+			// a packet which is different to what was requested. Choose panic as this
+			// would be a programming error that should be caught in testing.
+			panic(fmt.Sprintf("IPv4 Options %d bytes, Max %d", params.Options.SizeWithPadding(), header.IPv4MaximumOptionsSize))
+		}
+	}
+	ip := header.IPv4(pkt.NetworkHeader().Push(hdrLen))
 	length := uint16(pkt.Size())
 	// RFC 6864 section 4.3 mandates uniqueness of ID values for non-atomic
 	// datagrams. Since the DF bit is never being set here, all datagrams
 	// are non-atomic and need an ID.
 	id := atomic.AddUint32(&e.protocol.ids[hashRoute(r, params.Protocol, e.protocol.hashIV)%buckets], 1)
 	ip.Encode(&header.IPv4Fields{
-		IHL:         header.IPv4MinimumSize,
 		TotalLength: length,
 		ID:          uint16(id),
 		TTL:         params.TTL,
@@ -206,23 +228,21 @@ func (e *endpoint) addIPHeader(r *stack.Route, pkt *stack.PacketBuffer, params s
 		Protocol:    uint8(params.Protocol),
 		SrcAddr:     r.LocalAddress,
 		DstAddr:     r.RemoteAddress,
+		Options:     opts,
 	})
 	ip.SetChecksum(^ip.CalculateChecksum())
 	pkt.NetworkProtocolNumber = ProtocolNumber
 }
 
-func (e *endpoint) packetMustBeFragmented(pkt *stack.PacketBuffer, gso *stack.GSO) bool {
-	return (gso == nil || gso.Type == stack.GSONone) && pkt.Size() > int(e.nic.MTU())
-}
-
 // handleFragments fragments pkt and calls the handler function on each
 // fragment. It returns the number of fragments handled and the number of
 // fragments left to be processed. The IP header must already be present in the
-// original packet. The mtu is the maximum size of the packets.
-func (e *endpoint) handleFragments(r *stack.Route, gso *stack.GSO, mtu uint32, pkt *stack.PacketBuffer, handler func(*stack.PacketBuffer) *tcpip.Error) (int, int, *tcpip.Error) {
-	fragMTU := int(calculateFragmentInnerMTU(mtu, pkt))
+// original packet.
+func (e *endpoint) handleFragments(r *stack.Route, gso *stack.GSO, networkMTU uint32, pkt *stack.PacketBuffer, handler func(*stack.PacketBuffer) *tcpip.Error) (int, int, *tcpip.Error) {
+	// Round the MTU down to align to 8 bytes.
+	fragmentPayloadSize := networkMTU &^ 7
 	networkHeader := header.IPv4(pkt.NetworkHeader().View())
-	pf := fragmentation.MakePacketFragmenter(pkt, fragMTU, pkt.AvailableHeaderBytes()+len(networkHeader))
+	pf := fragmentation.MakePacketFragmenter(pkt, fragmentPayloadSize, pkt.AvailableHeaderBytes()+len(networkHeader))
 
 	var n int
 	for {
@@ -240,17 +260,13 @@ func (e *endpoint) handleFragments(r *stack.Route, gso *stack.GSO, mtu uint32, p
 // WritePacket writes a packet to the given destination address and protocol.
 func (e *endpoint) WritePacket(r *stack.Route, gso *stack.GSO, params stack.NetworkHeaderParams, pkt *stack.PacketBuffer) *tcpip.Error {
 	e.addIPHeader(r, pkt, params)
-	return e.writePacket(r, gso, pkt)
-}
 
-func (e *endpoint) writePacket(r *stack.Route, gso *stack.GSO, pkt *stack.PacketBuffer) *tcpip.Error {
 	// iptables filtering. All packets that reach here are locally
 	// generated.
 	nicName := e.protocol.stack.FindNICNameFromID(e.nic.ID())
-	ipt := e.protocol.stack.IPTables()
-	if ok := ipt.Check(stack.Output, pkt, gso, r, "", nicName); !ok {
+	if ok := e.protocol.stack.IPTables().Check(stack.Output, pkt, gso, r, "", nicName); !ok {
 		// iptables is telling us to drop the packet.
-		r.Stats().IP.IPTablesOutputDropped.Increment()
+		e.protocol.stack.Stats().IP.IPTablesOutputDropped.Increment()
 		return nil
 	}
 
@@ -265,23 +281,43 @@ func (e *endpoint) writePacket(r *stack.Route, gso *stack.GSO, pkt *stack.Packet
 		netHeader := header.IPv4(pkt.NetworkHeader().View())
 		ep, err := e.protocol.stack.FindNetworkEndpoint(ProtocolNumber, netHeader.DestinationAddress())
 		if err == nil {
-			route := r.ReverseRoute(netHeader.SourceAddress(), netHeader.DestinationAddress())
-			ep.HandlePacket(&route, pkt)
+			pkt := pkt.CloneToInbound()
+			if e.protocol.stack.ParsePacketBuffer(ProtocolNumber, pkt) == stack.ParsedOK {
+				// Since we rewrote the packet but it is being routed back to us, we can
+				// safely assume the checksum is valid.
+				pkt.RXTransportChecksumValidated = true
+				ep.(*endpoint).handlePacket(pkt)
+			}
 			return nil
 		}
 	}
 
+	return e.writePacket(r, gso, pkt, false /* headerIncluded */)
+}
+
+func (e *endpoint) writePacket(r *stack.Route, gso *stack.GSO, pkt *stack.PacketBuffer, headerIncluded bool) *tcpip.Error {
 	if r.Loop&stack.PacketLoop != 0 {
-		loopedR := r.MakeLoopedRoute()
-		e.HandlePacket(&loopedR, pkt)
-		loopedR.Release()
+		pkt := pkt.CloneToInbound()
+		if e.protocol.stack.ParsePacketBuffer(ProtocolNumber, pkt) == stack.ParsedOK {
+			// If the packet was generated by the stack (not a raw/packet endpoint
+			// where a packet may be written with the header included), then we can
+			// safely assume the checksum is valid.
+			pkt.RXTransportChecksumValidated = !headerIncluded
+			e.handlePacket(pkt)
+		}
 	}
 	if r.Loop&stack.PacketOut == 0 {
 		return nil
 	}
 
-	if e.packetMustBeFragmented(pkt, gso) {
-		sent, remain, err := e.handleFragments(r, gso, e.nic.MTU(), pkt, func(fragPkt *stack.PacketBuffer) *tcpip.Error {
+	networkMTU, err := calculateNetworkMTU(e.nic.MTU(), uint32(pkt.NetworkHeader().View().Size()))
+	if err != nil {
+		r.Stats().IP.OutgoingPacketErrors.Increment()
+		return err
+	}
+
+	if packetMustBeFragmented(pkt, networkMTU, gso) {
+		sent, remain, err := e.handleFragments(r, gso, networkMTU, pkt, func(fragPkt *stack.PacketBuffer) *tcpip.Error {
 			// TODO(gvisor.dev/issue/3884): Evaluate whether we want to send each
 			// fragment one by one using WritePacket() (current strategy) or if we
 			// want to create a PacketBufferList from the fragments and feed it to
@@ -292,6 +328,7 @@ func (e *endpoint) writePacket(r *stack.Route, gso *stack.GSO, pkt *stack.Packet
 		r.Stats().IP.OutgoingPacketErrors.IncrementBy(uint64(remain))
 		return err
 	}
+
 	if err := e.nic.WritePacket(r, gso, ProtocolNumber, pkt); err != nil {
 		r.Stats().IP.OutgoingPacketErrors.Increment()
 		return err
@@ -311,17 +348,23 @@ func (e *endpoint) WritePackets(r *stack.Route, gso *stack.GSO, pkts stack.Packe
 
 	for pkt := pkts.Front(); pkt != nil; pkt = pkt.Next() {
 		e.addIPHeader(r, pkt, params)
-		if e.packetMustBeFragmented(pkt, gso) {
+		networkMTU, err := calculateNetworkMTU(e.nic.MTU(), uint32(pkt.NetworkHeader().View().Size()))
+		if err != nil {
+			r.Stats().IP.OutgoingPacketErrors.IncrementBy(uint64(pkts.Len()))
+			return 0, err
+		}
+
+		if packetMustBeFragmented(pkt, networkMTU, gso) {
 			// Keep track of the packet that is about to be fragmented so it can be
 			// removed once the fragmentation is done.
 			originalPkt := pkt
-			if _, _, err := e.handleFragments(r, gso, e.nic.MTU(), pkt, func(fragPkt *stack.PacketBuffer) *tcpip.Error {
+			if _, _, err := e.handleFragments(r, gso, networkMTU, pkt, func(fragPkt *stack.PacketBuffer) *tcpip.Error {
 				// Modify the packet list in place with the new fragments.
 				pkts.InsertAfter(pkt, fragPkt)
 				pkt = fragPkt
 				return nil
 			}); err != nil {
-				panic(fmt.Sprintf("e.handleFragments(_, _, %d, _, _) = %s", e.nic.MTU(), err))
+				panic(fmt.Sprintf("e.handleFragments(_, _, %d, _, _) = %s", networkMTU, err))
 			}
 			// Remove the packet that was just fragmented and process the rest.
 			pkts.Remove(originalPkt)
@@ -331,8 +374,7 @@ func (e *endpoint) WritePackets(r *stack.Route, gso *stack.GSO, pkts stack.Packe
 	nicName := e.protocol.stack.FindNICNameFromID(e.nic.ID())
 	// iptables filtering. All packets that reach here are locally
 	// generated.
-	ipt := e.protocol.stack.IPTables()
-	dropped, natPkts := ipt.CheckPackets(stack.Output, pkts, gso, r, nicName)
+	dropped, natPkts := e.protocol.stack.IPTables().CheckPackets(stack.Output, pkts, gso, r, nicName)
 	if len(dropped) == 0 && len(natPkts) == 0 {
 		// Fast path: If no packets are to be dropped then we can just invoke the
 		// faster WritePackets API directly.
@@ -355,10 +397,13 @@ func (e *endpoint) WritePackets(r *stack.Route, gso *stack.GSO, pkts stack.Packe
 		if _, ok := natPkts[pkt]; ok {
 			netHeader := header.IPv4(pkt.NetworkHeader().View())
 			if ep, err := e.protocol.stack.FindNetworkEndpoint(ProtocolNumber, netHeader.DestinationAddress()); err == nil {
-				src := netHeader.SourceAddress()
-				dst := netHeader.DestinationAddress()
-				route := r.ReverseRoute(src, dst)
-				ep.HandlePacket(&route, pkt)
+				pkt := pkt.CloneToInbound()
+				if e.protocol.stack.ParsePacketBuffer(ProtocolNumber, pkt) == stack.ParsedOK {
+					// Since we rewrote the packet but it is being routed back to us, we
+					// can safely assume the checksum is valid.
+					pkt.RXTransportChecksumValidated = true
+					ep.(*endpoint).handlePacket(pkt)
+				}
 				n++
 				continue
 			}
@@ -382,6 +427,16 @@ func (e *endpoint) WriteHeaderIncludedPacket(r *stack.Route, pkt *stack.PacketBu
 	// The packet already has an IP header, but there are a few required
 	// checks.
 	h, ok := pkt.Data.PullUp(header.IPv4MinimumSize)
+	if !ok {
+		return tcpip.ErrMalformedHeader
+	}
+
+	hdrLen := header.IPv4(h).HeaderLength()
+	if hdrLen < header.IPv4MinimumSize {
+		return tcpip.ErrMalformedHeader
+	}
+
+	h, ok = pkt.Data.PullUp(int(hdrLen))
 	if !ok {
 		return tcpip.ErrMalformedHeader
 	}
@@ -424,21 +479,108 @@ func (e *endpoint) WriteHeaderIncludedPacket(r *stack.Route, pkt *stack.PacketBu
 		return tcpip.ErrMalformedHeader
 	}
 
-	return e.writePacket(r, nil /* gso */, pkt)
+	return e.writePacket(r, nil /* gso */, pkt, true /* headerIncluded */)
+}
+
+// forwardPacket attempts to forward a packet to its final destination.
+func (e *endpoint) forwardPacket(pkt *stack.PacketBuffer) *tcpip.Error {
+	h := header.IPv4(pkt.NetworkHeader().View())
+	ttl := h.TTL()
+	if ttl == 0 {
+		// As per RFC 792 page 6, Time Exceeded Message,
+		//
+		//  If the gateway processing a datagram finds the time to live field
+		//  is zero it must discard the datagram.  The gateway may also notify
+		//  the source host via the time exceeded message.
+		return e.protocol.returnError(&icmpReasonTTLExceeded{}, pkt)
+	}
+
+	dstAddr := h.DestinationAddress()
+
+	// Check if the destination is owned by the stack.
+	networkEndpoint, err := e.protocol.stack.FindNetworkEndpoint(ProtocolNumber, dstAddr)
+	if err == nil {
+		networkEndpoint.(*endpoint).handlePacket(pkt)
+		return nil
+	}
+	if err != tcpip.ErrBadAddress {
+		return err
+	}
+
+	r, err := e.protocol.stack.FindRoute(0, "", dstAddr, ProtocolNumber, false /* multicastLoop */)
+	if err != nil {
+		return err
+	}
+	defer r.Release()
+
+	// We need to do a deep copy of the IP packet because
+	// WriteHeaderIncludedPacket takes ownership of the packet buffer, but we do
+	// not own it.
+	newHdr := header.IPv4(stack.PayloadSince(pkt.NetworkHeader()))
+
+	// As per RFC 791 page 30, Time to Live,
+	//
+	//   This field must be decreased at each point that the internet header
+	//   is processed to reflect the time spent processing the datagram.
+	//   Even if no local information is available on the time actually
+	//   spent, the field must be decremented by 1.
+	newHdr.SetTTL(ttl - 1)
+
+	return r.WriteHeaderIncludedPacket(stack.NewPacketBuffer(stack.PacketBufferOptions{
+		ReserveHeaderBytes: int(r.MaxHeaderLength()),
+		Data:               buffer.View(newHdr).ToVectorisedView(),
+	}))
 }
 
 // HandlePacket is called by the link layer when new ipv4 packets arrive for
 // this endpoint.
-func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
+func (e *endpoint) HandlePacket(pkt *stack.PacketBuffer) {
+	stats := e.protocol.stack.Stats()
+	stats.IP.PacketsReceived.Increment()
+
 	if !e.isEnabled() {
+		stats.IP.DisabledPacketsReceived.Increment()
 		return
 	}
 
+	// Loopback traffic skips the prerouting chain.
+	if !e.nic.IsLoopback() {
+		if ok := e.protocol.stack.IPTables().Check(stack.Prerouting, pkt, nil, nil, e.MainAddress().Address, ""); !ok {
+			// iptables is telling us to drop the packet.
+			stats.IP.IPTablesPreroutingDropped.Increment()
+			return
+		}
+	}
+
+	e.handlePacket(pkt)
+}
+
+// handlePacket is like HandlePacket except it does not perform the prerouting
+// iptables hook.
+func (e *endpoint) handlePacket(pkt *stack.PacketBuffer) {
+	pkt.NICID = e.nic.ID()
+	stats := e.protocol.stack.Stats()
+
 	h := header.IPv4(pkt.NetworkHeader().View())
 	if !h.IsValid(pkt.Data.Size() + pkt.NetworkHeader().View().Size() + pkt.TransportHeader().View().Size()) {
-		r.Stats().IP.MalformedPacketsReceived.Increment()
+		stats.IP.MalformedPacketsReceived.Increment()
 		return
 	}
+	srcAddr := h.SourceAddress()
+	dstAddr := h.DestinationAddress()
+
+	addressEndpoint := e.AcquireAssignedAddress(dstAddr, e.nic.Promiscuous(), stack.CanBePrimaryEndpoint)
+	if addressEndpoint == nil {
+		if !e.protocol.Forwarding() {
+			stats.IP.InvalidDestinationAddressesReceived.Increment()
+			return
+		}
+
+		_ = e.forwardPacket(pkt)
+		return
+	}
+	subnet := addressEndpoint.AddressWithPrefix().Subnet()
+	addressEndpoint.DecRef()
 
 	// There has been some confusion regarding verifying checksums. We need
 	// just look for negative 0 (0xffff) as the checksum, as it's not possible to
@@ -462,7 +604,7 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 	//        is all 1 bits (-0 in 1's complement arithmetic), the check
 	//        succeeds.
 	if h.CalculateChecksum() != 0xffff {
-		r.Stats().IP.MalformedPacketsReceived.Increment()
+		stats.IP.MalformedPacketsReceived.Increment()
 		return
 	}
 
@@ -470,17 +612,18 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 	//   When a host sends any datagram, the IP source address MUST
 	//   be one of its own IP addresses (but not a broadcast or
 	//   multicast address).
-	if r.IsOutboundBroadcast() || header.IsV4MulticastAddress(r.RemoteAddress) {
-		r.Stats().IP.InvalidSourceAddressesReceived.Increment()
+	if directedBroadcast := subnet.IsBroadcast(srcAddr); directedBroadcast || srcAddr == header.IPv4Broadcast || header.IsV4MulticastAddress(srcAddr) {
+		stats.IP.InvalidSourceAddressesReceived.Increment()
 		return
 	}
 
+	pkt.NetworkPacketInfo.LocalAddressBroadcast = subnet.IsBroadcast(dstAddr) || dstAddr == header.IPv4Broadcast
+
 	// iptables filtering. All packets that reach here are intended for
 	// this machine and will not be forwarded.
-	ipt := e.protocol.stack.IPTables()
-	if ok := ipt.Check(stack.Input, pkt, nil, nil, "", ""); !ok {
+	if ok := e.protocol.stack.IPTables().Check(stack.Input, pkt, nil, nil, "", ""); !ok {
 		// iptables is telling us to drop the packet.
-		r.Stats().IP.IPTablesInputDropped.Increment()
+		stats.IP.IPTablesInputDropped.Increment()
 		return
 	}
 
@@ -488,8 +631,8 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 		if pkt.Data.Size()+pkt.TransportHeader().View().Size() == 0 {
 			// Drop the packet as it's marked as a fragment but has
 			// no payload.
-			r.Stats().IP.MalformedPacketsReceived.Increment()
-			r.Stats().IP.MalformedFragmentsReceived.Increment()
+			stats.IP.MalformedPacketsReceived.Increment()
+			stats.IP.MalformedFragmentsReceived.Increment()
 			return
 		}
 		// The packet is a fragment, let's try to reassemble it.
@@ -502,14 +645,13 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 		// size). Otherwise the packet would've been rejected as invalid before
 		// reaching here.
 		if int(start)+pkt.Data.Size() > header.IPv4MaximumPayloadSize {
-			r.Stats().IP.MalformedPacketsReceived.Increment()
-			r.Stats().IP.MalformedFragmentsReceived.Increment()
+			stats.IP.MalformedPacketsReceived.Increment()
+			stats.IP.MalformedFragmentsReceived.Increment()
 			return
 		}
-		var ready bool
-		var err error
+
 		proto := h.Protocol()
-		pkt.Data, _, ready, err = e.protocol.fragmentation.Process(
+		data, _, ready, err := e.protocol.fragmentation.Process(
 			// As per RFC 791 section 2.3, the identification value is unique
 			// for a source-destination pair and protocol.
 			fragmentation.FragmentID{
@@ -522,30 +664,57 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 			start+uint16(pkt.Data.Size())-1,
 			h.More(),
 			proto,
-			pkt.Data,
+			pkt,
 		)
 		if err != nil {
-			r.Stats().IP.MalformedPacketsReceived.Increment()
-			r.Stats().IP.MalformedFragmentsReceived.Increment()
+			stats.IP.MalformedPacketsReceived.Increment()
+			stats.IP.MalformedFragmentsReceived.Increment()
 			return
 		}
 		if !ready {
 			return
 		}
-	}
+		pkt.Data = data
 
-	r.Stats().IP.PacketsDelivered.Increment()
+		// The reassembler doesn't take care of fixing up the header, so we need
+		// to do it here.
+		h.SetTotalLength(uint16(pkt.Data.Size() + len((h))))
+		h.SetFlagsFragmentOffset(0, 0)
+	}
+	stats.IP.PacketsDelivered.Increment()
+
 	p := h.TransportProtocol()
 	if p == header.ICMPv4ProtocolNumber {
 		// TODO(gvisor.dev/issues/3810): when we sort out ICMP and transport
 		// headers, the setting of the transport number here should be
 		// unnecessary and removed.
 		pkt.TransportProtocolNumber = p
-		e.handleICMP(r, pkt)
+		e.handleICMP(pkt)
 		return
 	}
+	if opts := h.Options(); len(opts) != 0 {
+		// TODO(gvisor.dev/issue/4586):
+		// When we add forwarding support we should use the verified options
+		// rather than just throwing them away.
+		aux, _, err := e.processIPOptions(pkt, opts, &optionUsageReceive{})
+		if err != nil {
+			switch {
+			case
+				errors.Is(err, header.ErrIPv4OptDuplicate),
+				errors.Is(err, errIPv4RecordRouteOptInvalidPointer),
+				errors.Is(err, errIPv4RecordRouteOptInvalidLength),
+				errors.Is(err, errIPv4TimestampOptInvalidLength),
+				errors.Is(err, errIPv4TimestampOptInvalidPointer),
+				errors.Is(err, errIPv4TimestampOptOverflow):
+				_ = e.protocol.returnError(&icmpReasonParamProblem{pointer: aux}, pkt)
+				stats.MalformedRcvdPackets.Increment()
+				stats.IP.MalformedPacketsReceived.Increment()
+			}
+			return
+		}
+	}
 
-	switch res := e.dispatcher.DeliverTransportPacket(r, p, pkt); res {
+	switch res := e.dispatcher.DeliverTransportPacket(p, pkt); res {
 	case stack.TransportPacketHandled:
 	case stack.TransportPacketDestinationPortUnreachable:
 		// As per RFC: 1122 Section 3.2.2.1 A host SHOULD generate Destination
@@ -553,13 +722,13 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 		//     3 (Port Unreachable), when the designated transport protocol
 		//     (e.g., UDP) is unable to demultiplex the datagram but has no
 		//     protocol mechanism to inform the sender.
-		_ = e.protocol.returnError(r, &icmpReasonPortUnreachable{}, pkt)
+		_ = e.protocol.returnError(&icmpReasonPortUnreachable{}, pkt)
 	case stack.TransportPacketProtocolUnreachable:
 		// As per RFC: 1122 Section 3.2.2.1
 		//   A host SHOULD generate Destination Unreachable messages with code:
 		//     2 (Protocol Unreachable), when the designated transport protocol
 		//     is not supported
-		_ = e.protocol.returnError(r, &icmpReasonProtoUnreachable{}, pkt)
+		_ = e.protocol.returnError(&icmpReasonProtoUnreachable{}, pkt)
 	default:
 		panic(fmt.Sprintf("unrecognized result from DeliverTransportPacket = %d", res))
 	}
@@ -602,7 +771,7 @@ func (e *endpoint) AcquireAssignedAddress(localAddr tcpip.Address, allowTemp boo
 
 	loopback := e.nic.IsLoopback()
 	addressEndpoint := e.mu.addressableEndpointState.ReadOnly().AddrOrMatching(localAddr, allowTemp, func(addressEndpoint stack.AddressEndpoint) bool {
-		subnet := addressEndpoint.AddressWithPrefix().Subnet()
+		subnet := addressEndpoint.Subnet()
 		// IPv4 has a notion of a subnet broadcast address and considers the
 		// loopback interface bound to an address's whole subnet (on linux).
 		return subnet.IsBroadcast(localAddr) || (loopback && subnet.Contains(localAddr))
@@ -673,6 +842,7 @@ func (e *endpoint) IsInGroup(addr tcpip.Address) bool {
 
 var _ stack.ForwardingNetworkProtocol = (*protocol)(nil)
 var _ stack.NetworkProtocol = (*protocol)(nil)
+var _ fragmentation.TimeoutHandler = (*protocol)(nil)
 
 type protocol struct {
 	stack *stack.Stack
@@ -778,26 +948,32 @@ func (p *protocol) SetForwarding(v bool) {
 	}
 }
 
-// calculateMTU calculates the network-layer payload MTU based on the link-layer
-// payload mtu.
-func calculateMTU(mtu uint32) uint32 {
-	if mtu > MaxTotalSize {
-		mtu = MaxTotalSize
+// calculateNetworkMTU calculates the network-layer payload MTU based on the
+// link-layer payload mtu.
+func calculateNetworkMTU(linkMTU, networkHeaderSize uint32) (uint32, *tcpip.Error) {
+	if linkMTU < header.IPv4MinimumMTU {
+		return 0, tcpip.ErrInvalidEndpointState
 	}
-	return mtu - header.IPv4MinimumSize
+
+	// As per RFC 791 section 3.1, an IPv4 header cannot exceed 60 bytes in
+	// length:
+	//   The maximal internet header is 60 octets, and a typical internet header
+	//   is 20 octets, allowing a margin for headers of higher level protocols.
+	if networkHeaderSize > header.IPv4MaximumHeaderSize {
+		return 0, tcpip.ErrMalformedHeader
+	}
+
+	networkMTU := linkMTU
+	if networkMTU > MaxTotalSize {
+		networkMTU = MaxTotalSize
+	}
+
+	return networkMTU - uint32(networkHeaderSize), nil
 }
 
-// calculateFragmentInnerMTU calculates the maximum number of bytes of
-// fragmentable data a fragment can have, based on the link layer mtu and pkt's
-// network header size.
-func calculateFragmentInnerMTU(mtu uint32, pkt *stack.PacketBuffer) uint32 {
-	if mtu > MaxTotalSize {
-		mtu = MaxTotalSize
-	}
-	mtu -= uint32(pkt.NetworkHeader().View().Size())
-	// Round the MTU down to align to 8 bytes.
-	mtu &^= 7
-	return mtu
+func packetMustBeFragmented(pkt *stack.PacketBuffer, networkMTU uint32, gso *stack.GSO) bool {
+	payload := pkt.TransportHeader().View().Size() + pkt.Data.Size()
+	return (gso == nil || gso.Type == stack.GSONone) && uint32(payload) > networkMTU
 }
 
 // addressToUint32 translates an IPv4 address into its little endian uint32
@@ -831,13 +1007,14 @@ func NewProtocol(s *stack.Stack) stack.NetworkProtocol {
 	}
 	hashIV := r[buckets]
 
-	return &protocol{
-		stack:         s,
-		ids:           ids,
-		hashIV:        hashIV,
-		defaultTTL:    DefaultTTL,
-		fragmentation: fragmentation.NewFragmentation(fragmentblockSize, fragmentation.HighFragThreshold, fragmentation.LowFragThreshold, reassembleTimeout, s.Clock()),
+	p := &protocol{
+		stack:      s,
+		ids:        ids,
+		hashIV:     hashIV,
+		defaultTTL: DefaultTTL,
 	}
+	p.fragmentation = fragmentation.NewFragmentation(fragmentblockSize, fragmentation.HighFragThreshold, fragmentation.LowFragThreshold, ReassembleTimeout, s.Clock(), p)
+	return p
 }
 
 func buildNextFragment(pf *fragmentation.PacketFragmenter, originalIPHeader header.IPv4) (*stack.PacketBuffer, bool) {
@@ -846,6 +1023,7 @@ func buildNextFragment(pf *fragmentation.PacketFragmenter, originalIPHeader head
 
 	originalIPHeaderLength := len(originalIPHeader)
 	nextFragIPHeader := header.IPv4(fragPkt.NetworkHeader().Push(originalIPHeaderLength))
+	fragPkt.NetworkProtocolNumber = ProtocolNumber
 
 	if copied := copy(nextFragIPHeader, originalIPHeader); copied != len(originalIPHeader) {
 		panic(fmt.Sprintf("wrong number of bytes copied into fragmentIPHeaders: got = %d, want = %d", copied, originalIPHeaderLength))
@@ -861,4 +1039,325 @@ func buildNextFragment(pf *fragmentation.PacketFragmenter, originalIPHeader head
 	nextFragIPHeader.SetChecksum(^nextFragIPHeader.CalculateChecksum())
 
 	return fragPkt, more
+}
+
+// optionAction describes possible actions that may be taken on an option
+// while processing it.
+type optionAction uint8
+
+const (
+	// optionRemove says that the option should not be in the output option set.
+	optionRemove optionAction = iota
+
+	// optionProcess says that the option should be fully processed.
+	optionProcess
+
+	// optionVerify says the option should be checked and passed unchanged.
+	optionVerify
+
+	// optionPass says to pass the output set without checking.
+	optionPass
+)
+
+// optionActions list what to do for each option in a given scenario.
+type optionActions struct {
+	// timestamp controls what to do with a Timestamp option.
+	timestamp optionAction
+
+	// recordroute controls what to do with a Record Route option.
+	recordRoute optionAction
+
+	// unknown controls what to do with an unknown option.
+	unknown optionAction
+}
+
+// optionsUsage specifies the ways options may be operated upon for a given
+// scenario during packet processing.
+type optionsUsage interface {
+	actions() optionActions
+}
+
+// optionUsageReceive implements optionsUsage for received packets.
+type optionUsageReceive struct{}
+
+// actions implements optionsUsage.
+func (*optionUsageReceive) actions() optionActions {
+	return optionActions{
+		timestamp:   optionVerify,
+		recordRoute: optionVerify,
+		unknown:     optionPass,
+	}
+}
+
+// TODO(gvisor.dev/issue/4586): Add an entry here for forwarding when it
+// is enabled (Process, Process, Pass) and for fragmenting (Process, Process,
+// Pass for frag1, but Remove,Remove,Remove for all other frags).
+
+// optionUsageEcho implements optionsUsage for echo packet processing.
+type optionUsageEcho struct{}
+
+// actions implements optionsUsage.
+func (*optionUsageEcho) actions() optionActions {
+	return optionActions{
+		timestamp:   optionProcess,
+		recordRoute: optionProcess,
+		unknown:     optionRemove,
+	}
+}
+
+var (
+	errIPv4TimestampOptInvalidLength  = errors.New("invalid Timestamp length")
+	errIPv4TimestampOptInvalidPointer = errors.New("invalid Timestamp pointer")
+	errIPv4TimestampOptOverflow       = errors.New("overflow in Timestamp")
+	errIPv4TimestampOptInvalidFlags   = errors.New("invalid Timestamp flags")
+)
+
+// handleTimestamp does any required processing on a Timestamp option
+// in place.
+func handleTimestamp(tsOpt header.IPv4OptionTimestamp, localAddress tcpip.Address, clock tcpip.Clock, usage optionsUsage) (uint8, error) {
+	flags := tsOpt.Flags()
+	var entrySize uint8
+	switch flags {
+	case header.IPv4OptionTimestampOnlyFlag:
+		entrySize = header.IPv4OptionTimestampSize
+	case
+		header.IPv4OptionTimestampWithIPFlag,
+		header.IPv4OptionTimestampWithPredefinedIPFlag:
+		entrySize = header.IPv4OptionTimestampWithAddrSize
+	default:
+		return header.IPv4OptTSOFLWAndFLGOffset, errIPv4TimestampOptInvalidFlags
+	}
+
+	pointer := tsOpt.Pointer()
+	// To simplify processing below, base further work on the array of timestamps
+	// beyond the header, rather than on the whole option. Also to aid
+	// calculations set 'nextSlot' to be 0 based as in the packet it is 1 based.
+	nextSlot := pointer - (header.IPv4OptionTimestampHdrLength + 1)
+	optLen := tsOpt.Size()
+	dataLength := optLen - header.IPv4OptionTimestampHdrLength
+
+	// In the section below, we verify the pointer, length and overflow counter
+	// fields of the option. The distinction is in which byte you return as being
+	// in error in the ICMP packet. Offsets 1 (length), 2 pointer)
+	// or 3 (overflowed counter).
+	//
+	// The following RFC sections cover this section:
+	//
+	// RFC 791 (page 22):
+	//    If there is some room but not enough room for a full timestamp
+	//    to be inserted, or the overflow count itself overflows, the
+	//    original datagram is considered to be in error and is discarded.
+	//    In either case an ICMP parameter problem message may be sent to
+	//    the source host [3].
+	//
+	// You can get this situation in two ways. Firstly if the data area is not
+	// a multiple of the entry size or secondly, if the pointer is not at a
+	// multiple of the entry size. The wording of the RFC suggests that
+	// this is not an error until you actually run out of space.
+	if pointer > optLen {
+		// RFC 791 (page 22) says we should switch to using the overflow count.
+		//    If the timestamp data area is already full (the pointer exceeds
+		//    the length) the datagram is forwarded without inserting the
+		//    timestamp, but the overflow count is incremented by one.
+		if flags == header.IPv4OptionTimestampWithPredefinedIPFlag {
+			// By definition we have nothing to do.
+			return 0, nil
+		}
+
+		if tsOpt.IncOverflow() != 0 {
+			return 0, nil
+		}
+		// The overflow count is also full.
+		return header.IPv4OptTSOFLWAndFLGOffset, errIPv4TimestampOptOverflow
+	}
+	if nextSlot+entrySize > dataLength {
+		// The data area isn't full but there isn't room for a new entry.
+		// Either Length or Pointer could be bad.
+		if false {
+			// We must select Pointer for Linux compatibility, even if
+			// only the length is bad.
+			// The Linux code is at (in October 2020)
+			// https://github.com/torvalds/linux/blob/bbf5c979011a099af5dc76498918ed7df445635b/net/ipv4/ip_options.c#L367-L370
+			//		if (optptr[2]+3 > optlen) {
+			//			pp_ptr = optptr + 2;
+			//			goto error;
+			//		}
+			// which doesn't distinguish between which of optptr[2] or optlen
+			// is wrong, but just arbitrarily decides on optptr+2.
+			if dataLength%entrySize != 0 {
+				// The Data section size should be a multiple of the expected
+				// timestamp entry size.
+				return header.IPv4OptionLengthOffset, errIPv4TimestampOptInvalidLength
+			}
+			// If the size is OK, the pointer must be corrupted.
+		}
+		return header.IPv4OptTSPointerOffset, errIPv4TimestampOptInvalidPointer
+	}
+
+	if usage.actions().timestamp == optionProcess {
+		tsOpt.UpdateTimestamp(localAddress, clock)
+	}
+	return 0, nil
+}
+
+var (
+	errIPv4RecordRouteOptInvalidLength  = errors.New("invalid length in Record Route")
+	errIPv4RecordRouteOptInvalidPointer = errors.New("invalid pointer in Record Route")
+)
+
+// handleRecordRoute checks and processes a Record route option. It is much
+// like the timestamp type 1 option, but without timestamps. The passed in
+// address is stored in the option in the correct spot if possible.
+func handleRecordRoute(rrOpt header.IPv4OptionRecordRoute, localAddress tcpip.Address, usage optionsUsage) (uint8, error) {
+	optlen := rrOpt.Size()
+
+	if optlen < header.IPv4AddressSize+header.IPv4OptionRecordRouteHdrLength {
+		return header.IPv4OptionLengthOffset, errIPv4RecordRouteOptInvalidLength
+	}
+
+	nextSlot := rrOpt.Pointer() - 1 // Pointer is 1 based.
+
+	// RFC 791 page 21 says
+	//       If the route data area is already full (the pointer exceeds the
+	//       length) the datagram is forwarded without inserting the address
+	//       into the recorded route. If there is some room but not enough
+	//       room for a full address to be inserted, the original datagram is
+	//       considered to be in error and is discarded.  In either case an
+	//       ICMP parameter problem message may be sent to the source
+	//       host.
+	// The use of the words "In either case" suggests that a 'full' RR option
+	// could generate an ICMP at every hop after it fills up. We chose to not
+	// do this (as do most implementations). It is probable that the inclusion
+	// of these words is a copy/paste error from the timestamp option where
+	// there are two failure reasons given.
+	if nextSlot >= optlen {
+		return 0, nil
+	}
+
+	// The data area isn't full but there isn't room for a new entry.
+	// Either Length or Pointer could be bad. We must select Pointer for Linux
+	// compatibility, even if only the length is bad.
+	if nextSlot+header.IPv4AddressSize > optlen {
+		if false {
+			// This is what we would do if we were not being Linux compatible.
+			// Check for bad pointer or length value. Must be a multiple of 4 after
+			// accounting for the 3 byte header and not within that header.
+			// RFC 791, page 20 says:
+			//       The pointer is relative to this option, and the
+			//       smallest legal value for the pointer is 4.
+			//
+			//       A recorded route is composed of a series of internet addresses.
+			//       Each internet address is 32 bits or 4 octets.
+			// Linux skips this test so we must too.  See Linux code at:
+			// https://github.com/torvalds/linux/blob/bbf5c979011a099af5dc76498918ed7df445635b/net/ipv4/ip_options.c#L338-L341
+			//    if (optptr[2]+3 > optlen) {
+			//      pp_ptr = optptr + 2;
+			//      goto error;
+			//    }
+			if (optlen-header.IPv4OptionRecordRouteHdrLength)%header.IPv4AddressSize != 0 {
+				// Length is bad, not on integral number of slots.
+				return header.IPv4OptionLengthOffset, errIPv4RecordRouteOptInvalidLength
+			}
+			// If not length, the fault must be with the pointer.
+		}
+		return header.IPv4OptRRPointerOffset, errIPv4RecordRouteOptInvalidPointer
+	}
+	if usage.actions().recordRoute == optionVerify {
+		return 0, nil
+	}
+	rrOpt.StoreAddress(localAddress)
+	return 0, nil
+}
+
+// processIPOptions parses the IPv4 options and produces a new set of options
+// suitable for use in the next step of packet processing as informed by usage.
+// The original will not be touched.
+//
+// Returns
+// - The location of an error if there was one (or 0 if no error)
+// - If there is an error, information as to what it was was.
+// - The replacement option set.
+func (e *endpoint) processIPOptions(pkt *stack.PacketBuffer, orig header.IPv4Options, usage optionsUsage) (uint8, header.IPv4Options, error) {
+	stats := e.protocol.stack.Stats()
+	opts := header.IPv4Options(orig)
+	optIter := opts.MakeIterator()
+
+	// Each option other than NOP must only appear (RFC 791 section 3.1, at the
+	// definition of every type). Keep track of each of the possible types in
+	// the 8 bit 'type' field.
+	var seenOptions [math.MaxUint8 + 1]bool
+
+	// TODO(gvisor.dev/issue/4586):
+	// This will need tweaking  when we start really forwarding packets
+	// as we may need to get two addresses, for rx and tx interfaces.
+	// We will also have to take usage into account.
+	prefixedAddress, err := e.protocol.stack.GetMainNICAddress(e.nic.ID(), ProtocolNumber)
+	localAddress := prefixedAddress.Address
+	if err != nil {
+		h := header.IPv4(pkt.NetworkHeader().View())
+		dstAddr := h.DestinationAddress()
+		if pkt.NetworkPacketInfo.LocalAddressBroadcast || header.IsV4MulticastAddress(dstAddr) {
+			return 0 /* errCursor */, nil, header.ErrIPv4OptionAddress
+		}
+		localAddress = dstAddr
+	}
+
+	for {
+		option, done, err := optIter.Next()
+		if done || err != nil {
+			return optIter.ErrCursor, optIter.Finalize(), err
+		}
+		optType := option.Type()
+		if optType == header.IPv4OptionNOPType {
+			optIter.PushNOPOrEnd(optType)
+			continue
+		}
+		if optType == header.IPv4OptionListEndType {
+			optIter.PushNOPOrEnd(optType)
+			return 0 /* errCursor */, optIter.Finalize(), nil /* err */
+		}
+
+		// check for repeating options (multiple NOPs are OK)
+		if seenOptions[optType] {
+			return optIter.ErrCursor, nil, header.ErrIPv4OptDuplicate
+		}
+		seenOptions[optType] = true
+
+		optLen := int(option.Size())
+		switch option := option.(type) {
+		case *header.IPv4OptionTimestamp:
+			stats.IP.OptionTSReceived.Increment()
+			if usage.actions().timestamp != optionRemove {
+				clock := e.protocol.stack.Clock()
+				newBuffer := optIter.RemainingBuffer()[:len(*option)]
+				_ = copy(newBuffer, option.Contents())
+				offset, err := handleTimestamp(header.IPv4OptionTimestamp(newBuffer), localAddress, clock, usage)
+				if err != nil {
+					return optIter.ErrCursor + offset, nil, err
+				}
+				optIter.ConsumeBuffer(optLen)
+			}
+
+		case *header.IPv4OptionRecordRoute:
+			stats.IP.OptionRRReceived.Increment()
+			if usage.actions().recordRoute != optionRemove {
+				newBuffer := optIter.RemainingBuffer()[:len(*option)]
+				_ = copy(newBuffer, option.Contents())
+				offset, err := handleRecordRoute(header.IPv4OptionRecordRoute(newBuffer), localAddress, usage)
+				if err != nil {
+					return optIter.ErrCursor + offset, nil, err
+				}
+				optIter.ConsumeBuffer(optLen)
+			}
+
+		default:
+			stats.IP.OptionUnknownReceived.Increment()
+			if usage.actions().unknown == optionPass {
+				newBuffer := optIter.RemainingBuffer()[:optLen]
+				// Arguments already heavily checked.. ignore result.
+				_ = copy(newBuffer, option.Contents())
+				optIter.ConsumeBuffer(optLen)
+			}
+		}
+	}
 }

@@ -129,13 +129,27 @@ func Semctl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscal
 		v, err := getPID(t, id, num)
 		return uintptr(v), nil, err
 
+	case linux.IPC_STAT:
+		arg := args[3].Pointer()
+		ds, err := ipcStat(t, id)
+		if err == nil {
+			_, err = ds.CopyOut(t, arg)
+		}
+
+		return 0, nil, err
+
+	case linux.GETZCNT:
+		v, err := getZCnt(t, id, num)
+		return uintptr(v), nil, err
+
+	case linux.GETNCNT:
+		v, err := getNCnt(t, id, num)
+		return uintptr(v), nil, err
+
 	case linux.IPC_INFO,
 		linux.SEM_INFO,
-		linux.IPC_STAT,
 		linux.SEM_STAT,
-		linux.SEM_STAT_ANY,
-		linux.GETNCNT,
-		linux.GETZCNT:
+		linux.SEM_STAT_ANY:
 
 		t.Kernel().EmitUnimplementedEvent(t)
 		fallthrough
@@ -169,6 +183,16 @@ func ipcSet(t *kernel.Task, id int32, uid auth.UID, gid auth.GID, perms fs.FileP
 	}
 	owner := fs.FileOwner{UID: kuid, GID: kgid}
 	return set.Change(t, creds, owner, perms)
+}
+
+func ipcStat(t *kernel.Task, id int32) (*linux.SemidDS, error) {
+	r := t.IPCNamespace().SemaphoreRegistry()
+	set := r.FindByID(id)
+	if set == nil {
+		return nil, syserror.EINVAL
+	}
+	creds := auth.CredentialsFromContext(t)
+	return set.GetStat(creds)
 }
 
 func setVal(t *kernel.Task, id int32, num int32, val int16) error {
@@ -239,4 +263,24 @@ func getPID(t *kernel.Task, id int32, num int32) (int32, error) {
 		return 0, nil
 	}
 	return int32(tg.ID()), nil
+}
+
+func getZCnt(t *kernel.Task, id int32, num int32) (uint16, error) {
+	r := t.IPCNamespace().SemaphoreRegistry()
+	set := r.FindByID(id)
+	if set == nil {
+		return 0, syserror.EINVAL
+	}
+	creds := auth.CredentialsFromContext(t)
+	return set.CountZeroWaiters(num, creds)
+}
+
+func getNCnt(t *kernel.Task, id int32, num int32) (uint16, error) {
+	r := t.IPCNamespace().SemaphoreRegistry()
+	set := r.FindByID(id)
+	if set == nil {
+		return 0, syserror.EINVAL
+	}
+	creds := auth.CredentialsFromContext(t)
+	return set.CountNegativeWaiters(num, creds)
 }

@@ -25,6 +25,7 @@ import (
 	"gvisor.dev/gvisor/pkg/procid"
 	"gvisor.dev/gvisor/pkg/sentry/platform/ring0"
 	"gvisor.dev/gvisor/pkg/sentry/platform/ring0/pagetables"
+	ktime "gvisor.dev/gvisor/pkg/sentry/time"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
@@ -39,6 +40,9 @@ type machine struct {
 	// This must be accessed atomically. If nextSlot is ^uint32(0), then
 	// slots are currently being updated, and the caller should retry.
 	nextSlot uint32
+
+	// upperSharedPageTables tracks the read-only shared upper of all the pagetables.
+	upperSharedPageTables *pagetables.PageTables
 
 	// kernel is the set of global structures.
 	kernel ring0.Kernel
@@ -198,9 +202,7 @@ func newMachine(vm int) (*machine, error) {
 	log.Debugf("The maximum number of vCPUs is %d.", m.maxVCPUs)
 	m.vCPUsByTID = make(map[uint64]*vCPU)
 	m.vCPUsByID = make([]*vCPU, m.maxVCPUs)
-	m.kernel.Init(ring0.KernelOpts{
-		PageTables: pagetables.New(newAllocator()),
-	}, m.maxVCPUs)
+	m.kernel.Init(m.maxVCPUs)
 
 	// Pull the maximum slots.
 	maxSlots, _, errno := syscall.RawSyscall(syscall.SYS_IOCTL, uintptr(m.fd), _KVM_CHECK_EXTENSION, _KVM_CAP_MAX_MEMSLOTS)
@@ -211,6 +213,13 @@ func newMachine(vm int) (*machine, error) {
 	}
 	log.Debugf("The maximum number of slots is %d.", m.maxSlots)
 	m.usedSlots = make([]uintptr, m.maxSlots)
+
+	// Create the upper shared pagetables and kernel(sentry) pagetables.
+	m.upperSharedPageTables = pagetables.New(newAllocator())
+	m.mapUpperHalf(m.upperSharedPageTables)
+	m.upperSharedPageTables.Allocator.(*allocator).base.Drain()
+	m.upperSharedPageTables.MarkReadOnlyShared()
+	m.kernel.PageTables = pagetables.NewWithUpper(newAllocator(), m.upperSharedPageTables, ring0.KernelStartAddress)
 
 	// Apply the physical mappings. Note that these mappings may point to
 	// guest physical addresses that are not actually available. These
@@ -225,7 +234,6 @@ func newMachine(vm int) (*machine, error) {
 
 		return true // Keep iterating.
 	})
-	m.mapUpperHalf(m.kernel.PageTables)
 
 	var physicalRegionsReadOnly []physicalRegion
 	var physicalRegionsAvailable []physicalRegion
@@ -624,4 +632,36 @@ func (c *vCPU) BounceToKernel() {
 //go:nosplit
 func (c *vCPU) BounceToHost() {
 	c.bounce(true)
+}
+
+// setSystemTimeLegacy calibrates and sets an approximate system time.
+func (c *vCPU) setSystemTimeLegacy() error {
+	const minIterations = 10
+	minimum := uint64(0)
+	for iter := 0; ; iter++ {
+		// Try to set the TSC to an estimate of where it will be
+		// on the host during a "fast" system call iteration.
+		start := uint64(ktime.Rdtsc())
+		if err := c.setTSC(start + (minimum / 2)); err != nil {
+			return err
+		}
+		// See if this is our new minimum call time. Note that this
+		// serves two functions: one, we make sure that we are
+		// accurately predicting the offset we need to set. Second, we
+		// don't want to do the final set on a slow call, which could
+		// produce a really bad result.
+		end := uint64(ktime.Rdtsc())
+		if end < start {
+			continue // Totally bogus: unstable TSC?
+		}
+		current := end - start
+		if current < minimum || iter == 0 {
+			minimum = current // Set our new minimum.
+		}
+		// Is this past minIterations and within ~10% of minimum?
+		upperThreshold := (((minimum << 3) + minimum) >> 3)
+		if iter >= minIterations && current <= upperThreshold {
+			return nil
+		}
+	}
 }

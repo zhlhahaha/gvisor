@@ -30,12 +30,11 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/socket/unix/transport"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/syserror"
-	"gvisor.dev/gvisor/pkg/usermem"
 )
 
 // Sync implements vfs.FilesystemImpl.Sync.
 func (fs *filesystem) Sync(ctx context.Context) error {
-	// Snapshot current syncable dentries and special files.
+	// Snapshot current syncable dentries and special file FDs.
 	fs.syncMu.Lock()
 	ds := make([]*dentry, 0, len(fs.syncableDentries))
 	for d := range fs.syncableDentries {
@@ -53,22 +52,28 @@ func (fs *filesystem) Sync(ctx context.Context) error {
 	// regardless.
 	var retErr error
 
-	// Sync regular files.
+	// Sync syncable dentries.
 	for _, d := range ds {
-		err := d.syncCachedFile(ctx)
+		err := d.syncCachedFile(ctx, true /* forFilesystemSync */)
 		d.DecRef(ctx)
-		if err != nil && retErr == nil {
-			retErr = err
+		if err != nil {
+			ctx.Infof("gofer.filesystem.Sync: dentry.syncCachedFile failed: %v", err)
+			if retErr == nil {
+				retErr = err
+			}
 		}
 	}
 
 	// Sync special files, which may be writable but do not use dentry shared
 	// handles (so they won't be synced by the above).
 	for _, sffd := range sffds {
-		err := sffd.Sync(ctx)
+		err := sffd.sync(ctx, true /* forFilesystemSync */)
 		sffd.vfsfd.DecRef(ctx)
-		if err != nil && retErr == nil {
-			retErr = err
+		if err != nil {
+			ctx.Infof("gofer.filesystem.Sync: specialFileFD.sync failed: %v", err)
+			if retErr == nil {
+				retErr = err
+			}
 		}
 	}
 
@@ -107,6 +112,51 @@ func putDentrySlice(ds *[]*dentry) {
 	}
 	*ds = (*ds)[:0]
 	dentrySlicePool.Put(ds)
+}
+
+// renameMuRUnlockAndCheckCaching calls fs.renameMu.RUnlock(), then calls
+// dentry.checkCachingLocked on all dentries in *dsp with fs.renameMu locked
+// for writing.
+//
+// dsp is a pointer-to-pointer since defer evaluates its arguments immediately,
+// but dentry slices are allocated lazily, and it's much easier to say "defer
+// fs.renameMuRUnlockAndCheckCaching(&ds)" than "defer func() {
+// fs.renameMuRUnlockAndCheckCaching(ds) }()" to work around this.
+func (fs *filesystem) renameMuRUnlockAndCheckCaching(ctx context.Context, dsp **[]*dentry) {
+	fs.renameMu.RUnlock()
+	if *dsp == nil {
+		return
+	}
+	ds := **dsp
+	// Only go through calling dentry.checkCachingLocked() (which requires
+	// re-locking renameMu) if we actually have any dentries with zero refs.
+	checkAny := false
+	for i := range ds {
+		if atomic.LoadInt64(&ds[i].refs) == 0 {
+			checkAny = true
+			break
+		}
+	}
+	if checkAny {
+		fs.renameMu.Lock()
+		for _, d := range ds {
+			d.checkCachingLocked(ctx)
+		}
+		fs.renameMu.Unlock()
+	}
+	putDentrySlice(*dsp)
+}
+
+func (fs *filesystem) renameMuUnlockAndCheckCaching(ctx context.Context, ds **[]*dentry) {
+	if *ds == nil {
+		fs.renameMu.Unlock()
+		return
+	}
+	for _, d := range **ds {
+		d.checkCachingLocked(ctx)
+	}
+	fs.renameMu.Unlock()
+	putDentrySlice(*ds)
 }
 
 // stepLocked resolves rp.Component() to an existing file, starting from the
@@ -229,7 +279,7 @@ func (fs *filesystem) revalidateChildLocked(ctx context.Context, vfsObj *vfs.Vir
 		return nil, err
 	}
 	if child != nil {
-		if !file.isNil() && inoFromPath(qid.Path) == child.ino {
+		if !file.isNil() && qid.Path == child.qidPath {
 			// The file at this path hasn't changed. Just update cached metadata.
 			file.close(ctx)
 			child.updateFromP9AttrsLocked(attrMask, &attr)
@@ -256,7 +306,7 @@ func (fs *filesystem) revalidateChildLocked(ctx context.Context, vfsObj *vfs.Vir
 			// treat their invalidation as deletion.
 			child.setDeleted()
 			parent.syntheticChildren--
-			child.decRefLocked()
+			child.decRefNoCaching()
 			parent.dirents = nil
 		}
 		*ds = appendDentry(*ds, child)
@@ -366,9 +416,6 @@ func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, dir
 	if len(name) > maxFilenameLen {
 		return syserror.ENAMETOOLONG
 	}
-	if !dir && rp.MustBeDir() {
-		return syserror.ENOENT
-	}
 	if parent.isDeleted() {
 		return syserror.ENOENT
 	}
@@ -382,6 +429,9 @@ func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, dir
 	if parent.isSynthetic() {
 		if child := parent.children[name]; child != nil {
 			return syserror.EEXIST
+		}
+		if !dir && rp.MustBeDir() {
+			return syserror.ENOENT
 		}
 		if createInSyntheticDir == nil {
 			return syserror.EPERM
@@ -402,6 +452,9 @@ func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, dir
 		if child := parent.children[name]; child != nil && child.isSynthetic() {
 			return syserror.EEXIST
 		}
+		if !dir && rp.MustBeDir() {
+			return syserror.ENOENT
+		}
 		// The existence of a non-synthetic dentry at name would be inconclusive
 		// because the file it represents may have been deleted from the remote
 		// filesystem, so we would need to make an RPC to revalidate the dentry.
@@ -421,6 +474,9 @@ func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, dir
 	}
 	if child := parent.children[name]; child != nil {
 		return syserror.EEXIST
+	}
+	if !dir && rp.MustBeDir() {
+		return syserror.ENOENT
 	}
 	// No cached dentry exists; however, there might still be an existing file
 	// at name. As above, we attempt the file creation RPC anyway.
@@ -625,7 +681,7 @@ func (fs *filesystem) unlinkAt(ctx context.Context, rp *vfs.ResolvingPath, dir b
 		child.setDeleted()
 		if child.isSynthetic() {
 			parent.syntheticChildren--
-			child.decRefLocked()
+			child.decRefNoCaching()
 		}
 		ds = appendDentry(ds, child)
 	}
@@ -638,41 +694,6 @@ func (fs *filesystem) unlinkAt(ctx context.Context, rp *vfs.ResolvingPath, dir b
 		}
 	}
 	return nil
-}
-
-// renameMuRUnlockAndCheckCaching calls fs.renameMu.RUnlock(), then calls
-// dentry.checkCachingLocked on all dentries in *ds with fs.renameMu locked for
-// writing.
-//
-// ds is a pointer-to-pointer since defer evaluates its arguments immediately,
-// but dentry slices are allocated lazily, and it's much easier to say "defer
-// fs.renameMuRUnlockAndCheckCaching(&ds)" than "defer func() {
-// fs.renameMuRUnlockAndCheckCaching(ds) }()" to work around this.
-func (fs *filesystem) renameMuRUnlockAndCheckCaching(ctx context.Context, ds **[]*dentry) {
-	fs.renameMu.RUnlock()
-	if *ds == nil {
-		return
-	}
-	if len(**ds) != 0 {
-		fs.renameMu.Lock()
-		for _, d := range **ds {
-			d.checkCachingLocked(ctx)
-		}
-		fs.renameMu.Unlock()
-	}
-	putDentrySlice(*ds)
-}
-
-func (fs *filesystem) renameMuUnlockAndCheckCaching(ctx context.Context, ds **[]*dentry) {
-	if *ds == nil {
-		fs.renameMu.Unlock()
-		return
-	}
-	for _, d := range **ds {
-		d.checkCachingLocked(ctx)
-	}
-	fs.renameMu.Unlock()
-	putDentrySlice(*ds)
 }
 
 // AccessAt implements vfs.Filesystem.Impl.AccessAt.
@@ -836,7 +857,7 @@ func (fs *filesystem) MknodAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 				mode: opts.Mode,
 				kuid: creds.EffectiveKUID,
 				kgid: creds.EffectiveKGID,
-				pipe: pipe.NewVFSPipe(true /* isNamed */, pipe.DefaultPipeSize, usermem.PageSize),
+				pipe: pipe.NewVFSPipe(true /* isNamed */, pipe.DefaultPipeSize),
 			})
 			return nil
 		}
@@ -1156,18 +1177,21 @@ func (d *dentry) createAndOpenChildLocked(ctx context.Context, rp *vfs.Resolving
 	// Incorporate the fid that was opened by lcreate.
 	useRegularFileFD := child.fileType() == linux.S_IFREG && !d.fs.opts.regularFilesUseSpecialFileFD
 	if useRegularFileFD {
+		openFD := int32(-1)
+		if fdobj != nil {
+			openFD = int32(fdobj.Release())
+		}
 		child.handleMu.Lock()
 		if vfs.MayReadFileWithOpenFlags(opts.Flags) {
 			child.readFile = openFile
 			if fdobj != nil {
-				child.hostFD = int32(fdobj.Release())
+				child.readFD = openFD
+				child.mmapFD = openFD
 			}
-		} else if fdobj != nil {
-			// Can't use fdobj if it's not readable.
-			fdobj.Close()
 		}
 		if vfs.MayWriteFileWithOpenFlags(opts.Flags) {
 			child.writeFile = openFile
+			child.writeFD = openFD
 		}
 		child.handleMu.Unlock()
 	}
@@ -1355,7 +1379,7 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		replaced.setDeleted()
 		if replaced.isSynthetic() {
 			newParent.syntheticChildren--
-			replaced.decRefLocked()
+			replaced.decRefNoCaching()
 		}
 		ds = appendDentry(ds, replaced)
 	}
@@ -1364,7 +1388,7 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	// with reference counts and queue oldParent for checkCachingLocked if the
 	// parent isn't actually changing.
 	if oldParent != newParent {
-		oldParent.decRefLocked()
+		oldParent.decRefNoCaching()
 		ds = appendDentry(ds, oldParent)
 		newParent.IncRef()
 		if renamed.isSynthetic() {
@@ -1512,7 +1536,6 @@ func (fs *filesystem) BoundEndpointAt(ctx context.Context, rp *vfs.ResolvingPath
 			d.IncRef()
 			return &endpoint{
 				dentry: d,
-				file:   d.file.file,
 				path:   opts.Addr,
 			}, nil
 		}
@@ -1590,8 +1613,4 @@ func (fs *filesystem) PrependPath(ctx context.Context, vfsroot, vd vfs.VirtualDe
 	fs.renameMu.RLock()
 	defer fs.renameMu.RUnlock()
 	return genericPrependPath(vfsroot, vd.Mount(), vd.Dentry().Impl().(*dentry), b)
-}
-
-func (fs *filesystem) nextSyntheticIno() inodeNumber {
-	return inodeNumber(atomic.AddUint64(&fs.syntheticSeq, 1) | syntheticInoMask)
 }

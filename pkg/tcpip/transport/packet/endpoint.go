@@ -89,6 +89,9 @@ type endpoint struct {
 	// lastErrorMu protects lastError.
 	lastErrorMu sync.Mutex   `state:"nosave"`
 	lastError   *tcpip.Error `state:".(string)"`
+
+	// ops is used to get socket level options.
+	ops tcpip.SocketOptions
 }
 
 // NewEndpoint returns a new packet endpoint.
@@ -389,7 +392,12 @@ func (ep *endpoint) GetSockOpt(opt tcpip.GettableSocketOption) *tcpip.Error {
 
 // GetSockOptBool implements tcpip.Endpoint.GetSockOptBool.
 func (*endpoint) GetSockOptBool(opt tcpip.SockOptBool) (bool, *tcpip.Error) {
-	return false, tcpip.ErrNotSupported
+	switch opt {
+	case tcpip.AcceptConnOption:
+		return false, nil
+	default:
+		return false, tcpip.ErrNotSupported
+	}
 }
 
 // GetSockOptInt implements tcpip.Endpoint.GetSockOptInt.
@@ -544,3 +552,7 @@ func (ep *endpoint) Stats() tcpip.EndpointStats {
 }
 
 func (ep *endpoint) SetOwner(owner tcpip.PacketOwner) {}
+
+func (ep *endpoint) SocketOptions() *tcpip.SocketOptions {
+	return &ep.ops
+}

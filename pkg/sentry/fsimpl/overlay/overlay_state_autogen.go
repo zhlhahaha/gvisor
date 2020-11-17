@@ -124,6 +124,32 @@ func (fs *filesystem) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(5, &fs.lastDirIno)
 }
 
+func (l *layerDevNumber) StateTypeName() string {
+	return "pkg/sentry/fsimpl/overlay.layerDevNumber"
+}
+
+func (l *layerDevNumber) StateFields() []string {
+	return []string{
+		"major",
+		"minor",
+	}
+}
+
+func (l *layerDevNumber) beforeSave() {}
+
+func (l *layerDevNumber) StateSave(stateSinkObject state.Sink) {
+	l.beforeSave()
+	stateSinkObject.Save(0, &l.major)
+	stateSinkObject.Save(1, &l.minor)
+}
+
+func (l *layerDevNumber) afterLoad() {}
+
+func (l *layerDevNumber) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &l.major)
+	stateSourceObject.Load(1, &l.minor)
+}
+
 func (d *dentry) StateTypeName() string {
 	return "pkg/sentry/fsimpl/overlay.dentry"
 }
@@ -147,9 +173,7 @@ func (d *dentry) StateFields() []string {
 		"devMajor",
 		"devMinor",
 		"ino",
-		"mapsMu",
 		"lowerMappings",
-		"dataMu",
 		"wrappedMappable",
 		"isMappable",
 		"locks",
@@ -178,16 +202,12 @@ func (d *dentry) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(14, &d.devMajor)
 	stateSinkObject.Save(15, &d.devMinor)
 	stateSinkObject.Save(16, &d.ino)
-	stateSinkObject.Save(17, &d.mapsMu)
-	stateSinkObject.Save(18, &d.lowerMappings)
-	stateSinkObject.Save(19, &d.dataMu)
-	stateSinkObject.Save(20, &d.wrappedMappable)
-	stateSinkObject.Save(21, &d.isMappable)
-	stateSinkObject.Save(22, &d.locks)
-	stateSinkObject.Save(23, &d.watches)
+	stateSinkObject.Save(17, &d.lowerMappings)
+	stateSinkObject.Save(18, &d.wrappedMappable)
+	stateSinkObject.Save(19, &d.isMappable)
+	stateSinkObject.Save(20, &d.locks)
+	stateSinkObject.Save(21, &d.watches)
 }
-
-func (d *dentry) afterLoad() {}
 
 func (d *dentry) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &d.vfsd)
@@ -207,13 +227,12 @@ func (d *dentry) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(14, &d.devMajor)
 	stateSourceObject.Load(15, &d.devMinor)
 	stateSourceObject.Load(16, &d.ino)
-	stateSourceObject.Load(17, &d.mapsMu)
-	stateSourceObject.Load(18, &d.lowerMappings)
-	stateSourceObject.Load(19, &d.dataMu)
-	stateSourceObject.Load(20, &d.wrappedMappable)
-	stateSourceObject.Load(21, &d.isMappable)
-	stateSourceObject.Load(22, &d.locks)
-	stateSourceObject.Load(23, &d.watches)
+	stateSourceObject.Load(17, &d.lowerMappings)
+	stateSourceObject.Load(18, &d.wrappedMappable)
+	stateSourceObject.Load(19, &d.isMappable)
+	stateSourceObject.Load(20, &d.locks)
+	stateSourceObject.Load(21, &d.watches)
+	stateSourceObject.AfterLoad(d.afterLoad)
 }
 
 func (fd *fileDescription) StateTypeName() string {
@@ -285,6 +304,7 @@ func init() {
 	state.Register((*FilesystemType)(nil))
 	state.Register((*FilesystemOptions)(nil))
 	state.Register((*filesystem)(nil))
+	state.Register((*layerDevNumber)(nil))
 	state.Register((*dentry)(nil))
 	state.Register((*fileDescription)(nil))
 	state.Register((*regularFileFD)(nil))

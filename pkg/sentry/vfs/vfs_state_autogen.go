@@ -288,16 +288,15 @@ func (epi *epollInterest) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(6, &epi.userData)
 }
 
-func (epi *epollInterest) afterLoad() {}
-
 func (epi *epollInterest) StateLoad(stateSourceObject state.Source) {
-	stateSourceObject.Load(0, &epi.epoll)
+	stateSourceObject.LoadWait(0, &epi.epoll)
 	stateSourceObject.Load(1, &epi.key)
 	stateSourceObject.Load(2, &epi.waiter)
 	stateSourceObject.Load(3, &epi.mask)
 	stateSourceObject.Load(4, &epi.ready)
 	stateSourceObject.Load(5, &epi.epollInterestEntry)
 	stateSourceObject.Load(6, &epi.userData)
+	stateSourceObject.AfterLoad(epi.afterLoad)
 }
 
 func (l *epollInterestList) StateTypeName() string {
@@ -690,10 +689,9 @@ func (r *FileDescriptionRefs) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(0, &r.refCount)
 }
 
-func (r *FileDescriptionRefs) afterLoad() {}
-
 func (r *FileDescriptionRefs) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &r.refCount)
+	stateSourceObject.AfterLoad(r.afterLoad)
 }
 
 func (fs *Filesystem) StateTypeName() string {
@@ -802,10 +800,9 @@ func (r *FilesystemRefs) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(0, &r.refCount)
 }
 
-func (r *FilesystemRefs) afterLoad() {}
-
 func (r *FilesystemRefs) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &r.refCount)
+	stateSourceObject.AfterLoad(r.afterLoad)
 }
 
 func (r *registeredFilesystemType) StateTypeName() string {
@@ -882,6 +879,7 @@ func (i *Inotify) StateFields() []string {
 		"DentryMetadataFileDescriptionImpl",
 		"NoLockFD",
 		"id",
+		"queue",
 		"events",
 		"scratch",
 		"nextWatchMinusOne",
@@ -898,10 +896,11 @@ func (i *Inotify) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(2, &i.DentryMetadataFileDescriptionImpl)
 	stateSinkObject.Save(3, &i.NoLockFD)
 	stateSinkObject.Save(4, &i.id)
-	stateSinkObject.Save(5, &i.events)
-	stateSinkObject.Save(6, &i.scratch)
-	stateSinkObject.Save(7, &i.nextWatchMinusOne)
-	stateSinkObject.Save(8, &i.watches)
+	stateSinkObject.Save(5, &i.queue)
+	stateSinkObject.Save(6, &i.events)
+	stateSinkObject.Save(7, &i.scratch)
+	stateSinkObject.Save(8, &i.nextWatchMinusOne)
+	stateSinkObject.Save(9, &i.watches)
 }
 
 func (i *Inotify) afterLoad() {}
@@ -912,10 +911,11 @@ func (i *Inotify) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(2, &i.DentryMetadataFileDescriptionImpl)
 	stateSourceObject.Load(3, &i.NoLockFD)
 	stateSourceObject.Load(4, &i.id)
-	stateSourceObject.Load(5, &i.events)
-	stateSourceObject.Load(6, &i.scratch)
-	stateSourceObject.Load(7, &i.nextWatchMinusOne)
-	stateSourceObject.Load(8, &i.watches)
+	stateSourceObject.Load(5, &i.queue)
+	stateSourceObject.Load(6, &i.events)
+	stateSourceObject.Load(7, &i.scratch)
+	stateSourceObject.Load(8, &i.nextWatchMinusOne)
+	stateSourceObject.Load(9, &i.watches)
 }
 
 func (w *Watches) StateTypeName() string {
@@ -1078,8 +1078,6 @@ func (mnt *Mount) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(10, &mnt.writers)
 }
 
-func (mnt *Mount) afterLoad() {}
-
 func (mnt *Mount) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &mnt.vfs)
 	stateSourceObject.Load(1, &mnt.fs)
@@ -1092,6 +1090,7 @@ func (mnt *Mount) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(9, &mnt.umounted)
 	stateSourceObject.Load(10, &mnt.writers)
 	stateSourceObject.LoadValue(5, new(VirtualDentry), func(y interface{}) { mnt.loadKey(y.(VirtualDentry)) })
+	stateSourceObject.AfterLoad(mnt.afterLoad)
 }
 
 func (mntns *MountNamespace) StateTypeName() string {
@@ -1169,10 +1168,9 @@ func (r *MountNamespaceRefs) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(0, &r.refCount)
 }
 
-func (r *MountNamespaceRefs) afterLoad() {}
-
 func (r *MountNamespaceRefs) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &r.refCount)
+	stateSourceObject.AfterLoad(r.afterLoad)
 }
 
 func (g *GetDentryOptions) StateTypeName() string {
@@ -1735,7 +1733,8 @@ func (vfs *VirtualFilesystem) beforeSave() {}
 
 func (vfs *VirtualFilesystem) StateSave(stateSinkObject state.Sink) {
 	vfs.beforeSave()
-	stateSinkObject.Save(0, &vfs.mounts)
+	var mountsValue []*Mount = vfs.saveMounts()
+	stateSinkObject.SaveValue(0, mountsValue)
 	stateSinkObject.Save(1, &vfs.mountpoints)
 	stateSinkObject.Save(2, &vfs.lastMountID)
 	stateSinkObject.Save(3, &vfs.anonMount)
@@ -1749,7 +1748,6 @@ func (vfs *VirtualFilesystem) StateSave(stateSinkObject state.Sink) {
 func (vfs *VirtualFilesystem) afterLoad() {}
 
 func (vfs *VirtualFilesystem) StateLoad(stateSourceObject state.Source) {
-	stateSourceObject.Load(0, &vfs.mounts)
 	stateSourceObject.Load(1, &vfs.mountpoints)
 	stateSourceObject.Load(2, &vfs.lastMountID)
 	stateSourceObject.Load(3, &vfs.anonMount)
@@ -1758,6 +1756,7 @@ func (vfs *VirtualFilesystem) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(6, &vfs.anonBlockDevMinor)
 	stateSourceObject.Load(7, &vfs.fsTypes)
 	stateSourceObject.Load(8, &vfs.filesystems)
+	stateSourceObject.LoadValue(0, new([]*Mount), func(y interface{}) { vfs.loadMounts(y.([]*Mount)) })
 }
 
 func (p *PathOperation) StateTypeName() string {

@@ -295,7 +295,7 @@ func (tg *ThreadGroup) createSession() error {
 		id:     SessionID(id),
 		leader: tg,
 	}
-	s.EnableLeakCheck()
+	s.InitRefs()
 
 	// Create a new ProcessGroup, belonging to that Session.
 	// This also has a single reference (assigned below).
@@ -309,7 +309,7 @@ func (tg *ThreadGroup) createSession() error {
 		session:    s,
 		ancestors:  0,
 	}
-	pg.refs.EnableLeakCheck()
+	pg.refs.InitRefs()
 
 	// Tie them and return the result.
 	s.processGroups.PushBack(pg)
@@ -395,7 +395,7 @@ func (tg *ThreadGroup) CreateProcessGroup() error {
 		originator: tg,
 		session:    tg.processGroup.session,
 	}
-	pg.refs.EnableLeakCheck()
+	pg.refs.InitRefs()
 
 	if tg.leader.parent != nil && tg.leader.parent.tg.processGroup.session == pg.session {
 		pg.ancestors++
@@ -477,20 +477,20 @@ func (tg *ThreadGroup) Session() *Session {
 //
 // If this group isn't visible in this namespace, zero will be returned. It is
 // the callers responsibility to check that before using this function.
-func (pidns *PIDNamespace) IDOfSession(s *Session) SessionID {
-	pidns.owner.mu.RLock()
-	defer pidns.owner.mu.RUnlock()
-	return pidns.sids[s]
+func (ns *PIDNamespace) IDOfSession(s *Session) SessionID {
+	ns.owner.mu.RLock()
+	defer ns.owner.mu.RUnlock()
+	return ns.sids[s]
 }
 
 // SessionWithID returns the Session with the given ID in the PID namespace ns,
 // or nil if that given ID is not defined in this namespace.
 //
 // A reference is not taken on the session.
-func (pidns *PIDNamespace) SessionWithID(id SessionID) *Session {
-	pidns.owner.mu.RLock()
-	defer pidns.owner.mu.RUnlock()
-	return pidns.sessions[id]
+func (ns *PIDNamespace) SessionWithID(id SessionID) *Session {
+	ns.owner.mu.RLock()
+	defer ns.owner.mu.RUnlock()
+	return ns.sessions[id]
 }
 
 // ProcessGroup returns the ThreadGroup's ProcessGroup.
@@ -505,18 +505,18 @@ func (tg *ThreadGroup) ProcessGroup() *ProcessGroup {
 // IDOfProcessGroup returns the process group assigned to pg in PID namespace ns.
 //
 // The same constraints apply as IDOfSession.
-func (pidns *PIDNamespace) IDOfProcessGroup(pg *ProcessGroup) ProcessGroupID {
-	pidns.owner.mu.RLock()
-	defer pidns.owner.mu.RUnlock()
-	return pidns.pgids[pg]
+func (ns *PIDNamespace) IDOfProcessGroup(pg *ProcessGroup) ProcessGroupID {
+	ns.owner.mu.RLock()
+	defer ns.owner.mu.RUnlock()
+	return ns.pgids[pg]
 }
 
 // ProcessGroupWithID returns the ProcessGroup with the given ID in the PID
 // namespace ns, or nil if that given ID is not defined in this namespace.
 //
 // A reference is not taken on the process group.
-func (pidns *PIDNamespace) ProcessGroupWithID(id ProcessGroupID) *ProcessGroup {
-	pidns.owner.mu.RLock()
-	defer pidns.owner.mu.RUnlock()
-	return pidns.processGroups[id]
+func (ns *PIDNamespace) ProcessGroupWithID(id ProcessGroupID) *ProcessGroup {
+	ns.owner.mu.RLock()
+	defer ns.owner.mu.RUnlock()
+	return ns.processGroups[id]
 }

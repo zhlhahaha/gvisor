@@ -124,8 +124,8 @@ func getTargetLinkAddr(it header.NDPOptionIterator) (tcpip.LinkAddress, bool) {
 	})
 }
 
-func (e *endpoint) handleICMP(r *stack.Route, pkt *stack.PacketBuffer, hasFragmentHeader bool) {
-	stats := r.Stats().ICMP
+func (e *endpoint) handleICMP(pkt *stack.PacketBuffer, hasFragmentHeader bool) {
+	stats := e.protocol.stack.Stats().ICMP
 	sent := stats.V6PacketsSent
 	received := stats.V6PacketsReceived
 	// TODO(gvisor.dev/issue/170): ICMP packets don't have their
@@ -138,13 +138,15 @@ func (e *endpoint) handleICMP(r *stack.Route, pkt *stack.PacketBuffer, hasFragme
 	}
 	h := header.ICMPv6(v)
 	iph := header.IPv6(pkt.NetworkHeader().View())
+	srcAddr := iph.SourceAddress()
+	dstAddr := iph.DestinationAddress()
 
 	// Validate ICMPv6 checksum before processing the packet.
 	//
 	// This copy is used as extra payload during the checksum calculation.
 	payload := pkt.Data.Clone(nil)
 	payload.TrimFront(len(h))
-	if got, want := h.Checksum(), header.ICMPv6Checksum(h, iph.SourceAddress(), iph.DestinationAddress(), payload); got != want {
+	if got, want := h.Checksum(), header.ICMPv6Checksum(h, srcAddr, dstAddr, payload); got != want {
 		received.Invalid.Increment()
 		return
 	}
@@ -170,8 +172,11 @@ func (e *endpoint) handleICMP(r *stack.Route, pkt *stack.PacketBuffer, hasFragme
 			return
 		}
 		pkt.Data.TrimFront(header.ICMPv6PacketTooBigMinimumSize)
-		mtu := header.ICMPv6(hdr).MTU()
-		e.handleControl(stack.ControlPacketTooBig, calculateMTU(mtu), pkt)
+		networkMTU, err := calculateNetworkMTU(header.ICMPv6(hdr).MTU(), header.IPv6MinimumSize)
+		if err != nil {
+			networkMTU = 0
+		}
+		e.handleControl(stack.ControlPacketTooBig, networkMTU, pkt)
 
 	case header.ICMPv6DstUnreachable:
 		received.DstUnreachable.Increment()
@@ -221,7 +226,7 @@ func (e *endpoint) handleICMP(r *stack.Route, pkt *stack.PacketBuffer, hasFragme
 			// we know we are also performing DAD on it). In this case we let the
 			// stack know so it can handle such a scenario and do nothing further with
 			// the NS.
-			if r.RemoteAddress == header.IPv6Any {
+			if srcAddr == header.IPv6Any {
 				// We would get an error if the address no longer exists or the address
 				// is no longer tentative (DAD resolved between the call to
 				// hasTentativeAddr and this point). Both of these are valid scenarios:
@@ -248,7 +253,7 @@ func (e *endpoint) handleICMP(r *stack.Route, pkt *stack.PacketBuffer, hasFragme
 		// section 5.4.3.
 
 		// Is the NS targeting us?
-		if r.Stack().CheckLocalAddress(e.nic.ID(), ProtocolNumber, targetAddr) == 0 {
+		if e.protocol.stack.CheckLocalAddress(e.nic.ID(), ProtocolNumber, targetAddr) == 0 {
 			return
 		}
 
@@ -274,9 +279,9 @@ func (e *endpoint) handleICMP(r *stack.Route, pkt *stack.PacketBuffer, hasFragme
 		// Otherwise, on link layers that have addresses this option MUST be
 		// included in multicast solicitations and SHOULD be included in unicast
 		// solicitations.
-		unspecifiedSource := r.RemoteAddress == header.IPv6Any
+		unspecifiedSource := srcAddr == header.IPv6Any
 		if len(sourceLinkAddr) == 0 {
-			if header.IsV6MulticastAddress(r.LocalAddress) && !unspecifiedSource {
+			if header.IsV6MulticastAddress(dstAddr) && !unspecifiedSource {
 				received.Invalid.Increment()
 				return
 			}
@@ -284,9 +289,9 @@ func (e *endpoint) handleICMP(r *stack.Route, pkt *stack.PacketBuffer, hasFragme
 			received.Invalid.Increment()
 			return
 		} else if e.nud != nil {
-			e.nud.HandleProbe(r.RemoteAddress, r.LocalAddress, header.IPv6ProtocolNumber, sourceLinkAddr, e.protocol)
+			e.nud.HandleProbe(srcAddr, header.IPv6ProtocolNumber, sourceLinkAddr, e.protocol)
 		} else {
-			e.linkAddrCache.AddLinkAddress(e.nic.ID(), r.RemoteAddress, sourceLinkAddr)
+			e.linkAddrCache.AddLinkAddress(e.nic.ID(), srcAddr, sourceLinkAddr)
 		}
 
 		// As per RFC 4861 section 7.1.1:
@@ -295,7 +300,7 @@ func (e *endpoint) handleICMP(r *stack.Route, pkt *stack.PacketBuffer, hasFragme
 		//    ...
 		//    - If the IP source address is the unspecified address, the IP
 		//      destination address is a solicited-node multicast address.
-		if unspecifiedSource && !header.IsSolicitedNodeAddr(r.LocalAddress) {
+		if unspecifiedSource && !header.IsSolicitedNodeAddr(dstAddr) {
 			received.Invalid.Increment()
 			return
 		}
@@ -305,7 +310,7 @@ func (e *endpoint) handleICMP(r *stack.Route, pkt *stack.PacketBuffer, hasFragme
 		//   If the source of the solicitation is the unspecified address, the node
 		//   MUST [...] and multicast the advertisement to the all-nodes address.
 		//
-		remoteAddr := r.RemoteAddress
+		remoteAddr := srcAddr
 		if unspecifiedSource {
 			remoteAddr = header.IPv6AllNodesMulticastAddress
 		}
@@ -462,12 +467,12 @@ func (e *endpoint) handleICMP(r *stack.Route, pkt *stack.PacketBuffer, hasFragme
 
 		// As per RFC 4291 section 2.7, multicast addresses must not be used as
 		// source addresses in IPv6 packets.
-		localAddr := r.LocalAddress
-		if header.IsV6MulticastAddress(r.LocalAddress) {
+		localAddr := dstAddr
+		if header.IsV6MulticastAddress(dstAddr) {
 			localAddr = ""
 		}
 
-		r, err := r.Stack().FindRoute(e.nic.ID(), localAddr, r.RemoteAddress, ProtocolNumber, false /* multicastLoop */)
+		r, err := e.protocol.stack.FindRoute(e.nic.ID(), localAddr, srcAddr, ProtocolNumber, false /* multicastLoop */)
 		if err != nil {
 			// If we cannot find a route to the destination, silently drop the packet.
 			return
@@ -483,7 +488,11 @@ func (e *endpoint) handleICMP(r *stack.Route, pkt *stack.PacketBuffer, hasFragme
 		copy(packet, icmpHdr)
 		packet.SetType(header.ICMPv6EchoReply)
 		packet.SetChecksum(header.ICMPv6Checksum(packet, r.LocalAddress, r.RemoteAddress, pkt.Data))
-		if err := r.WritePacket(nil /* gso */, stack.NetworkHeaderParams{Protocol: header.ICMPv6ProtocolNumber, TTL: r.DefaultTTL(), TOS: stack.DefaultTOS}, replyPkt); err != nil {
+		if err := r.WritePacket(nil /* gso */, stack.NetworkHeaderParams{
+			Protocol: header.ICMPv6ProtocolNumber,
+			TTL:      r.DefaultTTL(),
+			TOS:      stack.DefaultTOS,
+		}, replyPkt); err != nil {
 			sent.Dropped.Increment()
 			return
 		}
@@ -495,7 +504,7 @@ func (e *endpoint) handleICMP(r *stack.Route, pkt *stack.PacketBuffer, hasFragme
 			received.Invalid.Increment()
 			return
 		}
-		e.dispatcher.DeliverTransportPacket(r, header.ICMPv6ProtocolNumber, pkt)
+		e.dispatcher.DeliverTransportPacket(header.ICMPv6ProtocolNumber, pkt)
 
 	case header.ICMPv6TimeExceeded:
 		received.TimeExceeded.Increment()
@@ -516,7 +525,7 @@ func (e *endpoint) handleICMP(r *stack.Route, pkt *stack.PacketBuffer, hasFragme
 			return
 		}
 
-		stack := r.Stack()
+		stack := e.protocol.stack
 
 		// Is the networking stack operating as a router?
 		if !stack.Forwarding(ProtocolNumber) {
@@ -547,7 +556,7 @@ func (e *endpoint) handleICMP(r *stack.Route, pkt *stack.PacketBuffer, hasFragme
 			// As per RFC 4861 section 4.1, the Source Link-Layer Address Option MUST
 			// NOT be included when the source IP address is the unspecified address.
 			// Otherwise, it SHOULD be included on link layers that have addresses.
-			if r.RemoteAddress == header.IPv6Any {
+			if srcAddr == header.IPv6Any {
 				received.Invalid.Increment()
 				return
 			}
@@ -555,7 +564,7 @@ func (e *endpoint) handleICMP(r *stack.Route, pkt *stack.PacketBuffer, hasFragme
 			if e.nud != nil {
 				// A RS with a specified source IP address modifies the NUD state
 				// machine in the same way a reachability probe would.
-				e.nud.HandleProbe(r.RemoteAddress, r.LocalAddress, header.IPv6ProtocolNumber, sourceLinkAddr, e.protocol)
+				e.nud.HandleProbe(srcAddr, ProtocolNumber, sourceLinkAddr, e.protocol)
 			}
 		}
 
@@ -572,7 +581,7 @@ func (e *endpoint) handleICMP(r *stack.Route, pkt *stack.PacketBuffer, hasFragme
 			return
 		}
 
-		routerAddr := iph.SourceAddress()
+		routerAddr := srcAddr
 
 		// Is the IP Source Address a link-local address?
 		if !header.IsV6LinkLocalAddress(routerAddr) {
@@ -605,7 +614,7 @@ func (e *endpoint) handleICMP(r *stack.Route, pkt *stack.PacketBuffer, hasFragme
 		// If the RA has the source link layer option, update the link address
 		// cache with the link address for the advertised router.
 		if len(sourceLinkAddr) != 0 && e.nud != nil {
-			e.nud.HandleProbe(routerAddr, r.LocalAddress, header.IPv6ProtocolNumber, sourceLinkAddr, e.protocol)
+			e.nud.HandleProbe(routerAddr, ProtocolNumber, sourceLinkAddr, e.protocol)
 		}
 
 		e.mu.Lock()
@@ -648,52 +657,46 @@ func (*protocol) LinkAddressProtocol() tcpip.NetworkProtocolNumber {
 }
 
 // LinkAddressRequest implements stack.LinkAddressResolver.
-func (*protocol) LinkAddressRequest(addr, localAddr tcpip.Address, remoteLinkAddr tcpip.LinkAddress, linkEP stack.LinkEndpoint) *tcpip.Error {
-	// TODO(b/148672031): Use stack.FindRoute instead of manually creating the
-	// route here. Note, we would need the nicID to do this properly so the right
-	// NIC (associated to linkEP) is used to send the NDP NS message.
-	r := stack.Route{
-		LocalAddress:      localAddr,
-		RemoteAddress:     addr,
-		LocalLinkAddress:  linkEP.LinkAddress(),
-		RemoteLinkAddress: remoteLinkAddr,
+func (p *protocol) LinkAddressRequest(targetAddr, localAddr tcpip.Address, remoteLinkAddr tcpip.LinkAddress, nic stack.NetworkInterface) *tcpip.Error {
+	remoteAddr := targetAddr
+	if len(remoteLinkAddr) == 0 {
+		remoteAddr = header.SolicitedNodeAddr(targetAddr)
+		remoteLinkAddr = header.EthernetAddressFromMulticastIPv6Address(remoteAddr)
 	}
 
-	// If a remote address is not already known, then send a multicast
-	// solicitation since multicast addresses have a static mapping to link
-	// addresses.
-	if len(r.RemoteLinkAddress) == 0 {
-		r.RemoteAddress = header.SolicitedNodeAddr(addr)
-		r.RemoteLinkAddress = header.EthernetAddressFromMulticastIPv6Address(r.RemoteAddress)
+	r, err := p.stack.FindRoute(nic.ID(), localAddr, remoteAddr, ProtocolNumber, false /* multicastLoop */)
+	if err != nil {
+		return err
 	}
+	defer r.Release()
+	r.ResolveWith(remoteLinkAddr)
 
 	optsSerializer := header.NDPOptionsSerializer{
-		header.NDPSourceLinkLayerAddressOption(linkEP.LinkAddress()),
+		header.NDPSourceLinkLayerAddressOption(nic.LinkAddress()),
 	}
 	neighborSolicitSize := header.ICMPv6NeighborSolicitMinimumSize + optsSerializer.Length()
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-		ReserveHeaderBytes: int(linkEP.MaxHeaderLength()) + header.IPv6MinimumSize + neighborSolicitSize,
+		ReserveHeaderBytes: int(r.MaxHeaderLength()) + neighborSolicitSize,
 	})
 	pkt.TransportProtocolNumber = header.ICMPv6ProtocolNumber
 	packet := header.ICMPv6(pkt.TransportHeader().Push(neighborSolicitSize))
 	packet.SetType(header.ICMPv6NeighborSolicit)
 	ns := header.NDPNeighborSolicit(packet.NDPPayload())
-	ns.SetTargetAddress(addr)
+	ns.SetTargetAddress(targetAddr)
 	ns.Options().Serialize(optsSerializer)
 	packet.SetChecksum(header.ICMPv6Checksum(packet, r.LocalAddress, r.RemoteAddress, buffer.VectorisedView{}))
 
-	length := uint16(pkt.Size())
-	ip := header.IPv6(pkt.NetworkHeader().Push(header.IPv6MinimumSize))
-	ip.Encode(&header.IPv6Fields{
-		PayloadLength: length,
-		NextHeader:    uint8(header.ICMPv6ProtocolNumber),
-		HopLimit:      header.NDPHopLimit,
-		SrcAddr:       r.LocalAddress,
-		DstAddr:       r.RemoteAddress,
-	})
+	stat := p.stack.Stats().ICMP.V6PacketsSent
+	if err := r.WritePacket(nil /* gso */, stack.NetworkHeaderParams{
+		Protocol: header.ICMPv6ProtocolNumber,
+		TTL:      header.NDPHopLimit,
+	}, pkt); err != nil {
+		stat.Dropped.Increment()
+		return err
+	}
 
-	// TODO(stijlist): count this in ICMP stats.
-	return linkEP.WritePacket(&r, nil /* gso */, ProtocolNumber, pkt)
+	stat.NeighborSolicit.Increment()
+	return nil
 }
 
 // ResolveStaticAddress implements stack.LinkAddressResolver.
@@ -747,9 +750,26 @@ type icmpReasonPortUnreachable struct{}
 
 func (*icmpReasonPortUnreachable) isICMPReason() {}
 
+// icmpReasonHopLimitExceeded is an error where a packet's hop limit exceeded in
+// transit to its final destination, as per RFC 4443 section 3.3.
+type icmpReasonHopLimitExceeded struct{}
+
+func (*icmpReasonHopLimitExceeded) isICMPReason() {}
+
+// icmpReasonReassemblyTimeout is an error where insufficient fragments are
+// received to complete reassembly of a packet within a configured time after
+// the reception of the first-arriving fragment of that packet.
+type icmpReasonReassemblyTimeout struct{}
+
+func (*icmpReasonReassemblyTimeout) isICMPReason() {}
+
 // returnError takes an error descriptor and generates the appropriate ICMP
 // error packet for IPv6 and sends it.
-func (p *protocol) returnError(r *stack.Route, reason icmpReason, pkt *stack.PacketBuffer) *tcpip.Error {
+func (p *protocol) returnError(reason icmpReason, pkt *stack.PacketBuffer) *tcpip.Error {
+	origIPHdr := header.IPv6(pkt.NetworkHeader().View())
+	origIPHdrSrc := origIPHdr.SourceAddress()
+	origIPHdrDst := origIPHdr.DestinationAddress()
+
 	// Only send ICMP error if the address is not a multicast v6
 	// address and the source is not the unspecified address.
 	//
@@ -776,22 +796,35 @@ func (p *protocol) returnError(r *stack.Route, reason icmpReason, pkt *stack.Pac
 		allowResponseToMulticast = reason.respondToMulticast
 	}
 
-	if (!allowResponseToMulticast && header.IsV6MulticastAddress(r.LocalAddress)) || r.RemoteAddress == header.IPv6Any {
+	if (!allowResponseToMulticast && header.IsV6MulticastAddress(origIPHdrDst)) || origIPHdrSrc == header.IPv6Any {
 		return nil
 	}
 
+	// If we hit a Hop Limit Exceeded error, then we know we are operating as a
+	// router. As per RFC 4443 section 3.3:
+	//
+	//   If a router receives a packet with a Hop Limit of zero, or if a
+	//   router decrements a packet's Hop Limit to zero, it MUST discard the
+	//   packet and originate an ICMPv6 Time Exceeded message with Code 0 to
+	//   the source of the packet.  This indicates either a routing loop or
+	//   too small an initial Hop Limit value.
+	//
+	// If we are operating as a router, do not use the packet's destination
+	// address as the response's source address as we should not own the
+	// destination address of a packet we are forwarding.
+	localAddr := origIPHdrDst
+	if _, ok := reason.(*icmpReasonHopLimitExceeded); ok {
+		localAddr = ""
+	}
 	// Even if we were able to receive a packet from some remote, we may not have
 	// a route to it - the remote may be blocked via routing rules. We must always
 	// consult our routing table and find a route to the remote before sending any
 	// packet.
-	route, err := p.stack.FindRoute(r.NICID(), r.LocalAddress, r.RemoteAddress, ProtocolNumber, false /* multicastLoop */)
+	route, err := p.stack.FindRoute(pkt.NICID, localAddr, origIPHdrSrc, ProtocolNumber, false /* multicastLoop */)
 	if err != nil {
 		return err
 	}
 	defer route.Release()
-	// From this point on, the incoming route should no longer be used; route
-	// must be used to send the ICMP error.
-	r = nil
 
 	stats := p.stack.Stats().ICMP
 	sent := stats.V6PacketsSent
@@ -799,8 +832,6 @@ func (p *protocol) returnError(r *stack.Route, reason icmpReason, pkt *stack.Pac
 		sent.RateLimited.Increment()
 		return nil
 	}
-
-	network, transport := pkt.NetworkHeader().View(), pkt.TransportHeader().View()
 
 	if pkt.TransportProtocolNumber == header.ICMPv6ProtocolNumber {
 		// TODO(gvisor.dev/issues/3810): Sort this out when ICMP headers are stored.
@@ -818,6 +849,8 @@ func (p *protocol) returnError(r *stack.Route, reason icmpReason, pkt *stack.Pac
 			return nil
 		}
 	}
+
+	network, transport := pkt.NetworkHeader().View(), pkt.TransportHeader().View()
 
 	// As per RFC 4443 section 2.4
 	//
@@ -839,7 +872,9 @@ func (p *protocol) returnError(r *stack.Route, reason icmpReason, pkt *stack.Pac
 	if payloadLen > available {
 		payloadLen = available
 	}
-	payload := buffer.NewVectorisedView(pkt.Size(), pkt.Views())
+	payload := network.ToVectorisedView()
+	payload.AppendView(transport)
+	payload.Append(pkt.Data)
 	payload.CapLength(payloadLen)
 
 	newPkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
@@ -860,6 +895,14 @@ func (p *protocol) returnError(r *stack.Route, reason icmpReason, pkt *stack.Pac
 		icmpHdr.SetType(header.ICMPv6DstUnreachable)
 		icmpHdr.SetCode(header.ICMPv6PortUnreachable)
 		counter = sent.DstUnreachable
+	case *icmpReasonHopLimitExceeded:
+		icmpHdr.SetType(header.ICMPv6TimeExceeded)
+		icmpHdr.SetCode(header.ICMPv6HopLimitExceeded)
+		counter = sent.TimeExceeded
+	case *icmpReasonReassemblyTimeout:
+		icmpHdr.SetType(header.ICMPv6TimeExceeded)
+		icmpHdr.SetCode(header.ICMPv6ReassemblyTimeout)
+		counter = sent.TimeExceeded
 	default:
 		panic(fmt.Sprintf("unsupported ICMP type %T", reason))
 	}
@@ -878,4 +921,17 @@ func (p *protocol) returnError(r *stack.Route, reason icmpReason, pkt *stack.Pac
 	}
 	counter.Increment()
 	return nil
+}
+
+// OnReassemblyTimeout implements fragmentation.TimeoutHandler.
+func (p *protocol) OnReassemblyTimeout(pkt *stack.PacketBuffer) {
+	// OnReassemblyTimeout sends a Time Exceeded Message as per RFC 2460 Section
+	// 4.5:
+	//
+	//   If the first fragment (i.e., the one with a Fragment Offset of zero) has
+	//   been received, an ICMP Time Exceeded -- Fragment Reassembly Time Exceeded
+	//   message should be sent to the source of that fragment.
+	if pkt != nil {
+		p.returnError(&icmpReasonReassemblyTimeout{}, pkt)
+	}
 }

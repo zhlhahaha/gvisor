@@ -99,7 +99,8 @@ const (
 
 // ICMP codes for ICMPv4 Time Exceeded messages as defined in RFC 792.
 const (
-	ICMPv4TTLExceeded ICMPv4Code = 0
+	ICMPv4TTLExceeded       ICMPv4Code = 0
+	ICMPv4ReassemblyTimeout ICMPv4Code = 1
 )
 
 // ICMP codes for ICMPv4 Destination Unreachable messages as defined in RFC 792.
@@ -125,6 +126,12 @@ func (b ICMPv4) Code() ICMPv4Code { return ICMPv4Code(b[1]) }
 
 // SetCode sets the ICMP code field.
 func (b ICMPv4) SetCode(c ICMPv4Code) { b[1] = byte(c) }
+
+// Pointer returns the pointer field in a Parameter Problem packet.
+func (b ICMPv4) Pointer() byte { return b[icmpv4PointerOffset] }
+
+// SetPointer sets the pointer field in a Parameter Problem packet.
+func (b ICMPv4) SetPointer(c byte) { b[icmpv4PointerOffset] = c }
 
 // Checksum is the ICMP checksum field.
 func (b ICMPv4) Checksum() uint16 {

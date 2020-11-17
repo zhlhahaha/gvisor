@@ -32,6 +32,8 @@ import (
 const initialLimit = 16 * 1024
 
 // A RightsControlMessage is a control message containing FDs.
+//
+// +stateify savable
 type RightsControlMessage interface {
 	// Clone returns a copy of the RightsControlMessage.
 	Clone() RightsControlMessage
@@ -203,6 +205,9 @@ type Endpoint interface {
 
 	// LastError implements tcpip.Endpoint.LastError.
 	LastError() *tcpip.Error
+
+	// SocketOptions implements tcpip.Endpoint.SocketOptions.
+	SocketOptions() *tcpip.SocketOptions
 }
 
 // A Credentialer is a socket or endpoint that supports the SO_PASSCRED socket
@@ -336,7 +341,7 @@ type Receiver interface {
 	RecvMaxQueueSize() int64
 
 	// Release releases any resources owned by the Receiver. It should be
-	// called before droping all references to a Receiver.
+	// called before dropping all references to a Receiver.
 	Release(ctx context.Context)
 }
 
@@ -487,7 +492,7 @@ func (q *streamQueueReceiver) Recv(ctx context.Context, data [][]byte, wantCreds
 		c := q.control.Clone()
 
 		// Don't consume data since we are peeking.
-		copied, data, _ = vecCopy(data, q.buffer)
+		copied, _, _ = vecCopy(data, q.buffer)
 
 		return copied, copied, c, false, q.addr, notify, nil
 	}
@@ -572,6 +577,12 @@ func (q *streamQueueReceiver) Recv(ctx context.Context, data [][]byte, wantCreds
 	return copied, copied, c, cmTruncated, q.addr, notify, nil
 }
 
+// Release implements Receiver.Release.
+func (q *streamQueueReceiver) Release(ctx context.Context) {
+	q.queueReceiver.Release(ctx)
+	q.control.Release(ctx)
+}
+
 // A ConnectedEndpoint is an Endpoint that can be used to send Messages.
 type ConnectedEndpoint interface {
 	// Passcred implements Endpoint.Passcred.
@@ -619,7 +630,7 @@ type ConnectedEndpoint interface {
 	SendMaxQueueSize() int64
 
 	// Release releases any resources owned by the ConnectedEndpoint. It should
-	// be called before droping all references to a ConnectedEndpoint.
+	// be called before dropping all references to a ConnectedEndpoint.
 	Release(ctx context.Context)
 
 	// CloseUnread sets the fact that this end is closed with unread data to
@@ -749,6 +760,8 @@ type baseEndpoint struct {
 
 	// linger is used for SO_LINGER socket option.
 	linger tcpip.LingerOption
+
+	ops tcpip.SocketOptions
 }
 
 // EventRegister implements waiter.Waitable.EventRegister.
@@ -857,7 +870,6 @@ func (e *baseEndpoint) SetSockOpt(opt tcpip.SettableSocketOption) *tcpip.Error {
 
 func (e *baseEndpoint) SetSockOptBool(opt tcpip.SockOptBool, v bool) *tcpip.Error {
 	switch opt {
-	case tcpip.BroadcastOption:
 	case tcpip.PasscredOption:
 		e.setPasscred(v)
 	case tcpip.ReuseAddressOption:
@@ -879,7 +891,7 @@ func (e *baseEndpoint) SetSockOptInt(opt tcpip.SockOptInt, v int) *tcpip.Error {
 
 func (e *baseEndpoint) GetSockOptBool(opt tcpip.SockOptBool) (bool, *tcpip.Error) {
 	switch opt {
-	case tcpip.KeepaliveEnabledOption:
+	case tcpip.KeepaliveEnabledOption, tcpip.AcceptConnOption:
 		return false, nil
 
 	case tcpip.PasscredOption:
@@ -970,6 +982,11 @@ func (e *baseEndpoint) GetSockOpt(opt tcpip.GettableSocketOption) *tcpip.Error {
 // LastError implements Endpoint.LastError.
 func (*baseEndpoint) LastError() *tcpip.Error {
 	return nil
+}
+
+// SocketOptions implements Endpoint.SocketOptions.
+func (e *baseEndpoint) SocketOptions() *tcpip.SocketOptions {
+	return &e.ops
 }
 
 // Shutdown closes the read and/or write end of the endpoint connection to its

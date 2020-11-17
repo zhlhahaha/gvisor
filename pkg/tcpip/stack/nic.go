@@ -232,7 +232,8 @@ func (n *NIC) setPromiscuousMode(enable bool) {
 	n.mu.Unlock()
 }
 
-func (n *NIC) isPromiscuousMode() bool {
+// Promiscuous implements NetworkInterface.
+func (n *NIC) Promiscuous() bool {
 	n.mu.RLock()
 	rv := n.mu.promiscuous
 	n.mu.RUnlock()
@@ -273,6 +274,15 @@ func (n *NIC) WritePacket(r *Route, gso *GSO, protocol tcpip.NetworkProtocolNumb
 	return n.writePacket(r, gso, protocol, pkt)
 }
 
+// WritePacketToRemote implements NetworkInterface.
+func (n *NIC) WritePacketToRemote(remoteLinkAddr tcpip.LinkAddress, gso *GSO, protocol tcpip.NetworkProtocolNumber, pkt *PacketBuffer) *tcpip.Error {
+	r := Route{
+		NetProto:          protocol,
+		RemoteLinkAddress: remoteLinkAddr,
+	}
+	return n.writePacket(&r, gso, protocol, pkt)
+}
+
 func (n *NIC) writePacket(r *Route, gso *GSO, protocol tcpip.NetworkProtocolNumber, pkt *PacketBuffer) *tcpip.Error {
 	// WritePacket takes ownership of pkt, calculate numBytes first.
 	numBytes := pkt.Size()
@@ -311,16 +321,21 @@ func (n *NIC) setSpoofing(enable bool) {
 // primaryAddress returns an address that can be used to communicate with
 // remoteAddr.
 func (n *NIC) primaryEndpoint(protocol tcpip.NetworkProtocolNumber, remoteAddr tcpip.Address) AssignableAddressEndpoint {
-	n.mu.RLock()
-	spoofing := n.mu.spoofing
-	n.mu.RUnlock()
-
 	ep, ok := n.networkEndpoints[protocol]
 	if !ok {
 		return nil
 	}
 
-	return ep.AcquireOutgoingPrimaryAddress(remoteAddr, spoofing)
+	addressableEndpoint, ok := ep.(AddressableEndpoint)
+	if !ok {
+		return nil
+	}
+
+	n.mu.RLock()
+	spoofing := n.mu.spoofing
+	n.mu.RUnlock()
+
+	return addressableEndpoint.AcquireOutgoingPrimaryAddress(remoteAddr, spoofing)
 }
 
 type getAddressBehaviour int
@@ -337,6 +352,16 @@ const (
 
 func (n *NIC) getAddress(protocol tcpip.NetworkProtocolNumber, dst tcpip.Address) AssignableAddressEndpoint {
 	return n.getAddressOrCreateTemp(protocol, dst, CanBePrimaryEndpoint, promiscuous)
+}
+
+func (n *NIC) hasAddress(protocol tcpip.NetworkProtocolNumber, addr tcpip.Address) bool {
+	ep := n.getAddressOrCreateTempInner(protocol, addr, false, NeverPrimaryEndpoint)
+	if ep != nil {
+		ep.DecRef()
+		return true
+	}
+
+	return false
 }
 
 // findEndpoint finds the endpoint, if any, with the given address.
@@ -369,11 +394,17 @@ func (n *NIC) getAddressOrCreateTemp(protocol tcpip.NetworkProtocolNumber, addre
 // getAddressOrCreateTempInner is like getAddressEpOrCreateTemp except a boolean
 // is passed to indicate whether or not we should generate temporary endpoints.
 func (n *NIC) getAddressOrCreateTempInner(protocol tcpip.NetworkProtocolNumber, address tcpip.Address, createTemp bool, peb PrimaryEndpointBehavior) AssignableAddressEndpoint {
-	if ep, ok := n.networkEndpoints[protocol]; ok {
-		return ep.AcquireAssignedAddress(address, createTemp, peb)
+	ep, ok := n.networkEndpoints[protocol]
+	if !ok {
+		return nil
 	}
 
-	return nil
+	addressableEndpoint, ok := ep.(AddressableEndpoint)
+	if !ok {
+		return nil
+	}
+
+	return addressableEndpoint.AcquireAssignedAddress(address, createTemp, peb)
 }
 
 // addAddress adds a new address to n, so that it starts accepting packets
@@ -384,7 +415,12 @@ func (n *NIC) addAddress(protocolAddress tcpip.ProtocolAddress, peb PrimaryEndpo
 		return tcpip.ErrUnknownProtocol
 	}
 
-	addressEndpoint, err := ep.AddAndAcquirePermanentAddress(protocolAddress.AddressWithPrefix, peb, AddressConfigStatic, false /* deprecated */)
+	addressableEndpoint, ok := ep.(AddressableEndpoint)
+	if !ok {
+		return tcpip.ErrNotSupported
+	}
+
+	addressEndpoint, err := addressableEndpoint.AddAndAcquirePermanentAddress(protocolAddress.AddressWithPrefix, peb, AddressConfigStatic, false /* deprecated */)
 	if err == nil {
 		// We have no need for the address endpoint.
 		addressEndpoint.DecRef()
@@ -397,7 +433,12 @@ func (n *NIC) addAddress(protocolAddress tcpip.ProtocolAddress, peb PrimaryEndpo
 func (n *NIC) allPermanentAddresses() []tcpip.ProtocolAddress {
 	var addrs []tcpip.ProtocolAddress
 	for p, ep := range n.networkEndpoints {
-		for _, a := range ep.PermanentAddresses() {
+		addressableEndpoint, ok := ep.(AddressableEndpoint)
+		if !ok {
+			continue
+		}
+
+		for _, a := range addressableEndpoint.PermanentAddresses() {
 			addrs = append(addrs, tcpip.ProtocolAddress{Protocol: p, AddressWithPrefix: a})
 		}
 	}
@@ -408,7 +449,12 @@ func (n *NIC) allPermanentAddresses() []tcpip.ProtocolAddress {
 func (n *NIC) primaryAddresses() []tcpip.ProtocolAddress {
 	var addrs []tcpip.ProtocolAddress
 	for p, ep := range n.networkEndpoints {
-		for _, a := range ep.PrimaryAddresses() {
+		addressableEndpoint, ok := ep.(AddressableEndpoint)
+		if !ok {
+			continue
+		}
+
+		for _, a := range addressableEndpoint.PrimaryAddresses() {
 			addrs = append(addrs, tcpip.ProtocolAddress{Protocol: p, AddressWithPrefix: a})
 		}
 	}
@@ -426,13 +472,23 @@ func (n *NIC) primaryAddress(proto tcpip.NetworkProtocolNumber) tcpip.AddressWit
 		return tcpip.AddressWithPrefix{}
 	}
 
-	return ep.MainAddress()
+	addressableEndpoint, ok := ep.(AddressableEndpoint)
+	if !ok {
+		return tcpip.AddressWithPrefix{}
+	}
+
+	return addressableEndpoint.MainAddress()
 }
 
 // removeAddress removes an address from n.
 func (n *NIC) removeAddress(addr tcpip.Address) *tcpip.Error {
 	for _, ep := range n.networkEndpoints {
-		if err := ep.RemovePermanentAddress(addr); err == tcpip.ErrBadLocalAddress {
+		addressableEndpoint, ok := ep.(AddressableEndpoint)
+		if !ok {
+			continue
+		}
+
+		if err := addressableEndpoint.RemovePermanentAddress(addr); err == tcpip.ErrBadLocalAddress {
 			continue
 		} else {
 			return err
@@ -545,13 +601,6 @@ func (n *NIC) isInGroup(addr tcpip.Address) bool {
 	return false
 }
 
-func (n *NIC) handlePacket(protocol tcpip.NetworkProtocolNumber, dst, src tcpip.Address, remotelinkAddr tcpip.LinkAddress, addressEndpoint AssignableAddressEndpoint, pkt *PacketBuffer) {
-	r := makeRoute(protocol, dst, src, n, addressEndpoint, false /* handleLocal */, false /* multicastLoop */)
-	defer r.Release()
-	r.RemoteLinkAddress = remotelinkAddr
-	n.getNetworkEndpoint(protocol).HandlePacket(&r, pkt)
-}
-
 // DeliverNetworkPacket finds the appropriate network protocol endpoint and
 // hands the packet over for further processing. This function is called when
 // the NIC receives a packet from the link endpoint.
@@ -573,7 +622,7 @@ func (n *NIC) DeliverNetworkPacket(remote, local tcpip.LinkAddress, protocol tcp
 	n.stats.Rx.Packets.Increment()
 	n.stats.Rx.Bytes.IncrementBy(uint64(pkt.Data.Size()))
 
-	netProto, ok := n.stack.networkProtocols[protocol]
+	networkEndpoint, ok := n.networkEndpoints[protocol]
 	if !ok {
 		n.mu.RUnlock()
 		n.stack.stats.UnknownProtocolRcvdPackets.Increment()
@@ -585,6 +634,7 @@ func (n *NIC) DeliverNetworkPacket(remote, local tcpip.LinkAddress, protocol tcp
 	if local == "" {
 		local = n.LinkEndpoint.LinkAddress()
 	}
+	pkt.RXTransportChecksumValidated = n.LinkEndpoint.Capabilities()&CapabilityRXChecksumOffload != 0
 
 	// Are any packet type sockets listening for this network protocol?
 	packetEPs := n.mu.packetEPs[protocol]
@@ -597,11 +647,8 @@ func (n *NIC) DeliverNetworkPacket(remote, local tcpip.LinkAddress, protocol tcp
 		ep.HandlePacket(n.id, local, protocol, p)
 	}
 
-	if netProto.Number() == header.IPv4ProtocolNumber || netProto.Number() == header.IPv6ProtocolNumber {
-		n.stack.stats.IP.PacketsReceived.Increment()
-	}
-
 	// Parse headers.
+	netProto := n.stack.NetworkProtocolInstance(protocol)
 	transProtoNum, hasTransportHdr, ok := netProto.Parse(pkt)
 	if !ok {
 		// The packet is too small to contain a network header.
@@ -616,9 +663,8 @@ func (n *NIC) DeliverNetworkPacket(remote, local tcpip.LinkAddress, protocol tcp
 		}
 	}
 
-	src, dst := netProto.ParseAddresses(pkt.NetworkHeader().View())
-
 	if n.stack.handleLocal && !n.IsLoopback() {
+		src, _ := netProto.ParseAddresses(pkt.NetworkHeader().View())
 		if r := n.getAddress(protocol, src); r != nil {
 			r.DecRef()
 
@@ -631,78 +677,7 @@ func (n *NIC) DeliverNetworkPacket(remote, local tcpip.LinkAddress, protocol tcp
 		}
 	}
 
-	// Loopback traffic skips the prerouting chain.
-	if !n.IsLoopback() {
-		// iptables filtering.
-		ipt := n.stack.IPTables()
-		address := n.primaryAddress(protocol)
-		if ok := ipt.Check(Prerouting, pkt, nil, nil, address.Address, ""); !ok {
-			// iptables is telling us to drop the packet.
-			n.stack.stats.IP.IPTablesPreroutingDropped.Increment()
-			return
-		}
-	}
-
-	if addressEndpoint := n.getAddress(protocol, dst); addressEndpoint != nil {
-		n.handlePacket(protocol, dst, src, remote, addressEndpoint, pkt)
-		return
-	}
-
-	// This NIC doesn't care about the packet. Find a NIC that cares about the
-	// packet and forward it to the NIC.
-	//
-	// TODO: Should we be forwarding the packet even if promiscuous?
-	if n.stack.Forwarding(protocol) {
-		r, err := n.stack.FindRoute(0, "", dst, protocol, false /* multicastLoop */)
-		if err != nil {
-			n.stack.stats.IP.InvalidDestinationAddressesReceived.Increment()
-			return
-		}
-
-		// Found a NIC.
-		n := r.nic
-		if addressEndpoint := n.getAddressOrCreateTempInner(protocol, dst, false, NeverPrimaryEndpoint); addressEndpoint != nil {
-			if n.isValidForOutgoing(addressEndpoint) {
-				r.LocalLinkAddress = n.LinkEndpoint.LinkAddress()
-				r.RemoteLinkAddress = remote
-				r.RemoteAddress = src
-				// TODO(b/123449044): Update the source NIC as well.
-				n.getNetworkEndpoint(protocol).HandlePacket(&r, pkt)
-				addressEndpoint.DecRef()
-				r.Release()
-				return
-			}
-
-			addressEndpoint.DecRef()
-		}
-
-		// n doesn't have a destination endpoint.
-		// Send the packet out of n.
-		// TODO(gvisor.dev/issue/1085): According to the RFC, we must decrease the TTL field for ipv4/ipv6.
-
-		// pkt may have set its header and may not have enough headroom for
-		// link-layer header for the other link to prepend. Here we create a new
-		// packet to forward.
-		fwdPkt := NewPacketBuffer(PacketBufferOptions{
-			ReserveHeaderBytes: int(n.LinkEndpoint.MaxHeaderLength()),
-			// We need to do a deep copy of the IP packet because WritePacket (and
-			// friends) take ownership of the packet buffer, but we do not own it.
-			Data: PayloadSince(pkt.NetworkHeader()).ToVectorisedView(),
-		})
-
-		// TODO(b/143425874) Decrease the TTL field in forwarded packets.
-		if err := n.WritePacket(&r, nil, protocol, fwdPkt); err != nil {
-			n.stack.stats.IP.InvalidDestinationAddressesReceived.Increment()
-		}
-
-		r.Release()
-		return
-	}
-
-	// If a packet socket handled the packet, don't treat it as invalid.
-	if len(packetEPs) == 0 {
-		n.stack.stats.IP.InvalidDestinationAddressesReceived.Increment()
-	}
+	networkEndpoint.HandlePacket(pkt)
 }
 
 // DeliverOutboundPacket implements NetworkDispatcher.DeliverOutboundPacket.
@@ -725,7 +700,7 @@ func (n *NIC) DeliverOutboundPacket(remote, local tcpip.LinkAddress, protocol tc
 
 // DeliverTransportPacket delivers the packets to the appropriate transport
 // protocol endpoint.
-func (n *NIC) DeliverTransportPacket(r *Route, protocol tcpip.TransportProtocolNumber, pkt *PacketBuffer) TransportPacketDisposition {
+func (n *NIC) DeliverTransportPacket(protocol tcpip.TransportProtocolNumber, pkt *PacketBuffer) TransportPacketDisposition {
 	state, ok := n.stack.transportProtocols[protocol]
 	if !ok {
 		n.stack.stats.UnknownProtocolRcvdPackets.Increment()
@@ -737,7 +712,7 @@ func (n *NIC) DeliverTransportPacket(r *Route, protocol tcpip.TransportProtocolN
 	// Raw socket packets are delivered based solely on the transport
 	// protocol number. We do not inspect the payload to ensure it's
 	// validly formed.
-	n.stack.demux.deliverRawPacket(r, protocol, pkt)
+	n.stack.demux.deliverRawPacket(protocol, pkt)
 
 	// TransportHeader is empty only when pkt is an ICMP packet or was reassembled
 	// from fragments.
@@ -766,14 +741,25 @@ func (n *NIC) DeliverTransportPacket(r *Route, protocol tcpip.TransportProtocolN
 		return TransportPacketHandled
 	}
 
-	id := TransportEndpointID{dstPort, r.LocalAddress, srcPort, r.RemoteAddress}
-	if n.stack.demux.deliverPacket(r, protocol, pkt, id) {
+	netProto, ok := n.stack.networkProtocols[pkt.NetworkProtocolNumber]
+	if !ok {
+		panic(fmt.Sprintf("expected network protocol = %d, have = %#v", pkt.NetworkProtocolNumber, n.stack.networkProtocolNumbers()))
+	}
+
+	src, dst := netProto.ParseAddresses(pkt.NetworkHeader().View())
+	id := TransportEndpointID{
+		LocalPort:     dstPort,
+		LocalAddress:  dst,
+		RemotePort:    srcPort,
+		RemoteAddress: src,
+	}
+	if n.stack.demux.deliverPacket(protocol, pkt, id) {
 		return TransportPacketHandled
 	}
 
 	// Try to deliver to per-stack default handler.
 	if state.defaultHandler != nil {
-		if state.defaultHandler(r, id, pkt) {
+		if state.defaultHandler(id, pkt) {
 			return TransportPacketHandled
 		}
 	}
@@ -781,7 +767,7 @@ func (n *NIC) DeliverTransportPacket(r *Route, protocol tcpip.TransportProtocolN
 	// We could not find an appropriate destination for this packet so
 	// give the protocol specific error handler a chance to handle it.
 	// If it doesn't handle it then we should do so.
-	switch res := transProto.HandleUnknownDestinationPacket(r, id, pkt); res {
+	switch res := transProto.HandleUnknownDestinationPacket(id, pkt); res {
 	case UnknownDestinationPacketMalformed:
 		n.stack.stats.MalformedRcvdPackets.Increment()
 		return TransportPacketHandled
@@ -885,7 +871,7 @@ func (n *NIC) unregisterPacketEndpoint(netProto tcpip.NetworkProtocolNumber, ep 
 }
 
 // isValidForOutgoing returns true if the endpoint can be used to send out a
-// packet. It requires the endpoint to not be marked expired (i.e., its address)
+// packet. It requires the endpoint to not be marked expired (i.e., its address
 // has been removed) unless the NIC is in spoofing mode, or temporary.
 func (n *NIC) isValidForOutgoing(ep AssignableAddressEndpoint) bool {
 	n.mu.RLock()

@@ -41,7 +41,7 @@ func NewIPCNamespace(userNS *auth.UserNamespace) *IPCNamespace {
 		semaphores: semaphore.NewRegistry(userNS),
 		shms:       shm.NewRegistry(userNS),
 	}
-	ns.EnableLeakCheck()
+	ns.InitRefs()
 	return ns
 }
 
@@ -55,7 +55,7 @@ func (i *IPCNamespace) ShmRegistry() *shm.Registry {
 	return i.shms
 }
 
-// DecRef implements refs_vfs2.RefCounter.DecRef.
+// DecRef implements refsvfs2.RefCounter.DecRef.
 func (i *IPCNamespace) DecRef(ctx context.Context) {
 	i.IPCNamespaceRefs.DecRef(func() {
 		i.shms.Release(ctx)

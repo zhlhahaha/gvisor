@@ -39,7 +39,6 @@ func (p *Pipe) StateTypeName() string {
 func (p *Pipe) StateFields() []string {
 	return []string{
 		"isNamed",
-		"atomicIOBytes",
 		"readers",
 		"writers",
 		"view",
@@ -53,24 +52,22 @@ func (p *Pipe) beforeSave() {}
 func (p *Pipe) StateSave(stateSinkObject state.Sink) {
 	p.beforeSave()
 	stateSinkObject.Save(0, &p.isNamed)
-	stateSinkObject.Save(1, &p.atomicIOBytes)
-	stateSinkObject.Save(2, &p.readers)
-	stateSinkObject.Save(3, &p.writers)
-	stateSinkObject.Save(4, &p.view)
-	stateSinkObject.Save(5, &p.max)
-	stateSinkObject.Save(6, &p.hadWriter)
+	stateSinkObject.Save(1, &p.readers)
+	stateSinkObject.Save(2, &p.writers)
+	stateSinkObject.Save(3, &p.view)
+	stateSinkObject.Save(4, &p.max)
+	stateSinkObject.Save(5, &p.hadWriter)
 }
 
 func (p *Pipe) afterLoad() {}
 
 func (p *Pipe) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &p.isNamed)
-	stateSourceObject.Load(1, &p.atomicIOBytes)
-	stateSourceObject.Load(2, &p.readers)
-	stateSourceObject.Load(3, &p.writers)
-	stateSourceObject.Load(4, &p.view)
-	stateSourceObject.Load(5, &p.max)
-	stateSourceObject.Load(6, &p.hadWriter)
+	stateSourceObject.Load(1, &p.readers)
+	stateSourceObject.Load(2, &p.writers)
+	stateSourceObject.Load(3, &p.view)
+	stateSourceObject.Load(4, &p.max)
+	stateSourceObject.Load(5, &p.hadWriter)
 }
 
 func (r *Reader) StateTypeName() string {
@@ -119,6 +116,64 @@ func (rw *ReaderWriter) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &rw.Pipe)
 }
 
+func (vp *VFSPipe) StateTypeName() string {
+	return "pkg/sentry/kernel/pipe.VFSPipe"
+}
+
+func (vp *VFSPipe) StateFields() []string {
+	return []string{
+		"pipe",
+	}
+}
+
+func (vp *VFSPipe) beforeSave() {}
+
+func (vp *VFSPipe) StateSave(stateSinkObject state.Sink) {
+	vp.beforeSave()
+	stateSinkObject.Save(0, &vp.pipe)
+}
+
+func (vp *VFSPipe) afterLoad() {}
+
+func (vp *VFSPipe) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &vp.pipe)
+}
+
+func (fd *VFSPipeFD) StateTypeName() string {
+	return "pkg/sentry/kernel/pipe.VFSPipeFD"
+}
+
+func (fd *VFSPipeFD) StateFields() []string {
+	return []string{
+		"vfsfd",
+		"FileDescriptionDefaultImpl",
+		"DentryMetadataFileDescriptionImpl",
+		"LockFD",
+		"pipe",
+	}
+}
+
+func (fd *VFSPipeFD) beforeSave() {}
+
+func (fd *VFSPipeFD) StateSave(stateSinkObject state.Sink) {
+	fd.beforeSave()
+	stateSinkObject.Save(0, &fd.vfsfd)
+	stateSinkObject.Save(1, &fd.FileDescriptionDefaultImpl)
+	stateSinkObject.Save(2, &fd.DentryMetadataFileDescriptionImpl)
+	stateSinkObject.Save(3, &fd.LockFD)
+	stateSinkObject.Save(4, &fd.pipe)
+}
+
+func (fd *VFSPipeFD) afterLoad() {}
+
+func (fd *VFSPipeFD) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &fd.vfsfd)
+	stateSourceObject.Load(1, &fd.FileDescriptionDefaultImpl)
+	stateSourceObject.Load(2, &fd.DentryMetadataFileDescriptionImpl)
+	stateSourceObject.Load(3, &fd.LockFD)
+	stateSourceObject.Load(4, &fd.pipe)
+}
+
 func (w *Writer) StateTypeName() string {
 	return "pkg/sentry/kernel/pipe.Writer"
 }
@@ -147,5 +202,7 @@ func init() {
 	state.Register((*Pipe)(nil))
 	state.Register((*Reader)(nil))
 	state.Register((*ReaderWriter)(nil))
+	state.Register((*VFSPipe)(nil))
+	state.Register((*VFSPipeFD)(nil))
 	state.Register((*Writer)(nil))
 }

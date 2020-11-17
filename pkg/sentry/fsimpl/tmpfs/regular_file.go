@@ -42,7 +42,7 @@ type regularFile struct {
 	inode inode
 
 	// memFile is a platform.File used to allocate pages to this regularFile.
-	memFile *pgalloc.MemoryFile
+	memFile *pgalloc.MemoryFile `state:"nosave"`
 
 	// memoryUsageKind is the memory accounting category under which pages backing
 	// this regularFile's contents are accounted.
@@ -92,7 +92,7 @@ type regularFile struct {
 
 func (fs *filesystem) newRegularFile(kuid auth.KUID, kgid auth.KGID, mode linux.FileMode) *inode {
 	file := &regularFile{
-		memFile:         fs.memFile,
+		memFile:         fs.mfp.MemoryFile(),
 		memoryUsageKind: usage.Tmpfs,
 		seals:           linux.F_SEAL_SEAL,
 	}
@@ -565,7 +565,7 @@ func (rw *regularFileReadWriter) ReadToBlocks(dsts safemem.BlockSeq) (uint64, er
 
 // WriteFromBlocks implements safemem.Writer.WriteFromBlocks.
 //
-// Preconditions: inode.mu must be held.
+// Preconditions: rw.file.inode.mu must be held.
 func (rw *regularFileReadWriter) WriteFromBlocks(srcs safemem.BlockSeq) (uint64, error) {
 	// Hold dataMu so we can modify size.
 	rw.file.dataMu.Lock()
@@ -657,7 +657,7 @@ exitLoop:
 	// If the write ends beyond the file's previous size, it causes the
 	// file to grow.
 	if rw.off > rw.file.size {
-		rw.file.size = rw.off
+		atomic.StoreUint64(&rw.file.size, rw.off)
 	}
 
 	return done, retErr
