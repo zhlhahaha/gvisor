@@ -39,7 +39,7 @@ func (tcpMarshaler) name() string {
 }
 
 // marshal implements matchMaker.marshal.
-func (tcpMarshaler) marshal(mr stack.Matcher) []byte {
+func (tcpMarshaler) marshal(mr matcher) []byte {
 	matcher := mr.(*TCPMatcher)
 	xttcp := linux.XTTCP{
 		SourcePortStart:      matcher.sourcePortStart,
@@ -90,13 +90,13 @@ type TCPMatcher struct {
 	destinationPortEnd   uint16
 }
 
-// Name implements Matcher.Name.
-func (*TCPMatcher) Name() string {
+// name implements matcher.name.
+func (*TCPMatcher) name() string {
 	return matcherNameTCP
 }
 
 // Match implements Matcher.Match.
-func (tm *TCPMatcher) Match(hook stack.Hook, pkt *stack.PacketBuffer, interfaceName string) (bool, bool) {
+func (tm *TCPMatcher) Match(hook stack.Hook, pkt *stack.PacketBuffer, _, _ string) (bool, bool) {
 	// TODO(gvisor.dev/issue/170): Proto checks should ultimately be moved
 	// into the stack.Check codepath as matchers are added.
 	switch pkt.NetworkProtocolNumber {

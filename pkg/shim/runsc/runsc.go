@@ -26,12 +26,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
-	"syscall"
 	"time"
 
 	"github.com/containerd/containerd/log"
 	runc "github.com/containerd/go-runc"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"golang.org/x/sys/unix"
 )
 
 // DefaultCommand is the default command for Runsc.
@@ -63,7 +63,7 @@ func (l *LogMonitor) Wait(cmd *exec.Cmd, ch chan runc.Exit) (int, error) {
 // Runsc is the client to the runsc cli.
 type Runsc struct {
 	Command      string
-	PdeathSignal syscall.Signal
+	PdeathSignal unix.Signal
 	Setpgid      bool
 	Root         string
 	Log          string
@@ -165,6 +165,20 @@ func (r *Runsc) Create(context context.Context, id, bundle string, opts *CreateO
 	}
 
 	return err
+}
+
+func (r *Runsc) Pause(context context.Context, id string) error {
+	if _, err := cmdOutput(r.command(context, "pause", id), true); err != nil {
+		return fmt.Errorf("unable to pause: %w", err)
+	}
+	return nil
+}
+
+func (r *Runsc) Resume(context context.Context, id string) error {
+	if _, err := cmdOutput(r.command(context, "resume", id), true); err != nil {
+		return fmt.Errorf("unable to resume: %w", err)
+	}
+	return nil
 }
 
 // Start will start an already created container.
@@ -516,7 +530,7 @@ func (r *Runsc) command(context context.Context, args ...string) *exec.Cmd {
 		command = DefaultCommand
 	}
 	cmd := exec.CommandContext(context, command, append(r.args(), args...)...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{
+	cmd.SysProcAttr = &unix.SysProcAttr{
 		Setpgid: r.Setpgid,
 	}
 	if r.PdeathSignal != 0 {

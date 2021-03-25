@@ -294,22 +294,41 @@ func (a *InodeAttrs) SetStat(ctx context.Context, fs *vfs.Filesystem, creds *aut
 		return err
 	}
 
+	clearSID := false
 	stat := opts.Stat
+	if stat.Mask&linux.STATX_UID != 0 {
+		atomic.StoreUint32(&a.uid, stat.UID)
+		clearSID = true
+	}
+	if stat.Mask&linux.STATX_GID != 0 {
+		atomic.StoreUint32(&a.gid, stat.GID)
+		clearSID = true
+	}
 	if stat.Mask&linux.STATX_MODE != 0 {
 		for {
 			old := atomic.LoadUint32(&a.mode)
-			new := old | uint32(stat.Mode & ^uint16(linux.S_IFMT))
-			if swapped := atomic.CompareAndSwapUint32(&a.mode, old, new); swapped {
+			ft := old & linux.S_IFMT
+			newMode := ft | uint32(stat.Mode & ^uint16(linux.S_IFMT))
+			if clearSID {
+				newMode = vfs.ClearSUIDAndSGID(newMode)
+			}
+			if swapped := atomic.CompareAndSwapUint32(&a.mode, old, newMode); swapped {
+				clearSID = false
 				break
 			}
 		}
 	}
 
-	if stat.Mask&linux.STATX_UID != 0 {
-		atomic.StoreUint32(&a.uid, stat.UID)
-	}
-	if stat.Mask&linux.STATX_GID != 0 {
-		atomic.StoreUint32(&a.gid, stat.GID)
+	// We may have to clear the SUID/SGID bits, but didn't do so as part of
+	// STATX_MODE.
+	if clearSID {
+		for {
+			old := atomic.LoadUint32(&a.mode)
+			newMode := vfs.ClearSUIDAndSGID(old)
+			if swapped := atomic.CompareAndSwapUint32(&a.mode, old, newMode); swapped {
+				break
+			}
+		}
 	}
 
 	now := ktime.NowFromContext(ctx).Nanoseconds()
@@ -371,6 +390,8 @@ type OrderedChildrenOptions struct {
 	// OrderedChildren may modify the tracked children. This applies to
 	// operations related to rename, unlink and rmdir. If an OrderedChildren is
 	// not writable, these operations all fail with EPERM.
+	//
+	// Note that writable users must implement the sticky bit (I_SVTX).
 	Writable bool
 }
 
@@ -556,7 +577,6 @@ func (o *OrderedChildren) Unlink(ctx context.Context, name string, child Inode) 
 		return err
 	}
 
-	// TODO(gvisor.dev/issue/3027): Check sticky bit before removing.
 	o.removeLocked(name)
 	return nil
 }
@@ -603,8 +623,8 @@ func (o *OrderedChildren) Rename(ctx context.Context, oldname, newname string, c
 	if err := o.checkExistingLocked(oldname, child); err != nil {
 		return err
 	}
+	o.removeLocked(oldname)
 
-	// TODO(gvisor.dev/issue/3027): Check sticky bit before removing.
 	dst.replaceChildLocked(ctx, newname, child)
 	return nil
 }

@@ -16,8 +16,8 @@ package fuse
 
 import (
 	"sync/atomic"
-	"syscall"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
@@ -84,11 +84,7 @@ func (conn *connection) InitSend(creds *auth.Credentials, pid uint32) error {
 		Flags:        fuseDefaultInitFlags,
 	}
 
-	req, err := conn.NewRequest(creds, pid, 0, linux.FUSE_INIT, &in)
-	if err != nil {
-		return err
-	}
-
+	req := conn.NewRequest(creds, pid, 0, linux.FUSE_INIT, &in)
 	// Since there is no task to block on and FUSE_INIT is the request
 	// to unblock other requests, use nil.
 	return conn.CallAsync(nil, req)
@@ -234,7 +230,7 @@ func (conn *connection) Abort(ctx context.Context) {
 	// sendError() will remove them from `fd.completion` map.
 	// Will enter the path of a normally received error.
 	for _, toTerminate := range terminate {
-		conn.fd.sendError(ctx, -int32(syscall.ECONNABORTED), toTerminate)
+		conn.fd.sendError(ctx, -int32(unix.ECONNABORTED), toTerminate)
 	}
 
 	// 3. The requests not yet written to FUSE device.

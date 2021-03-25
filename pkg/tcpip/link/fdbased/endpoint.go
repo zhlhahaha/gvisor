@@ -41,7 +41,8 @@ package fdbased
 
 import (
 	"fmt"
-	"syscall"
+	"math"
+	"sync/atomic"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/binary"
@@ -57,7 +58,7 @@ import (
 // linkDispatcher reads packets from the link FD and dispatches them to the
 // NetworkDispatcher.
 type linkDispatcher interface {
-	dispatch() (bool, *tcpip.Error)
+	dispatch() (bool, tcpip.Error)
 }
 
 // PacketDispatchMode are the various supported methods of receiving and
@@ -118,7 +119,7 @@ type endpoint struct {
 
 	// closed is a function to be called when the FD's peer (if any) closes
 	// its end of the communication pipe.
-	closed func(*tcpip.Error)
+	closed func(tcpip.Error)
 
 	inboundDispatchers []linkDispatcher
 	dispatcher         stack.NetworkDispatcher
@@ -149,7 +150,7 @@ type Options struct {
 
 	// ClosedFunc is a function to be called when an endpoint's peer (if
 	// any) closes its end of the communication pipe.
-	ClosedFunc func(*tcpip.Error)
+	ClosedFunc func(tcpip.Error)
 
 	// Address is the link address for this endpoint. Only used if
 	// EthernetHeader is true.
@@ -189,7 +190,9 @@ type Options struct {
 // set of FD's that point to the same NIC. Trying to set the PACKET_FANOUT
 // option for an FD with a fanoutID already in use by another FD for a different
 // NIC will return an EINVAL.
-var fanoutID = 1
+//
+// Must be accessed using atomic operations.
+var fanoutID int32 = 0
 
 // New creates a new fd-based endpoint.
 //
@@ -234,11 +237,15 @@ func New(opts *Options) (stack.LinkEndpoint, error) {
 		packetDispatchMode: opts.PacketDispatchMode,
 	}
 
+	// Increment fanoutID to ensure that we don't re-use the same fanoutID for
+	// the next endpoint.
+	fid := atomic.AddInt32(&fanoutID, 1)
+
 	// Create per channel dispatchers.
 	for i := 0; i < len(e.fds); i++ {
 		fd := e.fds[i]
-		if err := syscall.SetNonblock(fd, true); err != nil {
-			return nil, fmt.Errorf("syscall.SetNonblock(%v) failed: %v", fd, err)
+		if err := unix.SetNonblock(fd, true); err != nil {
+			return nil, fmt.Errorf("unix.SetNonblock(%v) failed: %v", fd, err)
 		}
 
 		isSocket, err := isSocketFD(fd)
@@ -255,21 +262,17 @@ func New(opts *Options) (stack.LinkEndpoint, error) {
 				e.gsoMaxSize = opts.GSOMaxSize
 			}
 		}
-		inboundDispatcher, err := createInboundDispatcher(e, fd, isSocket)
+		inboundDispatcher, err := createInboundDispatcher(e, fd, isSocket, fid)
 		if err != nil {
 			return nil, fmt.Errorf("createInboundDispatcher(...) = %v", err)
 		}
 		e.inboundDispatchers = append(e.inboundDispatchers, inboundDispatcher)
 	}
 
-	// Increment fanoutID to ensure that we don't re-use the same fanoutID for
-	// the next endpoint.
-	fanoutID++
-
 	return e, nil
 }
 
-func createInboundDispatcher(e *endpoint, fd int, isSocket bool) (linkDispatcher, error) {
+func createInboundDispatcher(e *endpoint, fd int, isSocket bool, fID int32) (linkDispatcher, error) {
 	// By default use the readv() dispatcher as it works with all kinds of
 	// FDs (tap/tun/unix domain sockets and af_packet).
 	inboundDispatcher, err := newReadVDispatcher(fd, e)
@@ -284,11 +287,33 @@ func createInboundDispatcher(e *endpoint, fd int, isSocket bool) (linkDispatcher
 		}
 		switch sa.(type) {
 		case *unix.SockaddrLinklayer:
-			// enable PACKET_FANOUT mode is the underlying socket is
-			// of type AF_PACKET.
-			const fanoutType = 0x8000 // PACKET_FANOUT_HASH | PACKET_FANOUT_FLAG_DEFRAG
-			fanoutArg := fanoutID | fanoutType<<16
-			if err := syscall.SetsockoptInt(fd, syscall.SOL_PACKET, unix.PACKET_FANOUT, fanoutArg); err != nil {
+			// See: PACKET_FANOUT_MAX in net/packet/internal.h
+			const packetFanoutMax = 1 << 16
+			if fID > packetFanoutMax {
+				return nil, fmt.Errorf("host fanoutID limit exceeded, fanoutID must be <= %d", math.MaxUint16)
+			}
+			// Enable PACKET_FANOUT mode if the underlying socket is of type
+			// AF_PACKET. We do not enable PACKET_FANOUT_FLAG_DEFRAG as that will
+			// prevent gvisor from receiving fragmented packets and the host does the
+			// reassembly on our behalf before delivering the fragments. This makes it
+			// hard to test fragmentation reassembly code in Netstack.
+			//
+			// See: include/uapi/linux/if_packet.h (struct fanout_args).
+			//
+			// NOTE: We are using SetSockOptInt here even though the underlying
+			// option is actually a struct. The code follows the example in the
+			// kernel documentation as described at the link below:
+			//
+			// See: https://www.kernel.org/doc/Documentation/networking/packet_mmap.txt
+			//
+			// This works out because the actual implementation for the option zero
+			// initializes the structure and will initialize the max_members field
+			// to a proper value if zero.
+			//
+			// See: https://github.com/torvalds/linux/blob/7acac4b3196caee5e21fb5ea53f8bc124e6a16fc/net/packet/af_packet.c#L3881
+			const fanoutType = unix.PACKET_FANOUT_HASH
+			fanoutArg := int(fID) | fanoutType<<16
+			if err := unix.SetsockoptInt(fd, unix.SOL_PACKET, unix.PACKET_FANOUT, fanoutArg); err != nil {
 				return nil, fmt.Errorf("failed to enable PACKET_FANOUT option: %v", err)
 			}
 		}
@@ -313,11 +338,11 @@ func createInboundDispatcher(e *endpoint, fd int, isSocket bool) (linkDispatcher
 }
 
 func isSocketFD(fd int) (bool, error) {
-	var stat syscall.Stat_t
-	if err := syscall.Fstat(fd, &stat); err != nil {
-		return false, fmt.Errorf("syscall.Fstat(%v,...) failed: %v", fd, err)
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
+		return false, fmt.Errorf("unix.Fstat(%v,...) failed: %v", fd, err)
 	}
-	return (stat.Mode & syscall.S_IFSOCK) == syscall.S_IFSOCK, nil
+	return (stat.Mode & unix.S_IFSOCK) == unix.S_IFSOCK, nil
 }
 
 // Attach launches the goroutine that reads packets from the file descriptor and
@@ -408,7 +433,7 @@ func (e *endpoint) AddHeader(local, remote tcpip.LinkAddress, protocol tcpip.Net
 
 // WritePacket writes outbound packets to the file descriptor. If it is not
 // currently writable, the packet is dropped.
-func (e *endpoint) WritePacket(r *stack.Route, gso *stack.GSO, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) *tcpip.Error {
+func (e *endpoint) WritePacket(r stack.RouteInfo, gso *stack.GSO, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) tcpip.Error {
 	if e.hdrSize > 0 {
 		e.AddHeader(r.LocalLinkAddress, r.RemoteLinkAddress, protocol, pkt)
 	}
@@ -425,7 +450,7 @@ func (e *endpoint) WritePacket(r *stack.Route, gso *stack.GSO, protocol tcpip.Ne
 				vnetHdr.csumStart = header.EthernetMinimumSize + gso.L3HdrLen
 				vnetHdr.csumOffset = gso.CsumOffset
 			}
-			if gso.Type != stack.GSONone && uint16(pkt.Data.Size()) > gso.MSS {
+			if gso.Type != stack.GSONone && uint16(pkt.Data().Size()) > gso.MSS {
 				switch gso.Type {
 				case stack.GSOTCPv4:
 					vnetHdr.gsoType = _VIRTIO_NET_HDR_GSO_TCPV4
@@ -448,7 +473,7 @@ func (e *endpoint) WritePacket(r *stack.Route, gso *stack.GSO, protocol tcpip.Ne
 	return rawfile.NonBlockingWriteIovec(fd, builder.Build())
 }
 
-func (e *endpoint) sendBatch(batchFD int, batch []*stack.PacketBuffer) (int, *tcpip.Error) {
+func (e *endpoint) sendBatch(batchFD int, batch []*stack.PacketBuffer) (int, tcpip.Error) {
 	// Send a batch of packets through batchFD.
 	mmsgHdrs := make([]rawfile.MMsgHdr, 0, len(batch))
 	for _, pkt := range batch {
@@ -466,7 +491,7 @@ func (e *endpoint) sendBatch(batchFD int, batch []*stack.PacketBuffer) (int, *tc
 					vnetHdr.csumStart = header.EthernetMinimumSize + pkt.GSOOptions.L3HdrLen
 					vnetHdr.csumOffset = pkt.GSOOptions.CsumOffset
 				}
-				if pkt.GSOOptions.Type != stack.GSONone && uint16(pkt.Data.Size()) > pkt.GSOOptions.MSS {
+				if pkt.GSOOptions.Type != stack.GSONone && uint16(pkt.Data().Size()) > pkt.GSOOptions.MSS {
 					switch pkt.GSOOptions.Type {
 					case stack.GSOTCPv4:
 						vnetHdr.gsoType = _VIRTIO_NET_HDR_GSO_TCPV4
@@ -490,7 +515,7 @@ func (e *endpoint) sendBatch(batchFD int, batch []*stack.PacketBuffer) (int, *tc
 
 		var mmsgHdr rawfile.MMsgHdr
 		mmsgHdr.Msg.Iov = &iovecs[0]
-		mmsgHdr.Msg.Iovlen = uint64(len(iovecs))
+		mmsgHdr.Msg.SetIovlen((len(iovecs)))
 		mmsgHdrs = append(mmsgHdrs, mmsgHdr)
 	}
 
@@ -515,7 +540,7 @@ func (e *endpoint) sendBatch(batchFD int, batch []*stack.PacketBuffer) (int, *tc
 //  - pkt.EgressRoute
 //  - pkt.GSOOptions
 //  - pkt.NetworkProtocolNumber
-func (e *endpoint) WritePackets(_ *stack.Route, _ *stack.GSO, pkts stack.PacketBufferList, _ tcpip.NetworkProtocolNumber) (int, *tcpip.Error) {
+func (e *endpoint) WritePackets(_ stack.RouteInfo, _ *stack.GSO, pkts stack.PacketBufferList, _ tcpip.NetworkProtocolNumber) (int, tcpip.Error) {
 	// Preallocate to avoid repeated reallocation as we append to batch.
 	// batchSz is 47 because when SWGSO is in use then a single 65KB TCP
 	// segment can get split into 46 segments of 1420 bytes and a single 216
@@ -558,19 +583,14 @@ func viewsEqual(vs1, vs2 []buffer.View) bool {
 	return len(vs1) == len(vs2) && (len(vs1) == 0 || &vs1[0] == &vs2[0])
 }
 
-// WriteRawPacket implements stack.LinkEndpoint.WriteRawPacket.
-func (e *endpoint) WriteRawPacket(vv buffer.VectorisedView) *tcpip.Error {
-	return rawfile.NonBlockingWrite(e.fds[0], vv.ToView())
-}
-
 // InjectOutobund implements stack.InjectableEndpoint.InjectOutbound.
-func (e *endpoint) InjectOutbound(dest tcpip.Address, packet []byte) *tcpip.Error {
+func (e *endpoint) InjectOutbound(dest tcpip.Address, packet []byte) tcpip.Error {
 	return rawfile.NonBlockingWrite(e.fds[0], packet)
 }
 
 // dispatchLoop reads packets from the file descriptor in a loop and dispatches
 // them to the network stack.
-func (e *endpoint) dispatchLoop(inboundDispatcher linkDispatcher) *tcpip.Error {
+func (e *endpoint) dispatchLoop(inboundDispatcher linkDispatcher) tcpip.Error {
 	for {
 		cont, err := inboundDispatcher.dispatch()
 		if err != nil || !cont {
@@ -616,7 +636,7 @@ func (e *InjectableEndpoint) InjectInbound(protocol tcpip.NetworkProtocolNumber,
 
 // NewInjectable creates a new fd-based InjectableEndpoint.
 func NewInjectable(fd int, mtu uint32, capabilities stack.LinkEndpointCapabilities) *InjectableEndpoint {
-	syscall.SetNonblock(fd, true)
+	unix.SetNonblock(fd, true)
 
 	return &InjectableEndpoint{endpoint: endpoint{
 		fds:  []int{fd},

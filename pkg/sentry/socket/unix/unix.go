@@ -19,8 +19,8 @@ package unix
 import (
 	"fmt"
 	"strings"
-	"syscall"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/fspath"
@@ -115,9 +115,6 @@ type socketOpsCommon struct {
 	// bound, they cannot be modified.
 	abstractName      string
 	abstractNamespace *kernel.AbstractSocketNamespace
-
-	// ops is used to get socket level options.
-	ops tcpip.SocketOptions
 }
 
 func (s *socketOpsCommon) isPacket() bool {
@@ -139,7 +136,7 @@ func (s *socketOpsCommon) Endpoint() transport.Endpoint {
 
 // extractPath extracts and validates the address.
 func extractPath(sockaddr []byte) (string, *syserr.Error) {
-	addr, family, err := netstack.AddressAndFamily(sockaddr)
+	addr, family, err := socket.AddressAndFamily(sockaddr)
 	if err != nil {
 		if err == syserr.ErrAddressFamilyNotSupported {
 			err = syserr.ErrInvalidArgument
@@ -172,7 +169,7 @@ func (s *socketOpsCommon) GetPeerName(t *kernel.Task) (linux.SockAddr, uint32, *
 		return nil, 0, syserr.TranslateNetstackError(err)
 	}
 
-	a, l := netstack.ConvertAddress(linux.AF_UNIX, addr)
+	a, l := socket.ConvertAddress(linux.AF_UNIX, addr)
 	return a, l, nil
 }
 
@@ -184,7 +181,7 @@ func (s *socketOpsCommon) GetSockName(t *kernel.Task) (linux.SockAddr, uint32, *
 		return nil, 0, syserr.TranslateNetstackError(err)
 	}
 
-	a, l := netstack.ConvertAddress(linux.AF_UNIX, addr)
+	a, l := socket.ConvertAddress(linux.AF_UNIX, addr)
 	return a, l, nil
 }
 
@@ -210,7 +207,7 @@ func (s *socketOpsCommon) Listen(t *kernel.Task, backlog int) *syserr.Error {
 func (s *SocketOperations) blockingAccept(t *kernel.Task, peerAddr *tcpip.FullAddress) (transport.Endpoint, *syserr.Error) {
 	// Register for notifications.
 	e, ch := waiter.NewChannelEntry(nil)
-	s.EventRegister(&e, waiter.EventIn)
+	s.EventRegister(&e, waiter.ReadableEvents)
 	defer s.EventUnregister(&e)
 
 	// Try to accept the connection; if it fails, then wait until we get a
@@ -258,7 +255,7 @@ func (s *SocketOperations) Accept(t *kernel.Task, peerRequested bool, flags int,
 	var addr linux.SockAddr
 	var addrLen uint32
 	if peerAddr != nil {
-		addr, addrLen = netstack.ConvertAddress(linux.AF_UNIX, *peerAddr)
+		addr, addrLen = socket.ConvertAddress(linux.AF_UNIX, *peerAddr)
 	}
 
 	fd, e := t.NewFDFrom(0, ns, kernel.FDFlags{
@@ -474,7 +471,7 @@ func (s *socketOpsCommon) SendMsg(t *kernel.Task, src usermem.IOSequence, to []b
 	if len(to) > 0 {
 		switch s.stype {
 		case linux.SOCK_SEQPACKET:
-			to = nil
+			// to is ignored.
 		case linux.SOCK_STREAM:
 			if s.State() == linux.SS_CONNECTED {
 				return 0, syserr.ErrAlreadyConnected
@@ -499,10 +496,13 @@ func (s *socketOpsCommon) SendMsg(t *kernel.Task, src usermem.IOSequence, to []b
 		return int(n), syserr.FromError(err)
 	}
 
+	// Only send SCM Rights once (see net/unix/af_unix.c:unix_stream_sendmsg).
+	w.Control.Rights = nil
+
 	// We'll have to block. Register for notification and keep trying to
 	// send all the data.
 	e, ch := waiter.NewChannelEntry(nil)
-	s.EventRegister(&e, waiter.EventOut)
+	s.EventRegister(&e, waiter.WritableEvents)
 	defer s.EventUnregister(&e)
 
 	total := n
@@ -600,14 +600,14 @@ func (s *socketOpsCommon) RecvMsg(t *kernel.Task, dst usermem.IOSequence, flags 
 	// Calculate the number of FDs for which we have space and if we are
 	// requesting credentials.
 	var wantCreds bool
-	rightsLen := int(controlDataLen) - syscall.SizeofCmsghdr
+	rightsLen := int(controlDataLen) - unix.SizeofCmsghdr
 	if s.Passcred() {
 		// Credentials take priority if they are enabled and there is space.
 		wantCreds = rightsLen > 0
 		if !wantCreds {
 			msgFlags |= linux.MSG_CTRUNC
 		}
-		credLen := syscall.CmsgSpace(syscall.SizeofUcred)
+		credLen := unix.CmsgSpace(unix.SizeofUcred)
 		rightsLen -= credLen
 	}
 	// FDs are 32 bit (4 byte) ints.
@@ -650,7 +650,7 @@ func (s *socketOpsCommon) RecvMsg(t *kernel.Task, dst usermem.IOSequence, flags 
 		var from linux.SockAddr
 		var fromLen uint32
 		if r.From != nil && len([]byte(r.From.Addr)) != 0 {
-			from, fromLen = netstack.ConvertAddress(linux.AF_UNIX, *r.From)
+			from, fromLen = socket.ConvertAddress(linux.AF_UNIX, *r.From)
 		}
 
 		if r.ControlTrunc {
@@ -677,7 +677,7 @@ func (s *socketOpsCommon) RecvMsg(t *kernel.Task, dst usermem.IOSequence, flags 
 	// We'll have to block. Register for notification and keep trying to
 	// send all the data.
 	e, ch := waiter.NewChannelEntry(nil)
-	s.EventRegister(&e, waiter.EventIn)
+	s.EventRegister(&e, waiter.ReadableEvents)
 	defer s.EventUnregister(&e)
 
 	for {
@@ -685,7 +685,7 @@ func (s *socketOpsCommon) RecvMsg(t *kernel.Task, dst usermem.IOSequence, flags 
 			var from linux.SockAddr
 			var fromLen uint32
 			if r.From != nil {
-				from, fromLen = netstack.ConvertAddress(linux.AF_UNIX, *r.From)
+				from, fromLen = socket.ConvertAddress(linux.AF_UNIX, *r.From)
 			}
 
 			if r.ControlTrunc {

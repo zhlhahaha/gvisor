@@ -16,8 +16,8 @@ package fuse
 
 import (
 	"fmt"
-	"syscall"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/marshal"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
@@ -70,6 +70,7 @@ func (r *fuseInitRes) UnmarshalBytes(src []byte) {
 		out.MaxPages = uint16(usermem.ByteOrder.Uint16(src[:2]))
 		src = src[2:]
 	}
+	_ = src // Remove unused warning.
 }
 
 // SizeBytes is the size of the payload of the FUSE_INIT response.
@@ -104,7 +105,7 @@ type Request struct {
 }
 
 // NewRequest creates a new request that can be sent to the FUSE server.
-func (conn *connection) NewRequest(creds *auth.Credentials, pid uint32, ino uint64, opcode linux.FUSEOpcode, payload marshal.Marshallable) (*Request, error) {
+func (conn *connection) NewRequest(creds *auth.Credentials, pid uint32, ino uint64, opcode linux.FUSEOpcode, payload marshal.Marshallable) *Request {
 	conn.fd.mu.Lock()
 	defer conn.fd.mu.Unlock()
 	conn.fd.nextOpID += linux.FUSEOpID(reqIDStep)
@@ -130,7 +131,7 @@ func (conn *connection) NewRequest(creds *auth.Credentials, pid uint32, ino uint
 		id:   hdr.Unique,
 		hdr:  &hdr,
 		data: buf,
-	}, nil
+	}
 }
 
 // futureResponse represents an in-flight request, that may or may not have
@@ -198,7 +199,7 @@ func (r *Response) Error() error {
 		return nil
 	}
 
-	sysErrNo := syscall.Errno(-errno)
+	sysErrNo := unix.Errno(-errno)
 	return error(sysErrNo)
 }
 

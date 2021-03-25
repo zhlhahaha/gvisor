@@ -67,8 +67,10 @@ func RegisterFlags() {
 		flag.Bool("oci-seccomp", false, "Enables loading OCI seccomp filters inside the sandbox.")
 
 		// Flags that control sandbox runtime behavior: FS related.
-		flag.Var(fileAccessTypePtr(FileAccessExclusive), "file-access", "specifies which filesystem to use for the root mount: exclusive (default), shared. Volume mounts are always shared.")
+		flag.Var(fileAccessTypePtr(FileAccessExclusive), "file-access", "specifies which filesystem validation to use for the root mount: exclusive (default), shared.")
+		flag.Var(fileAccessTypePtr(FileAccessShared), "file-access-mounts", "specifies which filesystem validation to use for volumes other than the root mount: shared (default), exclusive.")
 		flag.Bool("overlay", false, "wrap filesystem mounts with writable overlay. All modifications are stored in memory inside the sandbox.")
+		flag.Bool("verity", false, "specifies whether a verity file system will be mounted.")
 		flag.Bool("overlayfs-stale-read", true, "assume root mount is an overlay filesystem")
 		flag.Bool("fsgofer-host-uds", false, "allow the gofer to mount Unix Domain Sockets.")
 		flag.Bool("vfs2", false, "enables VFSv2. This uses the new VFS layer that is faster than the previous one.")
@@ -114,7 +116,7 @@ func NewFromFlags() (*Config, error) {
 	if len(conf.RootDir) == 0 {
 		// If not set, set default root dir to something (hopefully) user-writeable.
 		conf.RootDir = "/var/run/runsc"
-		if runtimeDir := os.Getenv("XDG_RUNTIME_DIR"); runtimeDir != "" {
+		if runtimeDir, ok := os.LookupEnv("XDG_RUNTIME_DIR"); ok {
 			conf.RootDir = filepath.Join(runtimeDir, "runsc")
 		}
 	}

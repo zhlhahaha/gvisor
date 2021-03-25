@@ -61,7 +61,7 @@ func Install(rules SyscallRules) error {
 	log.Infof("Installing seccomp filters for %d syscalls (action=%v)", len(rules), defaultAction)
 
 	instrs, err := BuildProgram([]RuleSet{
-		RuleSet{
+		{
 			Rules:  rules,
 			Action: linux.SECCOMP_RET_ALLOW,
 		},
@@ -79,7 +79,7 @@ func Install(rules SyscallRules) error {
 
 	// Perform the actual installation.
 	if errno := SetFilter(instrs); errno != 0 {
-		return fmt.Errorf("Failed to set filter: %v", errno)
+		return fmt.Errorf("failed to set filter: %v", errno)
 	}
 
 	log.Infof("Seccomp filters installed.")
@@ -160,7 +160,7 @@ func buildIndex(rules []RuleSet, program *bpf.ProgramBuilder) error {
 		}
 	}
 	syscalls := make([]uintptr, 0, len(requiredSyscalls))
-	for sysno, _ := range requiredSyscalls {
+	for sysno := range requiredSyscalls {
 		syscalls = append(syscalls, sysno)
 	}
 	sort.Slice(syscalls, func(i, j int) bool { return syscalls[i] < syscalls[j] })

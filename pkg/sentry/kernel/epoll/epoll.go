@@ -14,12 +14,18 @@
 
 // Package epoll provides an implementation of Linux's IO event notification
 // facility. See epoll(7) for more details.
+//
+// Lock order:
+// EventPoll.mu
+//   fdnotifier.notifier.mu
+//     EventPoll.listsMu
+//       unix.baseEndpoint.Mutex
 package epoll
 
 import (
 	"fmt"
-	"syscall"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/refs"
@@ -167,12 +173,12 @@ func (e *EventPoll) Release(ctx context.Context) {
 
 // Read implements fs.FileOperations.Read.
 func (*EventPoll) Read(context.Context, *fs.File, usermem.IOSequence, int64) (int64, error) {
-	return 0, syscall.ENOSYS
+	return 0, unix.ENOSYS
 }
 
 // Write implements fs.FileOperations.Write.
 func (*EventPoll) Write(context.Context, *fs.File, usermem.IOSequence, int64) (int64, error) {
-	return 0, syscall.ENOSYS
+	return 0, unix.ENOSYS
 }
 
 // eventsAvailable determines if 'e' has events available for delivery.
@@ -207,8 +213,8 @@ func (e *EventPoll) eventsAvailable() bool {
 func (e *EventPoll) Readiness(mask waiter.EventMask) waiter.EventMask {
 	ready := waiter.EventMask(0)
 
-	if (mask&waiter.EventIn) != 0 && e.eventsAvailable() {
-		ready |= waiter.EventIn
+	if (mask&waiter.ReadableEvents) != 0 && e.eventsAvailable() {
+		ready |= waiter.ReadableEvents
 	}
 
 	return ready
@@ -273,7 +279,7 @@ func (e *EventPoll) ReadEvents(max int) []linux.EpollEvent {
 //
 // Callback is called when one of the files we're polling becomes ready. It
 // moves said file to the readyList if it's currently in the waiting list.
-func (p *pollEntry) Callback(*waiter.Entry) {
+func (p *pollEntry) Callback(*waiter.Entry, waiter.EventMask) {
 	e := p.epoll
 
 	e.listsMu.Lock()
@@ -284,7 +290,7 @@ func (p *pollEntry) Callback(*waiter.Entry) {
 		p.curList = &e.readyList
 		e.listsMu.Unlock()
 
-		e.Notify(waiter.EventIn)
+		e.Notify(waiter.ReadableEvents)
 		return
 	}
 
@@ -306,9 +312,8 @@ func (e *EventPoll) initEntryReadiness(entry *pollEntry) {
 	f.EventRegister(&entry.waiter, entry.mask)
 
 	// Check if the file happens to already be in a ready state.
-	ready := f.Readiness(entry.mask) & entry.mask
-	if ready != 0 {
-		entry.Callback(&entry.waiter)
+	if ready := f.Readiness(entry.mask) & entry.mask; ready != 0 {
+		entry.Callback(&entry.waiter, ready)
 	}
 }
 
@@ -353,18 +358,18 @@ func (e *EventPoll) AddEntry(id FileIdentifier, flags EntryFlags, mask waiter.Ev
 
 	// Fail if the file already has an entry.
 	if _, ok := e.files[id]; ok {
-		return syscall.EEXIST
+		return unix.EEXIST
 	}
 
 	// Check if a cycle would be created. We use 4 as the limit because
 	// that's the value used by linux and we want to emulate it.
 	if ep != nil {
 		if e == ep {
-			return syscall.EINVAL
+			return unix.EINVAL
 		}
 
 		if ep.observes(e, 4) {
-			return syscall.ELOOP
+			return unix.ELOOP
 		}
 	}
 
@@ -399,7 +404,7 @@ func (e *EventPoll) UpdateEntry(id FileIdentifier, flags EntryFlags, mask waiter
 	// Fail if the file doesn't have an entry.
 	entry, ok := e.files[id]
 	if !ok {
-		return syscall.ENOENT
+		return unix.ENOENT
 	}
 
 	// Unregister the old mask and remove entry from the list it's in, so
@@ -430,7 +435,7 @@ func (e *EventPoll) RemoveEntry(ctx context.Context, id FileIdentifier) error {
 	// Fail if the file doesn't have an entry.
 	entry, ok := e.files[id]
 	if !ok {
-		return syscall.ENOENT
+		return unix.ENOENT
 	}
 
 	// Unregister from file first so that no concurrent attempts will be

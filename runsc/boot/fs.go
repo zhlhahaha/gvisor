@@ -20,18 +20,9 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"syscall"
-
-	// Include filesystem types that OCI spec might mount.
-	_ "gvisor.dev/gvisor/pkg/sentry/fs/dev"
-	_ "gvisor.dev/gvisor/pkg/sentry/fs/host"
-	_ "gvisor.dev/gvisor/pkg/sentry/fs/proc"
-	_ "gvisor.dev/gvisor/pkg/sentry/fs/sys"
-	_ "gvisor.dev/gvisor/pkg/sentry/fs/tmpfs"
-	_ "gvisor.dev/gvisor/pkg/sentry/fs/tty"
-	"gvisor.dev/gvisor/pkg/sentry/vfs"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/fd"
@@ -48,9 +39,18 @@ import (
 	tmpfsvfs2 "gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
+	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/specutils"
+
+	// Include filesystem types that OCI spec might mount.
+	_ "gvisor.dev/gvisor/pkg/sentry/fs/dev"
+	_ "gvisor.dev/gvisor/pkg/sentry/fs/host"
+	_ "gvisor.dev/gvisor/pkg/sentry/fs/proc"
+	_ "gvisor.dev/gvisor/pkg/sentry/fs/sys"
+	_ "gvisor.dev/gvisor/pkg/sentry/fs/tmpfs"
+	_ "gvisor.dev/gvisor/pkg/sentry/fs/tty"
 )
 
 const (
@@ -103,14 +103,14 @@ func addOverlay(ctx context.Context, conf *config.Config, lower *fs.Inode, name 
 
 // compileMounts returns the supported mounts from the mount spec, adding any
 // mandatory mounts that are required by the OCI specification.
-func compileMounts(spec *specs.Spec) []specs.Mount {
+func compileMounts(spec *specs.Spec, vfs2Enabled bool) []specs.Mount {
 	// Keep track of whether proc and sys were mounted.
 	var procMounted, sysMounted, devMounted, devptsMounted bool
 	var mounts []specs.Mount
 
 	// Mount all submounts from the spec.
 	for _, m := range spec.Mounts {
-		if !specutils.IsSupportedDevMount(m) {
+		if !vfs2Enabled && !specutils.IsVFS1SupportedDevMount(m) {
 			log.Warningf("ignoring dev mount at %q", m.Destination)
 			continue
 		}
@@ -312,11 +312,11 @@ func setupContainerFS(ctx context.Context, conf *config.Config, mntr *containerM
 }
 
 func adjustDirentCache(k *kernel.Kernel) error {
-	var hl syscall.Rlimit
-	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &hl); err != nil {
+	var hl unix.Rlimit
+	if err := unix.Getrlimit(unix.RLIMIT_NOFILE, &hl); err != nil {
 		return fmt.Errorf("getting RLIMIT_NOFILE: %v", err)
 	}
-	if int64(hl.Cur) != syscall.RLIM_INFINITY {
+	if hl.Cur != unix.RLIM_INFINITY {
 		newSize := hl.Cur / 2
 		if newSize < gofer.DefaultDirentCacheSize {
 			log.Infof("Setting gofer dirent cache size to %d", newSize)
@@ -572,10 +572,10 @@ type containerMounter struct {
 	hints *podMountHints
 }
 
-func newContainerMounter(spec *specs.Spec, goferFDs []*fd.FD, k *kernel.Kernel, hints *podMountHints) *containerMounter {
+func newContainerMounter(spec *specs.Spec, goferFDs []*fd.FD, k *kernel.Kernel, hints *podMountHints, vfs2Enabled bool) *containerMounter {
 	return &containerMounter{
 		root:   spec.Root,
-		mounts: compileMounts(spec),
+		mounts: compileMounts(spec, vfs2Enabled),
 		fds:    fdDispenser{fds: goferFDs},
 		k:      k,
 		hints:  hints,
@@ -792,7 +792,7 @@ func (c *containerMounter) getMountNameAndOptions(conf *config.Config, m specs.M
 	case bind:
 		fd := c.fds.remove()
 		fsName = gofervfs2.Name
-		opts = p9MountData(fd, c.getMountAccessType(m), conf.VFS2)
+		opts = p9MountData(fd, c.getMountAccessType(conf, m), conf.VFS2)
 		// If configured, add overlay to all writable mounts.
 		useOverlay = conf.Overlay && !mountFlags(m.Options).ReadOnly
 
@@ -802,12 +802,11 @@ func (c *containerMounter) getMountNameAndOptions(conf *config.Config, m specs.M
 	return fsName, opts, useOverlay, nil
 }
 
-func (c *containerMounter) getMountAccessType(mount specs.Mount) config.FileAccessType {
+func (c *containerMounter) getMountAccessType(conf *config.Config, mount specs.Mount) config.FileAccessType {
 	if hint := c.hints.findMount(mount); hint != nil {
 		return hint.fileAccessType()
 	}
-	// Non-root bind mounts are always shared if no hints were provided.
-	return config.FileAccessShared
+	return conf.FileAccessMounts
 }
 
 // mountSubmount mounts volumes inside the container's root. Because mounts may
@@ -844,10 +843,10 @@ func (c *containerMounter) mountSubmount(ctx context.Context, conf *config.Confi
 		// than simply printed to the logs for the 'runsc boot' command.
 		//
 		// We check the error message string rather than type because the
-		// actual error types (syscall.EIO, syscall.EPIPE) are lost by file system
+		// actual error types (unix.EIO, unix.EPIPE) are lost by file system
 		// implementation (e.g. p9).
 		// TODO(gvisor.dev/issue/1765): Remove message when bug is resolved.
-		if strings.Contains(err.Error(), syscall.EIO.Error()) || strings.Contains(err.Error(), syscall.EPIPE.Error()) {
+		if strings.Contains(err.Error(), unix.EIO.Error()) || strings.Contains(err.Error(), unix.EPIPE.Error()) {
 			return fmt.Errorf("%v: %s", err, specutils.FaqErrorMsg("memlock", "you may be encountering a Linux kernel bug"))
 		}
 		return err

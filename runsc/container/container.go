@@ -30,6 +30,7 @@ import (
 
 	"github.com/cenkalti/backoff"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/log"
@@ -38,6 +39,7 @@ import (
 	"gvisor.dev/gvisor/runsc/boot"
 	"gvisor.dev/gvisor/runsc/cgroup"
 	"gvisor.dev/gvisor/runsc/config"
+	"gvisor.dev/gvisor/runsc/console"
 	"gvisor.dev/gvisor/runsc/sandbox"
 	"gvisor.dev/gvisor/runsc/specutils"
 )
@@ -79,6 +81,7 @@ func validateID(id string) error {
 //   - It calls 'runsc delete'. runc implementation kills --all SIGKILL once
 //     again just to be sure, waits, and then proceeds with remaining teardown.
 //
+// Container is thread-unsafe.
 type Container struct {
 	// ID is the container ID.
 	ID string `json:"id"`
@@ -126,125 +129,6 @@ type Container struct {
 	goferIsChild bool
 }
 
-// loadSandbox loads all containers that belong to the sandbox with the given
-// ID.
-func loadSandbox(rootDir, id string) ([]*Container, error) {
-	cids, err := List(rootDir)
-	if err != nil {
-		return nil, err
-	}
-
-	// Load the container metadata.
-	var containers []*Container
-	for _, cid := range cids {
-		container, err := Load(rootDir, cid)
-		if err != nil {
-			// Container file may not exist if it raced with creation/deletion or
-			// directory was left behind. Load provides a snapshot in time, so it's
-			// fine to skip it.
-			if os.IsNotExist(err) {
-				continue
-			}
-			return nil, fmt.Errorf("loading container %q: %v", id, err)
-		}
-		if container.Sandbox.ID == id {
-			containers = append(containers, container)
-		}
-	}
-	return containers, nil
-}
-
-// Load loads a container with the given id from a metadata file. partialID may
-// be an abbreviation of the full container id, in which case Load loads the
-// container to which id unambiguously refers to. Returns ErrNotExist if
-// container doesn't exist.
-func Load(rootDir, partialID string) (*Container, error) {
-	log.Debugf("Load container, rootDir: %q, partial cid: %s", rootDir, partialID)
-	if err := validateID(partialID); err != nil {
-		return nil, fmt.Errorf("invalid container id: %v", err)
-	}
-
-	id, err := findContainerID(rootDir, partialID)
-	if err != nil {
-		// Preserve error so that callers can distinguish 'not found' errors.
-		return nil, err
-	}
-
-	state := StateFile{
-		RootDir: rootDir,
-		ID:      id,
-	}
-	defer state.close()
-
-	c := &Container{}
-	if err := state.load(c); err != nil {
-		if os.IsNotExist(err) {
-			// Preserve error so that callers can distinguish 'not found' errors.
-			return nil, err
-		}
-		return nil, fmt.Errorf("reading container metadata file %q: %v", state.statePath(), err)
-	}
-	return c, nil
-}
-
-// LoadAndCheck is similar to Load(), but also checks if the container is still
-// running to get an error earlier to the caller.
-func LoadAndCheck(rootDir, partialID string) (*Container, error) {
-	c, err := Load(rootDir, partialID)
-	if err != nil {
-		// Preserve error so that callers can distinguish 'not found' errors.
-		return nil, err
-	}
-
-	// If the status is "Running" or "Created", check that the sandbox/container
-	// is still running, setting it to Stopped if not.
-	//
-	// This is inherently racy.
-	switch c.Status {
-	case Created:
-		if !c.isSandboxRunning() {
-			// Sandbox no longer exists, so this container definitely does not exist.
-			c.changeStatus(Stopped)
-		}
-	case Running:
-		if err := c.SignalContainer(syscall.Signal(0), false); err != nil {
-			c.changeStatus(Stopped)
-		}
-	}
-
-	return c, nil
-}
-
-func findContainerID(rootDir, partialID string) (string, error) {
-	// Check whether the id fully specifies an existing container.
-	stateFile := buildStatePath(rootDir, partialID)
-	if _, err := os.Stat(stateFile); err == nil {
-		return partialID, nil
-	}
-
-	// Now see whether id could be an abbreviation of exactly 1 of the
-	// container ids. If id is ambiguous (it could match more than 1
-	// container), it is an error.
-	ids, err := List(rootDir)
-	if err != nil {
-		return "", err
-	}
-	rv := ""
-	for _, id := range ids {
-		if strings.HasPrefix(id, partialID) {
-			if rv != "" {
-				return "", fmt.Errorf("id %q is ambiguous and could refer to multiple containers: %q, %q", partialID, rv, id)
-			}
-			rv = id
-		}
-	}
-	if rv == "" {
-		return "", os.ErrNotExist
-	}
-	log.Debugf("abbreviated id %q resolves to full id %q", partialID, rv)
-	return rv, nil
-}
-
 // Args is used to configure a new container.
 type Args struct {
 	// ID is the container unique identifier.
@@ -289,6 +173,15 @@ func New(conf *config.Config, args Args) (*Container, error) {
 		return nil, fmt.Errorf("creating container root directory %q: %v", conf.RootDir, err)
 	}
 
+	sandboxID := args.ID
+	if !isRoot(args.Spec) {
+		var ok bool
+		sandboxID, ok = specutils.SandboxID(args.Spec)
+		if !ok {
+			return nil, fmt.Errorf("no sandbox ID found when creating container")
+		}
+	}
+
 	c := &Container{
 		ID:            args.ID,
 		Spec:          args.Spec,
@@ -299,7 +192,10 @@ func New(conf *config.Config, args Args) (*Container, error) {
 		Owner:         os.Getenv("USER"),
 		Saver: StateFile{
 			RootDir: conf.RootDir,
-			ID:      args.ID,
+			ID: FullID{
+				SandboxID:   sandboxID,
+				ContainerID: args.ID,
+			},
 		},
 	}
 	// The Cleanup object cleans up partially created containers when an error
@@ -314,10 +210,17 @@ func New(conf *config.Config, args Args) (*Container, error) {
 	}
 	defer c.Saver.unlock()
 
-	// If the metadata annotations indicate that this container should be
-	// started in an existing sandbox, we must do so. The metadata will
-	// indicate the ID of the sandbox, which is the same as the ID of the
-	// init container in the sandbox.
+	// If the metadata annotations indicate that this container should be started
+	// in an existing sandbox, we must do so. These are the possible metadata
+	// annotation states:
+	//   1. No annotations: it means that there is a single container and this
+	//      container is obviously the root. Both container and sandbox share the
+	//      ID.
+	//   2. Container type == sandbox: it means this is the root container
+	//  		starting the sandbox. Both container and sandbox share the same ID.
+	//   3. Container type == container: it means this is a subcontainer of an
+	//      already started sandbox. In this case, container ID is different than
+	//      the sandbox ID.
 	if isRoot(args.Spec) {
 		log.Debugf("Creating new sandbox for container, cid: %s", args.ID)
 
@@ -328,7 +231,6 @@ func New(conf *config.Config, args Args) (*Container, error) {
 		if args.Spec.Linux.CgroupsPath == "" && !conf.TestOnlyAllowRunAsCurrentUserWithoutChroot {
 			args.Spec.Linux.CgroupsPath = "/" + args.ID
 		}
-
 		// Create and join cgroup before processes are created to ensure they are
 		// part of the cgroup from the start (and all their children processes).
 		cg, err := cgroup.New(args.Spec)
@@ -336,10 +238,14 @@ func New(conf *config.Config, args Args) (*Container, error) {
 			return nil, err
 		}
 		if cg != nil {
+			// TODO(gvisor.dev/issue/3481): Remove when cgroups v2 is supported.
+			if !conf.Rootless && cgroup.IsOnlyV2() {
+				return nil, fmt.Errorf("cgroups V2 is not yet supported. Enable cgroups V1 and retry")
+			}
 			// If there is cgroup config, install it before creating sandbox process.
 			if err := cg.Install(args.Spec.Linux.Resources); err != nil {
 				switch {
-				case errors.Is(err, syscall.EACCES) && conf.Rootless:
+				case errors.Is(err, unix.EACCES) && conf.Rootless:
 					log.Warningf("Skipping cgroup configuration in rootless mode: %v", err)
 					cg = nil
 				default:
@@ -356,7 +262,7 @@ func New(conf *config.Config, args Args) (*Container, error) {
 			// Start a new sandbox for this container. Any errors after this point
 			// must destroy the container.
 			sandArgs := &sandbox.Args{
-				ID:            args.ID,
+				ID:            sandboxID,
 				Spec:          args.Spec,
 				BundleDir:     args.BundleDir,
 				ConsoleSocket: args.ConsoleSocket,
@@ -377,27 +283,34 @@ func New(conf *config.Config, args Args) (*Container, error) {
 			return nil, err
 		}
 	} else {
-		// This is sort of confusing. For a sandbox with a root
-		// container and a child container in it, runsc sees:
-		// * A container struct whose sandbox ID is equal to the
-		//   container ID. This is the root container that is tied to
-		//   the creation of the sandbox.
-		// * A container struct whose sandbox ID is equal to the above
-		//   container/sandbox ID, but that has a different container
-		//   ID. This is the child container.
-		sbid, ok := specutils.SandboxID(args.Spec)
-		if !ok {
-			return nil, fmt.Errorf("no sandbox ID found when creating container")
-		}
-		log.Debugf("Creating new container, cid: %s, sandbox: %s", c.ID, sbid)
+		log.Debugf("Creating new container, cid: %s, sandbox: %s", c.ID, sandboxID)
 
 		// Find the sandbox associated with this ID.
-		sb, err := LoadAndCheck(conf.RootDir, sbid)
+		fullID := FullID{
+			SandboxID:   sandboxID,
+			ContainerID: sandboxID,
+		}
+		sb, err := Load(conf.RootDir, fullID, LoadOpts{Exact: true})
 		if err != nil {
 			return nil, err
 		}
 		c.Sandbox = sb.Sandbox
-		if err := c.Sandbox.CreateContainer(c.ID); err != nil {
+
+		// If the console control socket file is provided, then create a new
+		// pty master/slave pair and send the TTY to the sandbox process.
+		var tty *os.File
+		if c.ConsoleSocket != "" {
+			// Create a new TTY pair and send the master on the provided socket.
+			var err error
+			tty, err = console.NewWithSocket(c.ConsoleSocket)
+			if err != nil {
+				return nil, fmt.Errorf("setting up console with socket %q: %w", c.ConsoleSocket, err)
+			}
+			// tty file is transferred to the sandbox, then it can be closed here.
+			defer tty.Close()
+		}
+
+		if err := c.Sandbox.CreateContainer(c.ID, tty); err != nil {
 			return nil, err
 		}
 	}
@@ -451,11 +364,16 @@ func (c *Container) Start(conf *config.Config) error {
 		// the start (and all their children processes).
 		if err := runInCgroup(c.Sandbox.Cgroup, func() error {
 			// Create the gofer process.
-			ioFiles, mountsFile, err := c.createGoferProcess(c.Spec, conf, c.BundleDir, false)
+			goferFiles, mountsFile, err := c.createGoferProcess(c.Spec, conf, c.BundleDir, false)
 			if err != nil {
 				return err
 			}
-			defer mountsFile.Close()
+			defer func() {
+				_ = mountsFile.Close()
+				for _, f := range goferFiles {
+					_ = f.Close()
+				}
+			}()
 
 			cleanMounts, err := specutils.ReadMounts(mountsFile)
 			if err != nil {
@@ -463,7 +381,14 @@ func (c *Container) Start(conf *config.Config) error {
 			}
 			c.Spec.Mounts = cleanMounts
 
-			return c.Sandbox.StartContainer(c.Spec, conf, c.ID, ioFiles)
+			// Setup stdios if the container is not using terminal. Otherwise TTY was
+			// already setup in create.
+			var stdios []*os.File
+			if !c.Spec.Process.Terminal {
+				stdios = []*os.File{os.Stdin, os.Stdout, os.Stderr}
+			}
+
+			return c.Sandbox.StartContainer(c.Spec, conf, c.ID, stdios, goferFiles)
 		}); err != nil {
 			return err
 		}
@@ -523,7 +448,7 @@ func (c *Container) Restore(spec *specs.Spec, conf *config.Config, restoreFile s
 }
 
 // Run is a helper that calls Create + Start + Wait.
-func Run(conf *config.Config, args Args) (syscall.WaitStatus, error) {
+func Run(conf *config.Config, args Args) (unix.WaitStatus, error) {
 	log.Debugf("Run container, cid: %s, rootDir: %q", args.ID, conf.RootDir)
 	c, err := New(conf, args)
 	if err != nil {
@@ -565,12 +490,20 @@ func (c *Container) Execute(args *control.ExecArgs) (int32, error) {
 }
 
 // Event returns events for the container.
-func (c *Container) Event() (*boot.Event, error) {
+func (c *Container) Event() (*boot.EventOut, error) {
 	log.Debugf("Getting events for container, cid: %s", c.ID)
 	if err := c.requireStatus("get events for", Created, Running, Paused); err != nil {
 		return nil, err
 	}
-	return c.Sandbox.Event(c.ID)
+	event, err := c.Sandbox.Event(c.ID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Some stats can utilize host cgroups for accuracy.
+	c.populateStats(event)
+
+	return event, nil
 }
 
 // SandboxPid returns the Pid of the sandbox the container is running in, or -1 if the
@@ -585,7 +518,7 @@ func (c *Container) SandboxPid() int {
 // Wait waits for the container to exit, and returns its WaitStatus.
 // Call to wait on a stopped container is needed to retrieve the exit status
 // and wait returns immediately.
-func (c *Container) Wait() (syscall.WaitStatus, error) {
+func (c *Container) Wait() (unix.WaitStatus, error) {
 	log.Debugf("Wait on container, cid: %s", c.ID)
 	ws, err := c.Sandbox.Wait(c.ID)
 	if err == nil {
@@ -597,9 +530,9 @@ func (c *Container) Wait() (syscall.WaitStatus, error) {
 
 // WaitRootPID waits for process 'pid' in the sandbox's PID namespace and
 // returns its WaitStatus.
-func (c *Container) WaitRootPID(pid int32) (syscall.WaitStatus, error) {
+func (c *Container) WaitRootPID(pid int32) (unix.WaitStatus, error) {
 	log.Debugf("Wait on process %d in sandbox, cid: %s", pid, c.Sandbox.ID)
-	if !c.isSandboxRunning() {
+	if !c.IsSandboxRunning() {
 		return 0, fmt.Errorf("sandbox is not running")
 	}
 	return c.Sandbox.WaitPID(c.Sandbox.ID, pid)
@@ -607,9 +540,9 @@ func (c *Container) WaitRootPID(pid int32) (syscall.WaitStatus, error) {
 
 // WaitPID waits for process 'pid' in the container's PID namespace and returns
 // its WaitStatus.
-func (c *Container) WaitPID(pid int32) (syscall.WaitStatus, error) {
+func (c *Container) WaitPID(pid int32) (unix.WaitStatus, error) {
 	log.Debugf("Wait on process %d in container, cid: %s", pid, c.ID)
-	if !c.isSandboxRunning() {
+	if !c.IsSandboxRunning() {
 		return 0, fmt.Errorf("sandbox is not running")
 	}
 	return c.Sandbox.WaitPID(c.ID, pid)
@@ -619,7 +552,7 @@ func (c *Container) WaitPID(pid int32) (syscall.WaitStatus, error) {
 // is SIGKILL, then waits for all processes to exit before returning.
 // SignalContainer returns an error if the container is already stopped.
 // TODO(b/113680494): Distinguish different error types.
-func (c *Container) SignalContainer(sig syscall.Signal, all bool) error {
+func (c *Container) SignalContainer(sig unix.Signal, all bool) error {
 	log.Debugf("Signal container, cid: %s, signal: %v (%d)", c.ID, sig, sig)
 	// Signaling container in Stopped state is allowed. When all=false,
 	// an error will be returned anyway; when all=true, this allows
@@ -629,19 +562,19 @@ func (c *Container) SignalContainer(sig syscall.Signal, all bool) error {
 	if err := c.requireStatus("signal", Running, Stopped); err != nil {
 		return err
 	}
-	if !c.isSandboxRunning() {
+	if !c.IsSandboxRunning() {
 		return fmt.Errorf("sandbox is not running")
 	}
 	return c.Sandbox.SignalContainer(c.ID, sig, all)
 }
 
 // SignalProcess sends sig to a specific process in the container.
-func (c *Container) SignalProcess(sig syscall.Signal, pid int32) error {
+func (c *Container) SignalProcess(sig unix.Signal, pid int32) error {
 	log.Debugf("Signal process %d in container, cid: %s, signal: %v (%d)", pid, c.ID, sig, sig)
 	if err := c.requireStatus("signal a process inside", Running); err != nil {
 		return err
 	}
-	if !c.isSandboxRunning() {
+	if !c.IsSandboxRunning() {
 		return fmt.Errorf("sandbox is not running")
 	}
 	return c.Sandbox.SignalProcess(c.ID, int32(pid), sig, false)
@@ -654,7 +587,7 @@ func (c *Container) ForwardSignals(pid int32, fgProcess bool) func() {
 	log.Debugf("Forwarding all signals to container, cid: %s, PIDPID: %d, fgProcess: %t", c.ID, pid, fgProcess)
 	stop := sighandling.StartSignalForwarding(func(sig linux.Signal) {
 		log.Debugf("Forwarding signal %d to container, cid: %s, PID: %d, fgProcess: %t", sig, c.ID, pid, fgProcess)
-		if err := c.Sandbox.SignalProcess(c.ID, pid, syscall.Signal(sig), fgProcess); err != nil {
+		if err := c.Sandbox.SignalProcess(c.ID, pid, unix.Signal(sig), fgProcess); err != nil {
 			log.Warningf("error forwarding signal %d to container %q: %v", sig, c.ID, err)
 		}
 	})
@@ -836,9 +769,9 @@ func (c *Container) stop() error {
 	// Try killing gofer if it does not exit with container.
 	if c.GoferPid != 0 {
 		log.Debugf("Killing gofer for container, cid: %s, PID: %d", c.ID, c.GoferPid)
-		if err := syscall.Kill(c.GoferPid, syscall.SIGKILL); err != nil {
+		if err := unix.Kill(c.GoferPid, unix.SIGKILL); err != nil {
 			// The gofer may already be stopped, log the error.
-			log.Warningf("Error sending signal %d to gofer %d: %v", syscall.SIGKILL, c.GoferPid, err)
+			log.Warningf("Error sending signal %d to gofer %d: %v", unix.SIGKILL, c.GoferPid, err)
 		}
 	}
 
@@ -860,8 +793,8 @@ func (c *Container) waitForStopped() error {
 	defer cancel()
 	b := backoff.WithContext(backoff.NewConstantBackOff(100*time.Millisecond), ctx)
 	op := func() error {
-		if c.isSandboxRunning() {
-			if err := c.SignalContainer(syscall.Signal(0), false); err == nil {
+		if c.IsSandboxRunning() {
+			if err := c.SignalContainer(unix.Signal(0), false); err == nil {
 				return fmt.Errorf("container is still running")
 			}
 		}
@@ -871,7 +804,7 @@ func (c *Container) waitForStopped() error {
 		if c.goferIsChild {
 			// The gofer process is a child of the current process,
 			// so we can wait it and collect its zombie.
-			wpid, err := syscall.Wait4(int(c.GoferPid), nil, syscall.WNOHANG, nil)
+			wpid, err := unix.Wait4(int(c.GoferPid), nil, unix.WNOHANG, nil)
 			if err != nil {
 				return fmt.Errorf("error waiting the gofer process: %v", err)
 			}
@@ -879,7 +812,7 @@ func (c *Container) waitForStopped() error {
 				return fmt.Errorf("gofer is still running")
 			}
 
-		} else if err := syscall.Kill(c.GoferPid, 0); err == nil {
+		} else if err := unix.Kill(c.GoferPid, 0); err == nil {
 			return fmt.Errorf("gofer is still running")
 		}
 		c.GoferPid = 0
@@ -960,7 +893,7 @@ func (c *Container) createGoferProcess(spec *specs.Spec, conf *config.Config, bu
 
 	sandEnds := make([]*os.File, 0, mountCount)
 	for i := 0; i < mountCount; i++ {
-		fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
+		fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -982,8 +915,8 @@ func (c *Container) createGoferProcess(spec *specs.Spec, conf *config.Config, bu
 	if attached {
 		// The gofer is attached to the lifetime of this process, so it
 		// should synchronously die when this process dies.
-		cmd.SysProcAttr = &syscall.SysProcAttr{
-			Pdeathsig: syscall.SIGKILL,
+		cmd.SysProcAttr = &unix.SysProcAttr{
+			Pdeathsig: unix.SIGKILL,
 		}
 	}
 
@@ -1062,7 +995,8 @@ func (c *Container) changeStatus(s Status) {
 	c.Status = s
 }
 
-func (c *Container) isSandboxRunning() bool {
+// IsSandboxRunning returns true if the sandbox exists and is running.
+func (c *Container) IsSandboxRunning() bool {
 	return c.Sandbox != nil && c.Sandbox.IsRunning()
 }
 
@@ -1180,11 +1114,62 @@ func setOOMScoreAdj(pid int, scoreAdj int) error {
 	}
 	defer f.Close()
 	if _, err := f.WriteString(strconv.Itoa(scoreAdj)); err != nil {
-		if errors.Is(err, syscall.ESRCH) {
+		if errors.Is(err, unix.ESRCH) {
 			log.Warningf("Process (%d) exited while setting oom_score_adj", pid)
 			return nil
 		}
 		return fmt.Errorf("setting oom_score_adj to %q: %v", scoreAdj, err)
 	}
 	return nil
+}
+
+// populateStats populates event with stats estimates based on cgroups and the
+// sentry's accounting.
+// TODO(gvisor.dev/issue/172): This is an estimation; we should do more
+// detailed accounting.
+func (c *Container) populateStats(event *boot.EventOut) {
+	// The events command, when run for all running containers, should
+	// account for the full cgroup CPU usage. We split cgroup usage
+	// proportionally according to the sentry-internal usage measurements,
+	// only counting Running containers.
+	log.Warningf("event.ContainerUsage: %v", event.ContainerUsage)
+	var containerUsage uint64
+	var allContainersUsage uint64
+	for ID, usage := range event.ContainerUsage {
+		allContainersUsage += usage
+		if ID == c.ID {
+			containerUsage = usage
+		}
+	}
+
+	cgroup, err := c.Sandbox.FindCgroup()
+	if err != nil {
+		// No cgroup, so rely purely on the sentry's accounting.
+		log.Warningf("events: no cgroups")
+		event.Event.Data.CPU.Usage.Total = containerUsage
+		return
+	}
+
+	// Get the host cgroup CPU usage.
+	cgroupsUsage, err := cgroup.CPUUsage()
+	if err != nil {
+		// No cgroup usage, so rely purely on the sentry's accounting.
+		log.Warningf("events: failed when getting cgroup CPU usage for container: %v", err)
+		event.Event.Data.CPU.Usage.Total = containerUsage
+		return
+	}
+
+	// If the sentry reports no memory usage, fall back on cgroups and
+	// split usage equally across containers.
+	if allContainersUsage == 0 {
+		log.Warningf("events: no sentry CPU usage reported")
+		allContainersUsage = cgroupsUsage
+		containerUsage = cgroupsUsage / uint64(len(event.ContainerUsage))
+	}
+
+	log.Warningf("%f, %f, %f", containerUsage, cgroupsUsage, allContainersUsage)
+	// Scaling can easily overflow a uint64 (e.g. a containerUsage and
+	// cgroupsUsage of 16 seconds each will overflow), so use floats.
+	event.Event.Data.CPU.Usage.Total = uint64(float64(containerUsage) * (float64(cgroupsUsage) / float64(allContainersUsage)))
+	return
 }

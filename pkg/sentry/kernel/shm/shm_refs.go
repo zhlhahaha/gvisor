@@ -11,7 +11,7 @@ import (
 // stack traces). This is false by default and should only be set to true for
 // debugging purposes, as it can generate an extremely large amount of output
 // and drastically degrade performance.
-const ShmenableLogging = false
+const ShmenableLogging = true
 
 // obj is used to customize logging. Note that we use a pointer to T so that
 // we do not copy the entire object when passed as a format parameter.
@@ -52,11 +52,6 @@ func (r *ShmRefs) LeakMessage() string {
 // LogRefs implements refsvfs2.CheckedObject.LogRefs.
 func (r *ShmRefs) LogRefs() bool {
 	return ShmenableLogging
-}
-
-// EnableLeakCheck enables reference leak checking on r.
-func (r *ShmRefs) EnableLeakCheck() {
-	refsvfs2.Register(r)
 }
 
 // ReadRefs returns the current number of references. The returned count is
@@ -115,7 +110,7 @@ func (r *ShmRefs) TryIncRef() bool {
 func (r *ShmRefs) DecRef(destroy func()) {
 	v := atomic.AddInt64(&r.refCount, -1)
 	if ShmenableLogging {
-		refsvfs2.LogDecRef(r, v+1)
+		refsvfs2.LogDecRef(r, v)
 	}
 	switch {
 	case v < 0:
@@ -132,6 +127,6 @@ func (r *ShmRefs) DecRef(destroy func()) {
 
 func (r *ShmRefs) afterLoad() {
 	if r.ReadRefs() > 0 {
-		r.EnableLeakCheck()
+		refsvfs2.Register(r)
 	}
 }

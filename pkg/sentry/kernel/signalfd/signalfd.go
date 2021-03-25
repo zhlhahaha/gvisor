@@ -106,8 +106,8 @@ func (s *SignalOperations) Read(ctx context.Context, _ *fs.File, dst usermem.IOS
 		Signo:   uint32(info.Signo),
 		Errno:   info.Errno,
 		Code:    info.Code,
-		PID:     uint32(info.Pid()),
-		UID:     uint32(info.Uid()),
+		PID:     uint32(info.PID()),
+		UID:     uint32(info.UID()),
 		Status:  info.Status(),
 		Overrun: uint32(info.Overrun()),
 		Addr:    info.Addr(),
@@ -122,8 +122,8 @@ func (s *SignalOperations) Read(ctx context.Context, _ *fs.File, dst usermem.IOS
 
 // Readiness implements waiter.Waitable.Readiness.
 func (s *SignalOperations) Readiness(mask waiter.EventMask) waiter.EventMask {
-	if mask&waiter.EventIn != 0 && s.target.PendingSignals()&s.Mask() != 0 {
-		return waiter.EventIn // Pending signals.
+	if mask&waiter.ReadableEvents != 0 && s.target.PendingSignals()&s.Mask() != 0 {
+		return waiter.ReadableEvents // Pending signals.
 	}
 	return 0
 }

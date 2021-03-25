@@ -120,9 +120,6 @@ type socketOpsCommon struct {
 	// fixed buffer but only consume this many bytes.
 	sendBufferSize uint32
 
-	// passcred indicates if this socket wants SCM credentials.
-	passcred bool
-
 	// filter indicates that this socket has a BPF filter "installed".
 	//
 	// TODO(gvisor.dev/issue/1119): We don't actually support filtering,
@@ -179,10 +176,10 @@ func (s *socketOpsCommon) Readiness(mask waiter.EventMask) waiter.EventMask {
 	// ep holds messages to be read and thus handles EventIn readiness.
 	ready := s.ep.Readiness(mask)
 
-	if mask&waiter.EventOut == waiter.EventOut {
+	if mask&waiter.WritableEvents != 0 {
 		// sendMsg handles messages synchronously and is thus always
 		// ready for writing.
-		ready |= waiter.EventOut
+		ready |= waiter.WritableEvents
 	}
 
 	return ready
@@ -201,10 +198,7 @@ func (s *socketOpsCommon) EventUnregister(e *waiter.Entry) {
 
 // Passcred implements transport.Credentialer.Passcred.
 func (s *socketOpsCommon) Passcred() bool {
-	s.mu.Lock()
-	passcred := s.passcred
-	s.mu.Unlock()
-	return passcred
+	return s.ep.SocketOptions().GetPassCred()
 }
 
 // ConnectedPasscred implements transport.Credentialer.ConnectedPasscred.
@@ -419,9 +413,7 @@ func (s *socketOpsCommon) SetSockOpt(t *kernel.Task, level int, name int, opt []
 			}
 			passcred := usermem.ByteOrder.Uint32(opt)
 
-			s.mu.Lock()
-			s.passcred = passcred != 0
-			s.mu.Unlock()
+			s.ep.SocketOptions().SetPassCred(passcred != 0)
 			return nil
 
 		case linux.SO_ATTACH_FILTER:
@@ -552,7 +544,7 @@ func (s *socketOpsCommon) RecvMsg(t *kernel.Task, dst usermem.IOSequence, flags 
 	// We'll have to block. Register for notification and keep trying to
 	// receive all the data.
 	e, ch := waiter.NewChannelEntry(nil)
-	s.EventRegister(&e, waiter.EventIn)
+	s.EventRegister(&e, waiter.ReadableEvents)
 	defer s.EventUnregister(&e)
 
 	for {

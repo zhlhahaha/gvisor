@@ -27,11 +27,11 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/cenkalti/backoff"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/log"
 )
@@ -41,22 +41,32 @@ const (
 )
 
 var controllers = map[string]config{
-	"blkio":    config{ctrlr: &blockIO{}},
-	"cpu":      config{ctrlr: &cpu{}},
-	"cpuset":   config{ctrlr: &cpuSet{}},
-	"hugetlb":  config{ctrlr: &hugeTLB{}, optional: true},
-	"memory":   config{ctrlr: &memory{}},
-	"net_cls":  config{ctrlr: &networkClass{}},
-	"net_prio": config{ctrlr: &networkPrio{}},
-	"pids":     config{ctrlr: &pids{}},
+	"blkio":    {ctrlr: &blockIO{}},
+	"cpu":      {ctrlr: &cpu{}},
+	"cpuset":   {ctrlr: &cpuSet{}},
+	"hugetlb":  {ctrlr: &hugeTLB{}, optional: true},
+	"memory":   {ctrlr: &memory{}},
+	"net_cls":  {ctrlr: &networkClass{}},
+	"net_prio": {ctrlr: &networkPrio{}},
+	"pids":     {ctrlr: &pids{}},
 
 	// These controllers either don't have anything in the OCI spec or is
 	// irrelevant for a sandbox.
-	"devices":    config{ctrlr: &noop{}},
-	"freezer":    config{ctrlr: &noop{}},
-	"perf_event": config{ctrlr: &noop{}},
-	"rdma":       config{ctrlr: &noop{}, optional: true},
-	"systemd":    config{ctrlr: &noop{}},
+	"devices":    {ctrlr: &noop{}},
+	"freezer":    {ctrlr: &noop{}},
+	"perf_event": {ctrlr: &noop{}},
+	"rdma":       {ctrlr: &noop{}, optional: true},
+	"systemd":    {ctrlr: &noop{}},
+}
+
+// IsOnlyV2 checks whether cgroups V2 is enabled and V1 is not.
+func IsOnlyV2() bool {
+	var stat unix.Statfs_t
+	if err := unix.Statfs(cgroupRoot, &stat); err != nil {
+		// It's not used for anything important, assume not V2 on failure.
+		return false
+	}
+	return stat.Type == unix.CGROUP2_SUPER_MAGIC
 }
 
 func setOptionalValueInt(path, name string, val *int64) error {
@@ -100,7 +110,7 @@ func setValue(path, name, data string) error {
 		err := ioutil.WriteFile(fullpath, []byte(data), 0700)
 		if err == nil {
 			return nil
-		} else if !errors.Is(err, syscall.EINTR) {
+		} else if !errors.Is(err, unix.EINTR) {
 			return err
 		}
 	}
@@ -150,7 +160,7 @@ func fillFromAncestor(path string) (string, error) {
 		err := ioutil.WriteFile(path, []byte(val), 0700)
 		if err == nil {
 			break
-		} else if !errors.Is(err, syscall.EINTR) {
+		} else if !errors.Is(err, unix.EINTR) {
 			return "", err
 		}
 	}
@@ -203,6 +213,19 @@ func LoadPaths(pid string) (map[string]string, error) {
 }
 
 func loadPathsHelper(cgroup io.Reader) (map[string]string, error) {
+	// For nested containers, in /proc/self/cgroup we see paths from host,
+	// which don't exist in container, so recover the container paths here by
+	// double-checking with /proc/pid/mountinfo
+	mountinfo, err := os.Open("/proc/self/mountinfo")
+	if err != nil {
+		return nil, err
+	}
+	defer mountinfo.Close()
+
+	return loadPathsHelperWithMountinfo(cgroup, mountinfo)
+}
+
+func loadPathsHelperWithMountinfo(cgroup, mountinfo io.Reader) (map[string]string, error) {
 	paths := make(map[string]string)
 
 	scanner := bufio.NewScanner(cgroup)
@@ -225,6 +248,31 @@ func loadPathsHelper(cgroup io.Reader) (map[string]string, error) {
 	if err := scanner.Err(); err != nil {
 		return nil, err
 	}
+
+	mfScanner := bufio.NewScanner(mountinfo)
+	for mfScanner.Scan() {
+		txt := mfScanner.Text()
+		fields := strings.Fields(txt)
+		if len(fields) < 9 || fields[len(fields)-3] != "cgroup" {
+			continue
+		}
+		for _, opt := range strings.Split(fields[len(fields)-1], ",") {
+			// Remove prefix for cgroups with no controller, eg. systemd.
+			opt = strings.TrimPrefix(opt, "name=")
+			if cgroupPath, ok := paths[opt]; ok {
+				root := fields[3]
+				relCgroupPath, err := filepath.Rel(root, cgroupPath)
+				if err != nil {
+					return nil, err
+				}
+				paths[opt] = relCgroupPath
+			}
+		}
+	}
+	if err := mfScanner.Err(); err != nil {
+		return nil, err
+	}
+
 	return paths, nil
 }
 
@@ -234,7 +282,7 @@ func loadPathsHelper(cgroup io.Reader) (map[string]string, error) {
 type Cgroup struct {
 	Name    string            `json:"name"`
 	Parents map[string]string `json:"parents"`
-	Own     bool              `json:"own"`
+	Own     map[string]bool   `json:"own"`
 }
 
 // New creates a new Cgroup instance if the spec includes a cgroup path.
@@ -243,17 +291,24 @@ func New(spec *specs.Spec) (*Cgroup, error) {
 	if spec.Linux == nil || spec.Linux.CgroupsPath == "" {
 		return nil, nil
 	}
+	return NewFromPath(spec.Linux.CgroupsPath)
+}
+
+// NewFromPath creates a new Cgroup instance.
+func NewFromPath(cgroupsPath string) (*Cgroup, error) {
 	var parents map[string]string
-	if !filepath.IsAbs(spec.Linux.CgroupsPath) {
+	if !filepath.IsAbs(cgroupsPath) {
 		var err error
 		parents, err = LoadPaths("self")
 		if err != nil {
 			return nil, fmt.Errorf("finding current cgroups: %w", err)
 		}
 	}
+	own := make(map[string]bool)
 	return &Cgroup{
-		Name:    spec.Linux.CgroupsPath,
+		Name:    cgroupsPath,
 		Parents: parents,
+		Own:     own,
 	}, nil
 }
 
@@ -261,17 +316,7 @@ func New(spec *specs.Spec) (*Cgroup, error) {
 // already exists, it means that the caller has already provided a
 // pre-configured cgroups, and 'res' is ignored.
 func (c *Cgroup) Install(res *specs.LinuxResources) error {
-	if _, err := os.Stat(c.makePath("memory")); err == nil {
-		// If cgroup has already been created; it has been setup by caller. Don't
-		// make any changes to configuration, just join when sandbox/gofer starts.
-		log.Debugf("Using pre-created cgroup %q", c.Name)
-		return nil
-	}
-
 	log.Debugf("Creating cgroup %q", c.Name)
-
-	// Mark that cgroup resources are owned by me.
-	c.Own = true
 
 	// The Cleanup object cleans up partially created cgroups when an error occurs.
 	// Errors occuring during cleanup itself are ignored.
@@ -280,8 +325,18 @@ func (c *Cgroup) Install(res *specs.LinuxResources) error {
 
 	for key, cfg := range controllers {
 		path := c.makePath(key)
+		if _, err := os.Stat(path); err == nil {
+			// If cgroup has already been created; it has been setup by caller. Don't
+			// make any changes to configuration, just join when sandbox/gofer starts.
+			log.Debugf("Using pre-created cgroup %q", path)
+			continue
+		}
+
+		// Mark that cgroup resources are owned by me.
+		c.Own[key] = true
+
 		if err := os.MkdirAll(path, 0755); err != nil {
-			if cfg.optional && errors.Is(err, syscall.EROFS) {
+			if cfg.optional && errors.Is(err, unix.EROFS) {
 				log.Infof("Skipping cgroup %q", key)
 				continue
 			}
@@ -298,12 +353,12 @@ func (c *Cgroup) Install(res *specs.LinuxResources) error {
 // Uninstall removes the settings done in Install(). If cgroup path already
 // existed when Install() was called, Uninstall is a noop.
 func (c *Cgroup) Uninstall() error {
-	if !c.Own {
-		// cgroup is managed by caller, don't touch it.
-		return nil
-	}
 	log.Debugf("Deleting cgroup %q", c.Name)
 	for key := range controllers {
+		if !c.Own[key] {
+			// cgroup is managed by caller, don't touch it.
+			continue
+		}
 		path := c.makePath(key)
 		log.Debugf("Removing cgroup controller for key=%q path=%q", key, path)
 
@@ -314,7 +369,7 @@ func (c *Cgroup) Uninstall() error {
 		defer cancel()
 		b := backoff.WithContext(backoff.NewConstantBackOff(100*time.Millisecond), ctx)
 		fn := func() error {
-			err := syscall.Rmdir(path)
+			err := unix.Rmdir(path)
 			if os.IsNotExist(err) {
 				return nil
 			}
@@ -349,6 +404,9 @@ func (c *Cgroup) Join() (func(), error) {
 	undo = func() {
 		for _, path := range undoPaths {
 			log.Debugf("Restoring cgroup %q", path)
+			// Writing the value 0 to a cgroup.procs file causes
+			// the writing process to be moved to the corresponding
+			// cgroup. - cgroups(7).
 			if err := setValue(path, "cgroup.procs", "0"); err != nil {
 				log.Warningf("Error restoring cgroup %q: %v", path, err)
 			}
@@ -359,6 +417,9 @@ func (c *Cgroup) Join() (func(), error) {
 	for key, cfg := range controllers {
 		path := c.makePath(key)
 		log.Debugf("Joining cgroup %q", path)
+		// Writing the value 0 to a cgroup.procs file causes the
+		// writing process to be moved to the corresponding cgroup.
+		// - cgroups(7).
 		if err := setValue(path, "cgroup.procs", "0"); err != nil {
 			if cfg.optional && os.IsNotExist(err) {
 				continue
@@ -369,6 +430,7 @@ func (c *Cgroup) Join() (func(), error) {
 	return undo, nil
 }
 
+// CPUQuota returns the CFS CPU quota.
 func (c *Cgroup) CPUQuota() (float64, error) {
 	path := c.makePath("cpu")
 	quota, err := getInt(path, "cpu.cfs_quota_us")
@@ -383,6 +445,16 @@ func (c *Cgroup) CPUQuota() (float64, error) {
 		return -1, err
 	}
 	return float64(quota) / float64(period), nil
+}
+
+// CPUUsage returns the total CPU usage of the cgroup.
+func (c *Cgroup) CPUUsage() (uint64, error) {
+	path := c.makePath("cpuacct")
+	usage, err := getValue(path, "cpuacct.usage")
+	if err != nil {
+		return 0, err
+	}
+	return strconv.ParseUint(strings.TrimSpace(usage), 10, 64)
 }
 
 // NumCPU returns the number of CPUs configured in 'cpuset/cpuset.cpus'.

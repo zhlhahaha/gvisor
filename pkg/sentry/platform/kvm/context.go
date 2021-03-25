@@ -18,10 +18,10 @@ import (
 	"sync/atomic"
 
 	pkgcontext "gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/ring0"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/platform/interrupt"
-	"gvisor.dev/gvisor/pkg/sentry/platform/ring0"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
@@ -65,7 +65,7 @@ func (c *context) Switch(ctx pkgcontext.Context, mm platform.MemoryManager, ac a
 	// Prepare switch options.
 	switchOpts := ring0.SwitchOpts{
 		Registers:          &ac.StateData().Regs,
-		FloatingPointState: (*byte)(ac.FloatingPointData()),
+		FloatingPointState: ac.FloatingPointData(),
 		PageTables:         localAS.pageTables,
 		Flush:              localAS.Touch(cpu),
 		FullRestore:        ac.FullRestore(),

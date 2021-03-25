@@ -130,9 +130,8 @@ func submitCallback(t *kernel.Task, id uint64, cb *linux.IOCallback, cbAddr user
 	if !ok {
 		return syserror.EINVAL
 	}
-	if ready := aioCtx.Prepare(); !ready {
-		// Context is busy.
-		return syserror.EAGAIN
+	if err := aioCtx.Prepare(); err != nil {
+		return err
 	}
 
 	if eventFD != nil {
@@ -178,7 +177,7 @@ func getAIOCallback(t *kernel.Task, fd, eventFD *vfs.FileDescription, cbAddr use
 
 		// Update the result.
 		if err != nil {
-			err = slinux.HandleIOErrorVFS2(t, ev.Result != 0 /* partial */, err, nil /* never interrupted */, "aio", fd)
+			err = slinux.HandleIOErrorVFS2(ctx, ev.Result != 0 /* partial */, err, nil /* never interrupted */, "aio", fd)
 			ev.Result = -int64(kernel.ExtractErrno(err, 0))
 		}
 

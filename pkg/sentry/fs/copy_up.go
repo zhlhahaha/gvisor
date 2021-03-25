@@ -303,17 +303,18 @@ func copyUpLocked(ctx context.Context, parent *Dirent, next *Dirent) error {
 
 	// Take a reference on the upper Inode (transferred to
 	// next.Inode.overlay.upper) and make new translations use it.
-	next.Inode.overlay.dataMu.Lock()
+	overlay := next.Inode.overlay
+	overlay.dataMu.Lock()
 	childUpperInode.IncRef()
-	next.Inode.overlay.upper = childUpperInode
-	next.Inode.overlay.dataMu.Unlock()
+	overlay.upper = childUpperInode
+	overlay.dataMu.Unlock()
 
 	// Invalidate existing translations through the lower Inode.
-	next.Inode.overlay.mappings.InvalidateAll(memmap.InvalidateOpts{})
+	overlay.mappings.InvalidateAll(memmap.InvalidateOpts{})
 
 	// Remove existing memory mappings from the lower Inode.
 	if lowerMappable != nil {
-		for seg := next.Inode.overlay.mappings.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
+		for seg := overlay.mappings.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
 			for m := range seg.Value() {
 				lowerMappable.RemoveMapping(ctx, m.MappingSpace, m.AddrRange, seg.Start(), m.Writable)
 			}
@@ -336,7 +337,12 @@ func cleanupUpper(ctx context.Context, parent *Inode, name string, copyUpErr err
 
 // copyUpBuffers is a buffer pool for copying file content. The buffer
 // size is the same used by io.Copy.
-var copyUpBuffers = sync.Pool{New: func() interface{} { return make([]byte, 8*usermem.PageSize) }}
+var copyUpBuffers = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 8*usermem.PageSize)
+		return &b
+	},
+}
 
 // copyContentsLocked copies the contents of lower to upper. It panics if
 // less than size bytes can be copied.
@@ -361,7 +367,7 @@ func copyContentsLocked(ctx context.Context, upper *Inode, lower *Inode, size in
 	defer lowerFile.DecRef(ctx)
 
 	// Use a buffer pool to minimize allocations.
-	buf := copyUpBuffers.Get().([]byte)
+	buf := copyUpBuffers.Get().(*[]byte)
 	defer copyUpBuffers.Put(buf)
 
 	// Transfer the contents.
@@ -371,7 +377,7 @@ func copyContentsLocked(ctx context.Context, upper *Inode, lower *Inode, size in
 	// optimizations could be self-defeating. So we leave this as simple as possible.
 	var offset int64
 	for {
-		nr, err := lowerFile.FileOperations.Read(ctx, lowerFile, usermem.BytesIOSequence(buf), offset)
+		nr, err := lowerFile.FileOperations.Read(ctx, lowerFile, usermem.BytesIOSequence(*buf), offset)
 		if err != nil && err != io.EOF {
 			return err
 		}
@@ -383,7 +389,7 @@ func copyContentsLocked(ctx context.Context, upper *Inode, lower *Inode, size in
 			}
 			return nil
 		}
-		nw, err := upperFile.FileOperations.Write(ctx, upperFile, usermem.BytesIOSequence(buf[:nr]), offset)
+		nw, err := upperFile.FileOperations.Write(ctx, upperFile, usermem.BytesIOSequence((*buf)[:nr]), offset)
 		if err != nil {
 			return err
 		}

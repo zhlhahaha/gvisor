@@ -22,9 +22,11 @@ import (
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
+	"gvisor.dev/gvisor/pkg/tcpip/ports"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
+// +checklocks:e.mu
 func (e *endpoint) drainSegmentLocked() {
 	// Drain only up to once.
 	if e.drainDone != nil {
@@ -55,9 +57,11 @@ func (e *endpoint) beforeSave() {
 	case epState.connected() || epState.handshake():
 		if !e.route.HasSaveRestoreCapability() {
 			if !e.route.HasDisconncetOkCapability() {
-				panic(tcpip.ErrSaveRejection{fmt.Errorf("endpoint cannot be saved in connected state: local %v:%d, remote %v:%d", e.ID.LocalAddress, e.ID.LocalPort, e.ID.RemoteAddress, e.ID.RemotePort)})
+				panic(&tcpip.ErrSaveRejection{
+					Err: fmt.Errorf("endpoint cannot be saved in connected state: local %s:%d, remote %s:%d", e.ID.LocalAddress, e.ID.LocalPort, e.ID.RemoteAddress, e.ID.RemotePort),
+				})
 			}
-			e.resetConnectionLocked(tcpip.ErrConnectionAborted)
+			e.resetConnectionLocked(&tcpip.ErrConnectionAborted{})
 			e.mu.Unlock()
 			e.Close()
 			e.mu.Lock()
@@ -179,14 +183,16 @@ func (e *endpoint) afterLoad() {
 // Resume implements tcpip.ResumableEndpoint.Resume.
 func (e *endpoint) Resume(s *stack.Stack) {
 	e.stack = s
+	e.ops.InitHandler(e, e.stack, GetTCPSendBufferLimits)
 	e.segmentQueue.thaw()
 	epState := e.origEndpointState
 	switch epState {
 	case StateInitial, StateBound, StateListen, StateConnecting, StateEstablished:
 		var ss tcpip.TCPSendBufferSizeRangeOption
 		if err := e.stack.TransportProtocolOption(ProtocolNumber, &ss); err == nil {
-			if e.sndBufSize < ss.Min || e.sndBufSize > ss.Max {
-				panic(fmt.Sprintf("endpoint.sndBufSize %d is outside the min and max allowed [%d, %d]", e.sndBufSize, ss.Min, ss.Max))
+			sendBufferSize := e.getSendBufferSize()
+			if sendBufferSize < ss.Min || sendBufferSize > ss.Max {
+				panic(fmt.Sprintf("endpoint sendBufferSize %d is outside the min and max allowed [%d, %d]", sendBufferSize, ss.Min, ss.Max))
 			}
 		}
 
@@ -203,7 +209,16 @@ func (e *endpoint) Resume(s *stack.Stack) {
 		if err != nil {
 			panic("unable to parse BindAddr: " + err.String())
 		}
-		if ok := e.stack.ReserveTuple(e.effectiveNetProtos, ProtocolNumber, addr.Addr, addr.Port, e.boundPortFlags, e.boundBindToDevice, e.boundDest); !ok {
+		portRes := ports.Reservation{
+			Networks:     e.effectiveNetProtos,
+			Transport:    ProtocolNumber,
+			Addr:         addr.Addr,
+			Port:         addr.Port,
+			Flags:        e.boundPortFlags,
+			BindToDevice: e.boundBindToDevice,
+			Dest:         e.boundDest,
+		}
+		if ok := e.stack.ReserveTuple(portRes); !ok {
 			panic(fmt.Sprintf("unable to re-reserve tuple (%v, %q, %d, %+v, %d, %v)", e.effectiveNetProtos, addr.Addr, addr.Port, e.boundPortFlags, e.boundBindToDevice, e.boundDest))
 		}
 		e.isPortReserved = true
@@ -228,7 +243,8 @@ func (e *endpoint) Resume(s *stack.Stack) {
 		// Reset the scoreboard to reinitialize the sack information as
 		// we do not restore SACK information.
 		e.scoreboard.Reset()
-		if err := e.connect(tcpip.FullAddress{NIC: e.boundNICID, Addr: e.connectingAddress, Port: e.ID.RemotePort}, false, e.workerRunning); err != tcpip.ErrConnectStarted {
+		err := e.connect(tcpip.FullAddress{NIC: e.boundNICID, Addr: e.connectingAddress, Port: e.ID.RemotePort}, false, e.workerRunning)
+		if _, ok := err.(*tcpip.ErrConnectStarted); !ok {
 			panic("endpoint connecting failed: " + err.String())
 		}
 		e.mu.Lock()
@@ -265,7 +281,8 @@ func (e *endpoint) Resume(s *stack.Stack) {
 			connectedLoading.Wait()
 			listenLoading.Wait()
 			bind()
-			if err := e.Connect(tcpip.FullAddress{NIC: e.boundNICID, Addr: e.connectingAddress, Port: e.ID.RemotePort}); err != tcpip.ErrConnectStarted {
+			err := e.Connect(tcpip.FullAddress{NIC: e.boundNICID, Addr: e.connectingAddress, Port: e.ID.RemotePort})
+			if _, ok := err.(*tcpip.ErrConnectStarted); !ok {
 				panic("endpoint connecting failed: " + err.String())
 			}
 			connectingLoading.Done()
@@ -292,24 +309,6 @@ func (e *endpoint) Resume(s *stack.Stack) {
 	}
 }
 
-// saveLastError is invoked by stateify.
-func (e *endpoint) saveLastError() string {
-	if e.lastError == nil {
-		return ""
-	}
-
-	return e.lastError.String()
-}
-
-// loadLastError is invoked by stateify.
-func (e *endpoint) loadLastError(s string) {
-	if s == "" {
-		return
-	}
-
-	e.lastError = tcpip.StringToError(s)
-}
-
 // saveRecentTSTime is invoked by stateify.
 func (e *endpoint) saveRecentTSTime() unixTime {
 	return unixTime{e.recentTSTime.Unix(), e.recentTSTime.UnixNano()}
@@ -320,22 +319,14 @@ func (e *endpoint) loadRecentTSTime(unix unixTime) {
 	e.recentTSTime = time.Unix(unix.second, unix.nano)
 }
 
-// saveHardError is invoked by stateify.
-func (e *EndpointInfo) saveHardError() string {
-	if e.HardError == nil {
-		return ""
-	}
-
-	return e.HardError.String()
+// saveLastOutOfWindowAckTime is invoked by stateify.
+func (e *endpoint) saveLastOutOfWindowAckTime() unixTime {
+	return unixTime{e.lastOutOfWindowAckTime.Unix(), e.lastOutOfWindowAckTime.UnixNano()}
 }
 
-// loadHardError is invoked by stateify.
-func (e *EndpointInfo) loadHardError(s string) {
-	if s == "" {
-		return
-	}
-
-	e.HardError = tcpip.StringToError(s)
+// loadLastOutOfWindowAckTime is invoked by stateify.
+func (e *endpoint) loadLastOutOfWindowAckTime(unix unixTime) {
+	e.lastOutOfWindowAckTime = time.Unix(unix.second, unix.nano)
 }
 
 // saveMeasureTime is invoked by stateify.

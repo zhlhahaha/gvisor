@@ -21,6 +21,7 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/fspath"
+	"gvisor.dev/gvisor/pkg/sentry/fsmetric"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/socket/unix/transport"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -152,7 +153,10 @@ func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, dir
 	if err != nil {
 		return err
 	}
-	if err := parentDir.inode.checkPermissions(rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
+
+	// Order of checks is important. First check if parent directory can be
+	// executed, then check for existence, and lastly check if mount is writable.
+	if err := parentDir.inode.checkPermissions(rp.Credentials(), vfs.MayExec); err != nil {
 		return err
 	}
 	name := rp.Component()
@@ -178,6 +182,10 @@ func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, dir
 		return err
 	}
 	defer mnt.EndWrite()
+
+	if err := parentDir.inode.checkPermissions(rp.Credentials(), vfs.MayWrite); err != nil {
+		return err
+	}
 	if err := create(parentDir, name); err != nil {
 		return err
 	}
@@ -269,7 +277,7 @@ func (fs *filesystem) MkdirAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 			return syserror.EMLINK
 		}
 		parentDir.inode.incLinksLocked() // from child's ".."
-		childDir := fs.newDirectory(creds.EffectiveKUID, creds.EffectiveKGID, opts.Mode)
+		childDir := fs.newDirectory(creds.EffectiveKUID, creds.EffectiveKGID, opts.Mode, parentDir)
 		parentDir.insertChildLocked(&childDir.dentry, name)
 		return nil
 	})
@@ -282,15 +290,15 @@ func (fs *filesystem) MknodAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 		var childInode *inode
 		switch opts.Mode.FileType() {
 		case linux.S_IFREG:
-			childInode = fs.newRegularFile(creds.EffectiveKUID, creds.EffectiveKGID, opts.Mode)
+			childInode = fs.newRegularFile(creds.EffectiveKUID, creds.EffectiveKGID, opts.Mode, parentDir)
 		case linux.S_IFIFO:
-			childInode = fs.newNamedPipe(creds.EffectiveKUID, creds.EffectiveKGID, opts.Mode)
+			childInode = fs.newNamedPipe(creds.EffectiveKUID, creds.EffectiveKGID, opts.Mode, parentDir)
 		case linux.S_IFBLK:
-			childInode = fs.newDeviceFile(creds.EffectiveKUID, creds.EffectiveKGID, opts.Mode, vfs.BlockDevice, opts.DevMajor, opts.DevMinor)
+			childInode = fs.newDeviceFile(creds.EffectiveKUID, creds.EffectiveKGID, opts.Mode, vfs.BlockDevice, opts.DevMajor, opts.DevMinor, parentDir)
 		case linux.S_IFCHR:
-			childInode = fs.newDeviceFile(creds.EffectiveKUID, creds.EffectiveKGID, opts.Mode, vfs.CharDevice, opts.DevMajor, opts.DevMinor)
+			childInode = fs.newDeviceFile(creds.EffectiveKUID, creds.EffectiveKGID, opts.Mode, vfs.CharDevice, opts.DevMajor, opts.DevMinor, parentDir)
 		case linux.S_IFSOCK:
-			childInode = fs.newSocketFile(creds.EffectiveKUID, creds.EffectiveKGID, opts.Mode, opts.Endpoint)
+			childInode = fs.newSocketFile(creds.EffectiveKUID, creds.EffectiveKGID, opts.Mode, opts.Endpoint, parentDir)
 		default:
 			return syserror.EINVAL
 		}
@@ -379,8 +387,10 @@ afterTrailingSymlink:
 		defer rp.Mount().EndWrite()
 		// Create and open the child.
 		creds := rp.Credentials()
-		child := fs.newDentry(fs.newRegularFile(creds.EffectiveKUID, creds.EffectiveKGID, opts.Mode))
+		child := fs.newDentry(fs.newRegularFile(creds.EffectiveKUID, creds.EffectiveKGID, opts.Mode, parentDir))
 		parentDir.insertChildLocked(child, name)
+		child.IncRef()
+		defer child.DecRef(ctx)
 		unlock()
 		fd, err := child.open(ctx, rp, &opts, true)
 		if err != nil {
@@ -436,6 +446,11 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 			if _, err := impl.truncate(0); err != nil {
 				return nil, err
 			}
+		}
+		if fd.vfsfd.IsWritable() {
+			fsmetric.TmpfsOpensW.Increment()
+		} else if fd.vfsfd.IsReadable() {
+			fsmetric.TmpfsOpensRO.Increment()
 		}
 		return &fd.vfsfd, nil
 	case *directory:
@@ -712,7 +727,7 @@ func (fs *filesystem) StatFSAt(ctx context.Context, rp *vfs.ResolvingPath) (linu
 func (fs *filesystem) SymlinkAt(ctx context.Context, rp *vfs.ResolvingPath, target string) error {
 	return fs.doCreateAt(ctx, rp, false /* dir */, func(parentDir *directory, name string) error {
 		creds := rp.Credentials()
-		child := fs.newDentry(fs.newSymlink(creds.EffectiveKUID, creds.EffectiveKGID, 0777, target))
+		child := fs.newDentry(fs.newSymlink(creds.EffectiveKUID, creds.EffectiveKGID, 0777, target, parentDir))
 		parentDir.insertChildLocked(child, name)
 		return nil
 	})
@@ -882,4 +897,9 @@ func (fs *filesystem) PrependPath(ctx context.Context, vfsroot, vd vfs.VirtualDe
 		b.PrependComponent(d.name)
 		d = d.parent
 	}
+}
+
+// MountOptions implements vfs.FilesystemImpl.MountOptions.
+func (fs *filesystem) MountOptions() string {
+	return fs.mopts
 }

@@ -17,6 +17,7 @@
 package netfilter
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 
@@ -205,7 +206,7 @@ func SetEntries(stk *stack.Stack, optVal []byte, ipv6 bool) *syserr.Error {
 
 	// Go through the list of supported hooks for this table and, for each
 	// one, set the rule it corresponds to.
-	for hook, _ := range replace.HookEntry {
+	for hook := range replace.HookEntry {
 		if table.ValidHooks()&(1<<hook) != 0 {
 			hk := hookFromLinux(hook)
 			table.BuiltinChains[hk] = stack.HookUnset
@@ -392,4 +393,12 @@ func TargetRevision(t *kernel.Task, revPtr usermem.Addr, netProto tcpip.NetworkP
 	}
 	rev.Revision = maxSupported
 	return rev, nil
+}
+
+func trimNullBytes(b []byte) []byte {
+	n := bytes.IndexByte(b, 0)
+	if n == -1 {
+		n = len(b)
+	}
+	return b[:n]
 }

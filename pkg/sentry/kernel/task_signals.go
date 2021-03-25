@@ -619,9 +619,6 @@ func (t *Task) setSignalMaskLocked(mask linux.SignalSet) {
 				return
 			}
 		})
-		// We have to re-issue the interrupt consumed by t.interrupted() since
-		// it might have been for a different reason.
-		t.interruptSelf()
 	}
 
 	// Conversely, if the new mask unblocks any signals that were blocked by
@@ -917,8 +914,8 @@ func (t *Task) signalStop(target *Task, code int32, status int32) {
 			Signo: int32(linux.SIGCHLD),
 			Code:  code,
 		}
-		sigchld.SetPid(int32(t.tg.pidns.tids[target]))
-		sigchld.SetUid(int32(target.Credentials().RealKUID.In(t.UserNamespace()).OrOverflow()))
+		sigchld.SetPID(int32(t.tg.pidns.tids[target]))
+		sigchld.SetUID(int32(target.Credentials().RealKUID.In(t.UserNamespace()).OrOverflow()))
 		sigchld.SetStatus(status)
 		// TODO(b/72102453): Set utime, stime.
 		t.sendSignalLocked(sigchld, true /* group */)
@@ -931,10 +928,10 @@ func (t *Task) signalStop(target *Task, code int32, status int32) {
 type runInterrupt struct{}
 
 func (*runInterrupt) execute(t *Task) taskRunState {
-	// Interrupts are de-duplicated (if t is interrupted twice before
-	// t.interrupted() is called, t.interrupted() will only return true once),
-	// so early exits from this function must re-enter the runInterrupt state
-	// to check for more interrupt-signaled conditions.
+	// Interrupts are de-duplicated (t.unsetInterrupted() will undo the effect
+	// of all previous calls to t.interrupted() regardless of how many such
+	// calls there have been), so early exits from this function must re-enter
+	// the runInterrupt state to check for more interrupt-signaled conditions.
 
 	t.tg.signalHandlers.mu.Lock()
 
@@ -1025,8 +1022,8 @@ func (*runInterrupt) execute(t *Task) taskRunState {
 					Signo: int32(sig),
 					Code:  t.ptraceCode,
 				}
-				t.ptraceSiginfo.SetPid(int32(t.tg.pidns.tids[t]))
-				t.ptraceSiginfo.SetUid(int32(t.Credentials().RealKUID.In(t.UserNamespace()).OrOverflow()))
+				t.ptraceSiginfo.SetPID(int32(t.tg.pidns.tids[t]))
+				t.ptraceSiginfo.SetUID(int32(t.Credentials().RealKUID.In(t.UserNamespace()).OrOverflow()))
 			} else {
 				t.ptraceCode = int32(sig)
 				t.ptraceSiginfo = nil
@@ -1080,6 +1077,7 @@ func (*runInterrupt) execute(t *Task) taskRunState {
 		return t.deliverSignal(info, act)
 	}
 
+	t.unsetInterrupted()
 	t.tg.signalHandlers.mu.Unlock()
 	return (*runApp)(nil)
 }
@@ -1116,11 +1114,11 @@ func (*runInterruptAfterSignalDeliveryStop) execute(t *Task) taskRunState {
 		if parent == nil {
 			// Tracer has detached and t was created by Kernel.CreateProcess().
 			// Pretend the parent is in an ancestor PID + user namespace.
-			info.SetPid(0)
-			info.SetUid(int32(auth.OverflowUID))
+			info.SetPID(0)
+			info.SetUID(int32(auth.OverflowUID))
 		} else {
-			info.SetPid(int32(t.tg.pidns.tids[parent]))
-			info.SetUid(int32(parent.Credentials().RealKUID.In(t.UserNamespace()).OrOverflow()))
+			info.SetPID(int32(t.tg.pidns.tids[parent]))
+			info.SetUID(int32(parent.Credentials().RealKUID.In(t.UserNamespace()).OrOverflow()))
 		}
 	}
 	t.tg.signalHandlers.mu.Lock()

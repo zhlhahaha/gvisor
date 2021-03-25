@@ -109,14 +109,6 @@ const (
 	//
 	// Default taken from MAX_NEIGHBOR_ADVERTISEMENT of RFC 4861 section 10.
 	defaultMaxReachbilityConfirmations = 3
-
-	// defaultUnreachableTime is the default duration for how long an entry will
-	// remain in the FAILED state before being removed from the neighbor cache.
-	//
-	// Note, there is no equivalent protocol constant defined in RFC 4861. It
-	// leaves the specifics of any garbage collection mechanism up to the
-	// implementation.
-	defaultUnreachableTime = 5 * time.Second
 )
 
 // NUDDispatcher is the interface integrators of netstack must implement to
@@ -167,25 +159,6 @@ type ReachabilityConfirmationFlags struct {
 
 	// IsRouter indicates that the sender is a router.
 	IsRouter bool
-}
-
-// NUDHandler communicates external events to the Neighbor Unreachability
-// Detection state machine, which is implemented per-interface. This is used by
-// network endpoints to inform the Neighbor Cache of probes and confirmations.
-type NUDHandler interface {
-	// HandleProbe processes an incoming neighbor probe (e.g. ARP request or
-	// Neighbor Solicitation for ARP or NDP, respectively). Validation of the
-	// probe needs to be performed before calling this function since the
-	// Neighbor Cache doesn't have access to view the NIC's assigned addresses.
-	HandleProbe(remoteAddr tcpip.Address, protocol tcpip.NetworkProtocolNumber, remoteLinkAddr tcpip.LinkAddress, linkRes LinkAddressResolver)
-
-	// HandleConfirmation processes an incoming neighbor confirmation (e.g. ARP
-	// reply or Neighbor Advertisement for ARP or NDP, respectively).
-	HandleConfirmation(addr tcpip.Address, linkAddr tcpip.LinkAddress, flags ReachabilityConfirmationFlags)
-
-	// HandleUpperLevelConfirmation processes an incoming upper-level protocol
-	// (e.g. TCP acknowledgements) reachability confirmation.
-	HandleUpperLevelConfirmation(addr tcpip.Address)
 }
 
 // NUDConfigurations is the NUD configurations for the netstack. This is used
@@ -278,10 +251,6 @@ type NUDConfigurations struct {
 	// TODO(gvisor.dev/issue/2246): Discuss if implementation of this NUD
 	// configuration option is necessary.
 	MaxReachabilityConfirmations uint32
-
-	// UnreachableTime describes how long an entry will remain in the FAILED
-	// state before being removed from the neighbor cache.
-	UnreachableTime time.Duration
 }
 
 // DefaultNUDConfigurations returns a NUDConfigurations populated with default
@@ -299,7 +268,6 @@ func DefaultNUDConfigurations() NUDConfigurations {
 		MaxUnicastProbes:             defaultMaxUnicastProbes,
 		MaxAnycastDelayTime:          defaultMaxAnycastDelayTime,
 		MaxReachabilityConfirmations: defaultMaxReachbilityConfirmations,
-		UnreachableTime:              defaultUnreachableTime,
 	}
 }
 
@@ -328,9 +296,6 @@ func (c *NUDConfigurations) resetInvalidFields() {
 	}
 	if c.MaxUnicastProbes == 0 {
 		c.MaxUnicastProbes = defaultMaxUnicastProbes
-	}
-	if c.UnreachableTime == 0 {
-		c.UnreachableTime = defaultUnreachableTime
 	}
 }
 
@@ -416,7 +381,7 @@ func (s *NUDState) ReachableTime() time.Duration {
 		s.config.BaseReachableTime != s.prevBaseReachableTime ||
 		s.config.MinRandomFactor != s.prevMinRandomFactor ||
 		s.config.MaxRandomFactor != s.prevMaxRandomFactor {
-		return s.recomputeReachableTimeLocked()
+		s.recomputeReachableTimeLocked()
 	}
 	return s.reachableTime
 }
@@ -442,7 +407,7 @@ func (s *NUDState) ReachableTime() time.Duration {
 //    random value gets re-computed at least once every few hours.
 //
 // s.mu MUST be locked for writing.
-func (s *NUDState) recomputeReachableTimeLocked() time.Duration {
+func (s *NUDState) recomputeReachableTimeLocked() {
 	s.prevBaseReachableTime = s.config.BaseReachableTime
 	s.prevMinRandomFactor = s.config.MinRandomFactor
 	s.prevMaxRandomFactor = s.config.MaxRandomFactor
@@ -462,5 +427,4 @@ func (s *NUDState) recomputeReachableTimeLocked() time.Duration {
 	}
 
 	s.expiration = time.Now().Add(2 * time.Hour)
-	return s.reachableTime
 }

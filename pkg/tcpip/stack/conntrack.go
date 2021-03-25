@@ -142,19 +142,19 @@ func (cn *conn) timedOut(now time.Time) bool {
 
 // update the connection tracking state.
 //
-// Precondition: ct.mu must be held.
-func (ct *conn) updateLocked(tcpHeader header.TCP, hook Hook) {
+// Precondition: cn.mu must be held.
+func (cn *conn) updateLocked(tcpHeader header.TCP, hook Hook) {
 	// Update the state of tcb. tcb assumes it's always initialized on the
 	// client. However, we only need to know whether the connection is
 	// established or not, so the client/server distinction isn't important.
 	// TODO(gvisor.dev/issue/170): Add support in tcpconntrack to handle
 	// other tcp states.
-	if ct.tcb.IsEmpty() {
-		ct.tcb.Init(tcpHeader)
-	} else if hook == ct.tcbHook {
-		ct.tcb.UpdateStateOutbound(tcpHeader)
+	if cn.tcb.IsEmpty() {
+		cn.tcb.Init(tcpHeader)
+	} else if hook == cn.tcbHook {
+		cn.tcb.UpdateStateOutbound(tcpHeader)
 	} else {
-		ct.tcb.UpdateStateInbound(tcpHeader)
+		cn.tcb.UpdateStateInbound(tcpHeader)
 	}
 }
 
@@ -198,15 +198,15 @@ type bucket struct {
 // TCP header.
 //
 // Preconditions: pkt.NetworkHeader() is valid.
-func packetToTupleID(pkt *PacketBuffer) (tupleID, *tcpip.Error) {
+func packetToTupleID(pkt *PacketBuffer) (tupleID, tcpip.Error) {
 	netHeader := pkt.Network()
 	if netHeader.TransportProtocol() != header.TCPProtocolNumber {
-		return tupleID{}, tcpip.ErrUnknownProtocol
+		return tupleID{}, &tcpip.ErrUnknownProtocol{}
 	}
 
 	tcpHeader := header.TCP(pkt.TransportHeader().View())
 	if len(tcpHeader) < header.TCPMinimumSize {
-		return tupleID{}, tcpip.ErrUnknownProtocol
+		return tupleID{}, &tcpip.ErrUnknownProtocol{}
 	}
 
 	return tupleID{
@@ -229,6 +229,12 @@ func newConn(orig, reply tupleID, manip manipType, hook Hook) *conn {
 	conn.original = tuple{conn: &conn, tupleID: orig}
 	conn.reply = tuple{conn: &conn, tupleID: reply, direction: dirReply}
 	return &conn
+}
+
+func (ct *ConnTrack) init() {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	ct.buckets = make([]bucket, numBuckets)
 }
 
 // connFor gets the conn for pkt if it exists, or returns nil
@@ -401,12 +407,12 @@ func handlePacketOutput(pkt *PacketBuffer, conn *conn, gso *GSO, r *Route, dir d
 
 	// Calculate the TCP checksum and set it.
 	tcpHeader.SetChecksum(0)
-	length := uint16(len(tcpHeader) + pkt.Data.Size())
+	length := uint16(len(tcpHeader) + pkt.Data().Size())
 	xsum := header.PseudoHeaderChecksum(header.TCPProtocolNumber, netHeader.SourceAddress(), netHeader.DestinationAddress(), length)
 	if gso != nil && gso.NeedsCsum {
 		tcpHeader.SetChecksum(xsum)
 	} else if r.RequiresTXTransportChecksum() {
-		xsum = header.ChecksumVV(pkt.Data, xsum)
+		xsum = header.ChecksumCombine(xsum, pkt.Data().AsRange().Checksum())
 		tcpHeader.SetChecksum(^tcpHeader.CalculateChecksum(xsum))
 	}
 
@@ -617,7 +623,7 @@ func (ct *ConnTrack) reapTupleLocked(tuple *tuple, bucket int, now time.Time) bo
 	return true
 }
 
-func (ct *ConnTrack) originalDst(epID TransportEndpointID, netProto tcpip.NetworkProtocolNumber) (tcpip.Address, uint16, *tcpip.Error) {
+func (ct *ConnTrack) originalDst(epID TransportEndpointID, netProto tcpip.NetworkProtocolNumber) (tcpip.Address, uint16, tcpip.Error) {
 	// Lookup the connection. The reply's original destination
 	// describes the original address.
 	tid := tupleID{
@@ -631,10 +637,10 @@ func (ct *ConnTrack) originalDst(epID TransportEndpointID, netProto tcpip.Networ
 	conn, _ := ct.connForTID(tid)
 	if conn == nil {
 		// Not a tracked connection.
-		return "", 0, tcpip.ErrNotConnected
+		return "", 0, &tcpip.ErrNotConnected{}
 	} else if conn.manip == manipNone {
 		// Unmanipulated connection.
-		return "", 0, tcpip.ErrInvalidOptionValue
+		return "", 0, &tcpip.ErrInvalidOptionValue{}
 	}
 
 	return conn.original.dstAddr, conn.original.dstPort, nil

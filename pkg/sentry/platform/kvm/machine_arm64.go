@@ -17,10 +17,11 @@
 package kvm
 
 import (
+	"gvisor.dev/gvisor/pkg/ring0"
+	"gvisor.dev/gvisor/pkg/ring0/pagetables"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
+	"gvisor.dev/gvisor/pkg/sentry/arch/fpu"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
-	"gvisor.dev/gvisor/pkg/sentry/platform/ring0"
-	"gvisor.dev/gvisor/pkg/sentry/platform/ring0/pagetables"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
@@ -32,7 +33,7 @@ type vCPUArchState struct {
 
 	// floatingPointState is the floating point state buffer used in guest
 	// to host transitions. See usage in bluepill_arm64.go.
-	floatingPointState *arch.FloatingPointData
+	floatingPointState fpu.State
 }
 
 const (
@@ -54,7 +55,7 @@ func (m *machine) mapUpperHalf(pageTable *pagetables.PageTables) {
 		pageTable.Map(
 			usermem.Addr(ring0.KernelStartAddress|pr.virtual),
 			pr.length,
-			pagetables.MapOpts{AccessType: usermem.AnyAccess},
+			pagetables.MapOpts{AccessType: usermem.AnyAccess, Global: true},
 			pr.physical)
 
 		return true // Keep iterating.

@@ -147,6 +147,10 @@ func (proc *Proc) execAsync(args *ExecArgs) (*kernel.ThreadGroup, kernel.ThreadI
 		args.Capabilities,
 		proc.Kernel.RootUserNamespace())
 
+	pidns := args.PIDNamespace
+	if pidns == nil {
+		pidns = proc.Kernel.RootPIDNamespace()
+	}
 	initArgs := kernel.CreateProcessArgs{
 		Filename:                args.Filename,
 		Argv:                    args.Argv,
@@ -163,7 +167,7 @@ func (proc *Proc) execAsync(args *ExecArgs) (*kernel.ThreadGroup, kernel.ThreadI
 		IPCNamespace:            proc.Kernel.RootIPCNamespace(),
 		AbstractSocketNamespace: proc.Kernel.RootAbstractSocketNamespace(),
 		ContainerID:             args.ContainerID,
-		PIDNamespace:            args.PIDNamespace,
+		PIDNamespace:            pidns,
 	}
 	if initArgs.MountNamespace != nil {
 		// initArgs must hold a reference on MountNamespace, which will
@@ -330,8 +334,8 @@ func PrintPIDsJSON(pl []*Process) (string, error) {
 func Processes(k *kernel.Kernel, containerID string, out *[]*Process) error {
 	ts := k.TaskSet()
 	now := k.RealtimeClock().Now()
-	for _, tg := range ts.Root.ThreadGroups() {
-		pidns := tg.PIDNamespace()
+	pidns := ts.Root
+	for _, tg := range pidns.ThreadGroups() {
 		pid := pidns.IDOfThreadGroup(tg)
 
 		// If tg has already been reaped ignore it.
@@ -403,4 +407,17 @@ func ttyName(tty *kernel.TTY) string {
 		return "?"
 	}
 	return fmt.Sprintf("pts/%d", tty.Index)
+}
+
+// ContainerUsage retrieves per-container CPU usage.
+func ContainerUsage(kr *kernel.Kernel) map[string]uint64 {
+	cusage := make(map[string]uint64)
+	for _, tg := range kr.TaskSet().Root.ThreadGroups() {
+		// We want each tg's usage including reaped children.
+		cid := tg.Leader().ContainerID()
+		stats := tg.CPUStats()
+		stats.Accumulate(tg.JoinedChildCPUStats())
+		cusage[cid] += uint64(stats.UserTime.Nanoseconds()) + uint64(stats.SysTime.Nanoseconds())
+	}
+	return cusage
 }

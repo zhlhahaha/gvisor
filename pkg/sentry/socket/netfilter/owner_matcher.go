@@ -38,7 +38,7 @@ func (ownerMarshaler) name() string {
 }
 
 // marshal implements matchMaker.marshal.
-func (ownerMarshaler) marshal(mr stack.Matcher) []byte {
+func (ownerMarshaler) marshal(mr matcher) []byte {
 	matcher := mr.(*OwnerMatcher)
 	iptOwnerInfo := linux.IPTOwnerInfo{
 		UID: matcher.uid,
@@ -96,6 +96,7 @@ func (ownerMarshaler) unmarshal(buf []byte, filter stack.IPHeaderFilter) (stack.
 	return &owner, nil
 }
 
+// OwnerMatcher matches against a UID and/or GID.
 type OwnerMatcher struct {
 	uid       uint32
 	gid       uint32
@@ -105,13 +106,13 @@ type OwnerMatcher struct {
 	invertGID bool
 }
 
-// Name implements Matcher.Name.
-func (*OwnerMatcher) Name() string {
+// name implements matcher.name.
+func (*OwnerMatcher) name() string {
 	return matcherNameOwner
 }
 
 // Match implements Matcher.Match.
-func (om *OwnerMatcher) Match(hook stack.Hook, pkt *stack.PacketBuffer, interfaceName string) (bool, bool) {
+func (om *OwnerMatcher) Match(hook stack.Hook, pkt *stack.PacketBuffer, _, _ string) (bool, bool) {
 	// Support only for OUTPUT chain.
 	// TODO(gvisor.dev/issue/170): Need to support for POSTROUTING chain also.
 	if hook != stack.Output {

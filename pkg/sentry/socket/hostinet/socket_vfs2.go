@@ -15,13 +15,11 @@
 package hostinet
 
 import (
-	"syscall"
-
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/fdnotifier"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
-	fslock "gvisor.dev/gvisor/pkg/sentry/fs/lock"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/sockfs"
 	"gvisor.dev/gvisor/pkg/sentry/hostfd"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
@@ -81,8 +79,7 @@ func newVFS2Socket(t *kernel.Task, family int, stype linux.SockType, protocol in
 
 // Release implements vfs.FileDescriptionImpl.Release.
 func (s *socketVFS2) Release(ctx context.Context) {
-	t := kernel.TaskFromContext(ctx)
-	t.Kernel().DeleteSocketVFS2(&s.vfsfd)
+	kernel.KernelFromContext(ctx).DeleteSocketVFS2(&s.vfsfd)
 	s.socketOpsCommon.Release(ctx)
 }
 
@@ -144,16 +141,6 @@ func (s *socketVFS2) Write(ctx context.Context, src usermem.IOSequence, opts vfs
 	return int64(n), err
 }
 
-// LockPOSIX implements vfs.FileDescriptionImpl.LockPOSIX.
-func (s *socketVFS2) LockPOSIX(ctx context.Context, uid fslock.UniqueID, t fslock.LockType, start, length uint64, whence int16, block fslock.Blocker) error {
-	return s.Locks().LockPOSIX(ctx, &s.vfsfd, uid, t, start, length, whence, block)
-}
-
-// UnlockPOSIX implements vfs.FileDescriptionImpl.UnlockPOSIX.
-func (s *socketVFS2) UnlockPOSIX(ctx context.Context, uid fslock.UniqueID, start, length uint64, whence int16) error {
-	return s.Locks().UnlockPOSIX(ctx, &s.vfsfd, uid, start, length, whence)
-}
-
 type socketProviderVFS2 struct {
 	family int
 }
@@ -172,16 +159,16 @@ func (p *socketProviderVFS2) Socket(t *kernel.Task, stypeflags linux.SockType, p
 	// Only accept TCP and UDP.
 	stype := stypeflags & linux.SOCK_TYPE_MASK
 	switch stype {
-	case syscall.SOCK_STREAM:
+	case unix.SOCK_STREAM:
 		switch protocol {
-		case 0, syscall.IPPROTO_TCP:
+		case 0, unix.IPPROTO_TCP:
 			// ok
 		default:
 			return nil, nil
 		}
-	case syscall.SOCK_DGRAM:
+	case unix.SOCK_DGRAM:
 		switch protocol {
-		case 0, syscall.IPPROTO_UDP:
+		case 0, unix.IPPROTO_UDP:
 			// ok
 		default:
 			return nil, nil
@@ -193,11 +180,11 @@ func (p *socketProviderVFS2) Socket(t *kernel.Task, stypeflags linux.SockType, p
 	// Conservatively ignore all flags specified by the application and add
 	// SOCK_NONBLOCK since socketOperations requires it. Pass a protocol of 0
 	// to simplify the syscall filters, since 0 and IPPROTO_* are equivalent.
-	fd, err := syscall.Socket(p.family, int(stype)|syscall.SOCK_NONBLOCK|syscall.SOCK_CLOEXEC, 0)
+	fd, err := unix.Socket(p.family, int(stype)|unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC, 0)
 	if err != nil {
 		return nil, syserr.FromError(err)
 	}
-	return newVFS2Socket(t, p.family, stype, protocol, fd, uint32(stypeflags&syscall.SOCK_NONBLOCK))
+	return newVFS2Socket(t, p.family, stype, protocol, fd, uint32(stypeflags&unix.SOCK_NONBLOCK))
 }
 
 // Pair implements socket.Provider.Pair.

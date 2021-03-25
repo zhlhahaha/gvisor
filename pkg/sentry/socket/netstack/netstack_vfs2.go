@@ -16,12 +16,10 @@ package netstack
 
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
-	"gvisor.dev/gvisor/pkg/amutex"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/marshal"
 	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
-	fslock "gvisor.dev/gvisor/pkg/sentry/fs/lock"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/sockfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/socket"
@@ -51,9 +49,7 @@ var _ = socket.SocketVFS2(&SocketVFS2{})
 // NewVFS2 creates a new endpoint socket.
 func NewVFS2(t *kernel.Task, family int, skType linux.SockType, protocol int, queue *waiter.Queue, endpoint tcpip.Endpoint) (*vfs.FileDescription, *syserr.Error) {
 	if skType == linux.SOCK_STREAM {
-		if err := endpoint.SetSockOptBool(tcpip.DelayOption, true); err != nil {
-			return nil, syserr.TranslateNetstackError(err)
-		}
+		endpoint.SocketOptions().SetDelayOption(true)
 	}
 
 	mnt := t.Kernel().SocketMount()
@@ -83,8 +79,7 @@ func NewVFS2(t *kernel.Task, family int, skType linux.SockType, protocol int, qu
 
 // Release implements vfs.FileDescriptionImpl.Release.
 func (s *SocketVFS2) Release(ctx context.Context) {
-	t := kernel.TaskFromContext(ctx)
-	t.Kernel().DeleteSocketVFS2(&s.vfsfd)
+	kernel.KernelFromContext(ctx).DeleteSocketVFS2(&s.vfsfd)
 	s.socketOpsCommon.Release(ctx)
 }
 
@@ -132,28 +127,20 @@ func (s *SocketVFS2) Write(ctx context.Context, src usermem.IOSequence, opts vfs
 		return 0, syserror.EOPNOTSUPP
 	}
 
-	f := &ioSequencePayload{ctx: ctx, src: src}
-	n, resCh, err := s.Endpoint.Write(f, tcpip.WriteOptions{})
-	if err == tcpip.ErrWouldBlock {
+	r := src.Reader(ctx)
+	n, err := s.Endpoint.Write(r, tcpip.WriteOptions{})
+	if _, ok := err.(*tcpip.ErrWouldBlock); ok {
 		return 0, syserror.ErrWouldBlock
 	}
-
-	if resCh != nil {
-		if err := amutex.Block(ctx, resCh); err != nil {
-			return 0, err
-		}
-		n, _, err = s.Endpoint.Write(f, tcpip.WriteOptions{})
-	}
-
 	if err != nil {
 		return 0, syserr.TranslateNetstackError(err).ToError()
 	}
 
-	if int64(n) < src.NumBytes() {
-		return int64(n), syserror.ErrWouldBlock
+	if n < src.NumBytes() {
+		return n, syserror.ErrWouldBlock
 	}
 
-	return int64(n), nil
+	return n, nil
 }
 
 // Accept implements the linux syscall accept(2) for sockets backed by
@@ -166,7 +153,7 @@ func (s *SocketVFS2) Accept(t *kernel.Task, peerRequested bool, flags int, block
 	}
 	ep, wq, terr := s.Endpoint.Accept(peerAddr)
 	if terr != nil {
-		if terr != tcpip.ErrWouldBlock || !blocking {
+		if _, ok := terr.(*tcpip.ErrWouldBlock); !ok || !blocking {
 			return 0, nil, 0, syserr.TranslateNetstackError(terr)
 		}
 
@@ -191,7 +178,7 @@ func (s *SocketVFS2) Accept(t *kernel.Task, peerRequested bool, flags int, block
 	var addrLen uint32
 	if peerAddr != nil {
 		// Get address of the peer and write it to peer slice.
-		addr, addrLen = ConvertAddress(s.family, *peerAddr)
+		addr, addrLen = socket.ConvertAddress(s.family, *peerAddr)
 	}
 
 	fd, e := t.NewFDFromVFS2(0, ns, kernel.FDFlags{
@@ -272,14 +259,4 @@ func (s *SocketVFS2) SetSockOpt(t *kernel.Task, level int, name int, optVal []by
 	}
 
 	return SetSockOpt(t, s, s.Endpoint, level, name, optVal)
-}
-
-// LockPOSIX implements vfs.FileDescriptionImpl.LockPOSIX.
-func (s *SocketVFS2) LockPOSIX(ctx context.Context, uid fslock.UniqueID, t fslock.LockType, start, length uint64, whence int16, block fslock.Blocker) error {
-	return s.Locks().LockPOSIX(ctx, &s.vfsfd, uid, t, start, length, whence, block)
-}
-
-// UnlockPOSIX implements vfs.FileDescriptionImpl.UnlockPOSIX.
-func (s *SocketVFS2) UnlockPOSIX(ctx context.Context, uid fslock.UniqueID, start, length uint64, whence int16) error {
-	return s.Locks().UnlockPOSIX(ctx, &s.vfsfd, uid, start, length, whence)
 }

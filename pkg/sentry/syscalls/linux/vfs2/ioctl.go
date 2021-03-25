@@ -32,6 +32,10 @@ func Ioctl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 	}
 	defer file.DecRef(t)
 
+	if file.StatusFlags()&linux.O_PATH != 0 {
+		return 0, nil, syserror.EBADF
+	}
+
 	// Handle ioctls that apply to all FDs.
 	switch args[1].Int() {
 	case linux.FIONCLEX:
@@ -100,7 +104,7 @@ func Ioctl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 			ownerType = linux.F_OWNER_PGRP
 			who = -who
 		}
-		return 0, nil, setAsyncOwner(t, file, ownerType, who)
+		return 0, nil, setAsyncOwner(t, int(fd), file, ownerType, who)
 	}
 
 	ret, err := file.Ioctl(t, t.MemoryManager(), args)

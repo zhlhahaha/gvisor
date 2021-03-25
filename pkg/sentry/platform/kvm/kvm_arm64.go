@@ -17,8 +17,8 @@
 package kvm
 
 import (
+	"gvisor.dev/gvisor/pkg/ring0"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
-	"gvisor.dev/gvisor/pkg/sentry/platform/ring0"
 )
 
 type kvmOneReg struct {
@@ -47,10 +47,11 @@ type userRegs struct {
 }
 
 type exception struct {
-	sErrPending uint8
-	sErrHasEsr  uint8
-	pad         [6]uint8
-	sErrEsr     uint64
+	sErrPending    uint8
+	sErrHasEsr     uint8
+	extDabtPending uint8
+	pad            [5]uint8
+	sErrEsr        uint64
 }
 
 type kvmVcpuEvents struct {

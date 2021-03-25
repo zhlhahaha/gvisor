@@ -19,11 +19,12 @@ package arch
 import (
 	"fmt"
 	"math/rand"
-	"syscall"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/cpuid"
 	"gvisor.dev/gvisor/pkg/marshal"
 	"gvisor.dev/gvisor/pkg/marshal/primitive"
+	"gvisor.dev/gvisor/pkg/sentry/arch/fpu"
 	"gvisor.dev/gvisor/pkg/sentry/limits"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
@@ -79,7 +80,7 @@ const (
 // +stateify savable
 type context64 struct {
 	State
-	sigFPState []aarch64FPState // fpstate to be restored on sigreturn.
+	sigFPState []fpu.State // fpstate to be restored on sigreturn.
 }
 
 // Arch implements Context.Arch.
@@ -87,10 +88,10 @@ func (c *context64) Arch() Arch {
 	return ARM64
 }
 
-func (c *context64) copySigFPState() []aarch64FPState {
-	var sigfps []aarch64FPState
+func (c *context64) copySigFPState() []fpu.State {
+	var sigfps []fpu.State
 	for _, s := range c.sigFPState {
-		sigfps = append(sigfps, s.fork())
+		sigfps = append(sigfps, s.Fork())
 	}
 	return sigfps
 }
@@ -194,7 +195,7 @@ func mmapRand(max uint64) usermem.Addr {
 func (c *context64) NewMmapLayout(min, max usermem.Addr, r *limits.LimitSet) (MmapLayout, error) {
 	min, ok := min.RoundUp()
 	if !ok {
-		return MmapLayout{}, syscall.EINVAL
+		return MmapLayout{}, unix.EINVAL
 	}
 	if max > maxAddr64 {
 		max = maxAddr64
@@ -202,7 +203,7 @@ func (c *context64) NewMmapLayout(min, max usermem.Addr, r *limits.LimitSet) (Mm
 	max = max.RoundDown()
 
 	if min > max {
-		return MmapLayout{}, syscall.EINVAL
+		return MmapLayout{}, unix.EINVAL
 	}
 
 	stackSize := r.Get(limits.Stack)
@@ -285,4 +286,8 @@ func (c *context64) PtracePeekUser(addr uintptr) (marshal.Marshallable, error) {
 func (c *context64) PtracePokeUser(addr, data uintptr) error {
 	// TODO(gvisor.dev/issue/1239): Full ptrace supporting for Arm64.
 	return nil
+}
+
+func (c *context64) FloatingPointData() *fpu.State {
+	return &c.State.fpState
 }

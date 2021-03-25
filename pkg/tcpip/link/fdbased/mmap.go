@@ -19,7 +19,6 @@ package fdbased
 import (
 	"encoding/binary"
 	"fmt"
-	"syscall"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -129,7 +128,7 @@ type packetMMapDispatcher struct {
 	ringOffset int
 }
 
-func (d *packetMMapDispatcher) readMMappedPacket() ([]byte, *tcpip.Error) {
+func (d *packetMMapDispatcher) readMMappedPacket() ([]byte, tcpip.Error) {
 	hdr := tPacketHdr(d.ringBuffer[d.ringOffset*tpFrameSize:])
 	for hdr.tpStatus()&tpStatusUser == 0 {
 		event := rawfile.PollEvent{
@@ -137,7 +136,7 @@ func (d *packetMMapDispatcher) readMMappedPacket() ([]byte, *tcpip.Error) {
 			Events: unix.POLLIN | unix.POLLERR,
 		}
 		if _, errno := rawfile.BlockingPoll(&event, 1, nil); errno != 0 {
-			if errno == syscall.EINTR {
+			if errno == unix.EINTR {
 				continue
 			}
 			return nil, rawfile.TranslateErrno(errno)
@@ -163,7 +162,7 @@ func (d *packetMMapDispatcher) readMMappedPacket() ([]byte, *tcpip.Error) {
 
 // dispatch reads packets from an mmaped ring buffer and dispatches them to the
 // network stack.
-func (d *packetMMapDispatcher) dispatch() (bool, *tcpip.Error) {
+func (d *packetMMapDispatcher) dispatch() (bool, tcpip.Error) {
 	pkt, err := d.readMMappedPacket()
 	if err != nil {
 		return false, err

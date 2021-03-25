@@ -47,19 +47,14 @@ type FilesystemType struct{}
 
 // +stateify savable
 type filesystemOptions struct {
-	// userID specifies the numeric uid of the mount owner.
-	// This option should not be specified by the filesystem owner.
-	// It is set by libfuse (or, if libfuse is not used, must be set
-	// by the filesystem itself). For more information, see man page
-	// for fuse(8)
-	userID uint32
+	// mopts contains the raw, unparsed mount options passed to this filesystem.
+	mopts string
 
-	// groupID specifies the numeric gid of the mount owner.
-	// This option should not be specified by the filesystem owner.
-	// It is set by libfuse (or, if libfuse is not used, must be set
-	// by the filesystem itself). For more information, see man page
-	// for fuse(8)
-	groupID uint32
+	// uid of the mount owner.
+	uid auth.KUID
+
+	// gid of the mount owner.
+	gid auth.KGID
 
 	// rootMode specifies the the file mode of the filesystem's root.
 	rootMode linux.FileMode
@@ -73,6 +68,19 @@ type filesystemOptions struct {
 	// specified as "max_read" in fs parameters.
 	// If not specified by user, use math.MaxUint32 as default value.
 	maxRead uint32
+
+	// defaultPermissions is the default_permissions mount option. It instructs
+	// the kernel to perform a standard unix permission checks based on
+	// ownership and mode bits, instead of deferring the check to the server.
+	//
+	// Immutable after mount.
+	defaultPermissions bool
+
+	// allowOther is the allow_other mount option. It allows processes that
+	// don't own the FUSE mount to call into it.
+	//
+	// Immutable after mount.
+	allowOther bool
 }
 
 // filesystem implements vfs.FilesystemImpl.
@@ -108,18 +116,19 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		return nil, nil, err
 	}
 
-	var fsopts filesystemOptions
+	fsopts := filesystemOptions{mopts: opts.Data}
 	mopts := vfs.GenericParseMountOptions(opts.Data)
 	deviceDescriptorStr, ok := mopts["fd"]
 	if !ok {
-		log.Warningf("%s.GetFilesystem: communication file descriptor N (obtained by opening /dev/fuse) must be specified as 'fd=N'", fsType.Name())
+		ctx.Warningf("fusefs.FilesystemType.GetFilesystem: mandatory mount option fd missing")
 		return nil, nil, syserror.EINVAL
 	}
 	delete(mopts, "fd")
 
 	deviceDescriptor, err := strconv.ParseInt(deviceDescriptorStr, 10 /* base */, 32 /* bitSize */)
 	if err != nil {
-		return nil, nil, err
+		ctx.Debugf("fusefs.FilesystemType.GetFilesystem: invalid fd: %q (%v)", deviceDescriptorStr, err)
+		return nil, nil, syserror.EINVAL
 	}
 
 	kernelTask := kernel.TaskFromContext(ctx)
@@ -128,6 +137,9 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		return nil, nil, syserror.EINVAL
 	}
 	fuseFDGeneric := kernelTask.GetFileVFS2(int32(deviceDescriptor))
+	if fuseFDGeneric == nil {
+		return nil, nil, syserror.EINVAL
+	}
 	defer fuseFDGeneric.DecRef(ctx)
 	fuseFD, ok := fuseFDGeneric.Impl().(*DeviceFD)
 	if !ok {
@@ -137,38 +149,54 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 
 	// Parse and set all the other supported FUSE mount options.
 	// TODO(gVisor.dev/issue/3229): Expand the supported mount options.
-	if userIDStr, ok := mopts["user_id"]; ok {
+	if uidStr, ok := mopts["user_id"]; ok {
 		delete(mopts, "user_id")
-		userID, err := strconv.ParseUint(userIDStr, 10, 32)
+		uid, err := strconv.ParseUint(uidStr, 10, 32)
 		if err != nil {
-			log.Warningf("%s.GetFilesystem: invalid user_id: user_id=%s", fsType.Name(), userIDStr)
+			log.Warningf("%s.GetFilesystem: invalid user_id: user_id=%s", fsType.Name(), uidStr)
 			return nil, nil, syserror.EINVAL
 		}
-		fsopts.userID = uint32(userID)
+		kuid := creds.UserNamespace.MapToKUID(auth.UID(uid))
+		if !kuid.Ok() {
+			ctx.Warningf("fusefs.FilesystemType.GetFilesystem: unmapped uid: %d", uid)
+			return nil, nil, syserror.EINVAL
+		}
+		fsopts.uid = kuid
+	} else {
+		ctx.Warningf("fusefs.FilesystemType.GetFilesystem: mandatory mount option user_id missing")
+		return nil, nil, syserror.EINVAL
 	}
 
-	if groupIDStr, ok := mopts["group_id"]; ok {
+	if gidStr, ok := mopts["group_id"]; ok {
 		delete(mopts, "group_id")
-		groupID, err := strconv.ParseUint(groupIDStr, 10, 32)
+		gid, err := strconv.ParseUint(gidStr, 10, 32)
 		if err != nil {
-			log.Warningf("%s.GetFilesystem: invalid group_id: group_id=%s", fsType.Name(), groupIDStr)
+			log.Warningf("%s.GetFilesystem: invalid group_id: group_id=%s", fsType.Name(), gidStr)
 			return nil, nil, syserror.EINVAL
 		}
-		fsopts.groupID = uint32(groupID)
+		kgid := creds.UserNamespace.MapToKGID(auth.GID(gid))
+		if !kgid.Ok() {
+			ctx.Warningf("fusefs.FilesystemType.GetFilesystem: unmapped gid: %d", gid)
+			return nil, nil, syserror.EINVAL
+		}
+		fsopts.gid = kgid
+	} else {
+		ctx.Warningf("fusefs.FilesystemType.GetFilesystem: mandatory mount option group_id missing")
+		return nil, nil, syserror.EINVAL
 	}
 
-	rootMode := linux.FileMode(0777)
-	modeStr, ok := mopts["rootmode"]
-	if ok {
+	if modeStr, ok := mopts["rootmode"]; ok {
 		delete(mopts, "rootmode")
 		mode, err := strconv.ParseUint(modeStr, 8, 32)
 		if err != nil {
 			log.Warningf("%s.GetFilesystem: invalid mode: %q", fsType.Name(), modeStr)
 			return nil, nil, syserror.EINVAL
 		}
-		rootMode = linux.FileMode(mode)
+		fsopts.rootMode = linux.FileMode(mode)
+	} else {
+		ctx.Warningf("fusefs.FilesystemType.GetFilesystem: mandatory mount option rootmode missing")
+		return nil, nil, syserror.EINVAL
 	}
-	fsopts.rootMode = rootMode
 
 	// Set the maxInFlightRequests option.
 	fsopts.maxActiveRequests = maxActiveRequestsDefault
@@ -186,6 +214,16 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		fsopts.maxRead = uint32(maxRead)
 	} else {
 		fsopts.maxRead = math.MaxUint32
+	}
+
+	if _, ok := mopts["default_permissions"]; ok {
+		delete(mopts, "default_permissions")
+		fsopts.defaultPermissions = true
+	}
+
+	if _, ok := mopts["allow_other"]; ok {
+		delete(mopts, "allow_other")
+		fsopts.allowOther = true
 	}
 
 	// Check for unparsed options.
@@ -248,12 +286,17 @@ func (fs *filesystem) Release(ctx context.Context) {
 	fs.umounted = true
 	fs.conn.Abort(ctx)
 	// Notify all the waiters on this fd.
-	fs.conn.fd.waitQueue.Notify(waiter.EventIn)
+	fs.conn.fd.waitQueue.Notify(waiter.ReadableEvents)
 
 	fs.conn.fd.mu.Unlock()
 
 	fs.Filesystem.VFSFilesystem().VirtualFilesystem().PutAnonBlockDevMinor(fs.devMinor)
 	fs.Filesystem.Release(ctx)
+}
+
+// MountOptions implements vfs.FilesystemImpl.MountOptions.
+func (fs *filesystem) MountOptions() string {
+	return fs.opts.mopts
 }
 
 // inode implements kernfs.Inode.
@@ -314,6 +357,37 @@ func (fs *filesystem) newInode(ctx context.Context, nodeID uint64, attr linux.FU
 	return i
 }
 
+// CheckPermissions implements kernfs.Inode.CheckPermissions.
+func (i *inode) CheckPermissions(ctx context.Context, creds *auth.Credentials, ats vfs.AccessTypes) error {
+	// Since FUSE operations are ultimately backed by a userspace process (the
+	// fuse daemon), allowing a process to call into fusefs grants the daemon
+	// ptrace-like capabilities over the calling process. Because of this, by
+	// default FUSE only allows the mount owner to interact with the
+	// filesystem. This explicitly excludes setuid/setgid processes.
+	//
+	// This behaviour can be overriden with the 'allow_other' mount option.
+	//
+	// See fs/fuse/dir.c:fuse_allow_current_process() in Linux.
+	if !i.fs.opts.allowOther {
+		if creds.RealKUID != i.fs.opts.uid ||
+			creds.EffectiveKUID != i.fs.opts.uid ||
+			creds.SavedKUID != i.fs.opts.uid ||
+			creds.RealKGID != i.fs.opts.gid ||
+			creds.EffectiveKGID != i.fs.opts.gid ||
+			creds.SavedKGID != i.fs.opts.gid {
+			return syserror.EACCES
+		}
+	}
+
+	// By default, fusefs delegates all permission checks to the server.
+	// However, standard unix permission checks can be enabled with the
+	// default_permissions mount option.
+	if i.fs.opts.defaultPermissions {
+		return i.InodeAttrs.CheckPermissions(ctx, creds, ats)
+	}
+	return nil
+}
+
 // Open implements kernfs.Inode.Open.
 func (i *inode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
 	isDir := i.InodeAttrs.Mode().IsDir()
@@ -360,12 +434,8 @@ func (i *inode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentr
 			in.Flags &= ^uint32(linux.O_TRUNC)
 		}
 
-		req, err := i.fs.conn.NewRequest(auth.CredentialsFromContext(ctx), uint32(kernelTask.ThreadID()), i.nodeID, opcode, &in)
-		if err != nil {
-			return nil, err
-		}
-
 		// Send the request and receive the reply.
+		req := i.fs.conn.NewRequest(auth.CredentialsFromContext(ctx), uint32(kernelTask.ThreadID()), i.nodeID, opcode, &in)
 		res, err := i.fs.conn.Call(kernelTask, req)
 		if err != nil {
 			return nil, err
@@ -485,10 +555,7 @@ func (i *inode) Unlink(ctx context.Context, name string, child kernfs.Inode) err
 		return syserror.EINVAL
 	}
 	in := linux.FUSEUnlinkIn{Name: name}
-	req, err := i.fs.conn.NewRequest(auth.CredentialsFromContext(ctx), uint32(kernelTask.ThreadID()), i.nodeID, linux.FUSE_UNLINK, &in)
-	if err != nil {
-		return err
-	}
+	req := i.fs.conn.NewRequest(auth.CredentialsFromContext(ctx), uint32(kernelTask.ThreadID()), i.nodeID, linux.FUSE_UNLINK, &in)
 	res, err := i.fs.conn.Call(kernelTask, req)
 	if err != nil {
 		return err
@@ -515,11 +582,7 @@ func (i *inode) RmDir(ctx context.Context, name string, child kernfs.Inode) erro
 	task, creds := kernel.TaskFromContext(ctx), auth.CredentialsFromContext(ctx)
 
 	in := linux.FUSERmDirIn{Name: name}
-	req, err := fusefs.conn.NewRequest(creds, uint32(task.ThreadID()), i.nodeID, linux.FUSE_RMDIR, &in)
-	if err != nil {
-		return err
-	}
-
+	req := fusefs.conn.NewRequest(creds, uint32(task.ThreadID()), i.nodeID, linux.FUSE_RMDIR, &in)
 	res, err := i.fs.conn.Call(task, req)
 	if err != nil {
 		return err
@@ -535,10 +598,7 @@ func (i *inode) newEntry(ctx context.Context, name string, fileType linux.FileMo
 		log.Warningf("fusefs.Inode.newEntry: couldn't get kernel task from context", i.nodeID)
 		return nil, syserror.EINVAL
 	}
-	req, err := i.fs.conn.NewRequest(auth.CredentialsFromContext(ctx), uint32(kernelTask.ThreadID()), i.nodeID, opcode, payload)
-	if err != nil {
-		return nil, err
-	}
+	req := i.fs.conn.NewRequest(auth.CredentialsFromContext(ctx), uint32(kernelTask.ThreadID()), i.nodeID, opcode, payload)
 	res, err := i.fs.conn.Call(kernelTask, req)
 	if err != nil {
 		return nil, err
@@ -574,10 +634,7 @@ func (i *inode) Readlink(ctx context.Context, mnt *vfs.Mount) (string, error) {
 			log.Warningf("fusefs.Inode.Readlink: couldn't get kernel task from context")
 			return "", syserror.EINVAL
 		}
-		req, err := i.fs.conn.NewRequest(auth.CredentialsFromContext(ctx), uint32(kernelTask.ThreadID()), i.nodeID, linux.FUSE_READLINK, &linux.FUSEEmptyIn{})
-		if err != nil {
-			return "", err
-		}
+		req := i.fs.conn.NewRequest(auth.CredentialsFromContext(ctx), uint32(kernelTask.ThreadID()), i.nodeID, linux.FUSE_READLINK, &linux.FUSEEmptyIn{})
 		res, err := i.fs.conn.Call(kernelTask, req)
 		if err != nil {
 			return "", err
@@ -680,11 +737,7 @@ func (i *inode) getAttr(ctx context.Context, fs *vfs.Filesystem, opts vfs.StatOp
 		GetAttrFlags: flags,
 		Fh:           fh,
 	}
-	req, err := i.fs.conn.NewRequest(creds, uint32(task.ThreadID()), i.nodeID, linux.FUSE_GETATTR, &in)
-	if err != nil {
-		return linux.FUSEAttr{}, err
-	}
-
+	req := i.fs.conn.NewRequest(creds, uint32(task.ThreadID()), i.nodeID, linux.FUSE_GETATTR, &in)
 	res, err := i.fs.conn.Call(task, req)
 	if err != nil {
 		return linux.FUSEAttr{}, err
@@ -803,11 +856,7 @@ func (i *inode) setAttr(ctx context.Context, fs *vfs.Filesystem, creds *auth.Cre
 		UID:       opts.Stat.UID,
 		GID:       opts.Stat.GID,
 	}
-	req, err := conn.NewRequest(creds, uint32(task.ThreadID()), i.nodeID, linux.FUSE_SETATTR, &in)
-	if err != nil {
-		return err
-	}
-
+	req := conn.NewRequest(creds, uint32(task.ThreadID()), i.nodeID, linux.FUSE_SETATTR, &in)
 	res, err := conn.Call(task, req)
 	if err != nil {
 		return err

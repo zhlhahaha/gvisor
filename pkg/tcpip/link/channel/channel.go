@@ -22,7 +22,6 @@ import (
 
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
@@ -32,7 +31,7 @@ type PacketInfo struct {
 	Pkt   *stack.PacketBuffer
 	Proto tcpip.NetworkProtocolNumber
 	GSO   *stack.GSO
-	Route stack.Route
+	Route stack.RouteInfo
 }
 
 // Notification is the interface for receiving notification from the packet
@@ -230,16 +229,12 @@ func (e *Endpoint) LinkAddress() tcpip.LinkAddress {
 }
 
 // WritePacket stores outbound packets into the channel.
-func (e *Endpoint) WritePacket(r *stack.Route, gso *stack.GSO, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) *tcpip.Error {
-	// Clone r then release its resource so we only get the relevant fields from
-	// stack.Route without holding a reference to a NIC's endpoint.
-	route := r.Clone()
-	route.Release()
+func (e *Endpoint) WritePacket(r stack.RouteInfo, gso *stack.GSO, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) tcpip.Error {
 	p := PacketInfo{
 		Pkt:   pkt,
 		Proto: protocol,
 		GSO:   gso,
-		Route: route,
+		Route: r,
 	}
 
 	e.q.Write(p)
@@ -248,18 +243,14 @@ func (e *Endpoint) WritePacket(r *stack.Route, gso *stack.GSO, protocol tcpip.Ne
 }
 
 // WritePackets stores outbound packets into the channel.
-func (e *Endpoint) WritePackets(r *stack.Route, gso *stack.GSO, pkts stack.PacketBufferList, protocol tcpip.NetworkProtocolNumber) (int, *tcpip.Error) {
-	// Clone r then release its resource so we only get the relevant fields from
-	// stack.Route without holding a reference to a NIC's endpoint.
-	route := r.Clone()
-	route.Release()
+func (e *Endpoint) WritePackets(r stack.RouteInfo, gso *stack.GSO, pkts stack.PacketBufferList, protocol tcpip.NetworkProtocolNumber) (int, tcpip.Error) {
 	n := 0
 	for pkt := pkts.Front(); pkt != nil; pkt = pkt.Next() {
 		p := PacketInfo{
 			Pkt:   pkt,
 			Proto: protocol,
 			GSO:   gso,
-			Route: route,
+			Route: r,
 		}
 
 		if !e.q.Write(p) {
@@ -269,21 +260,6 @@ func (e *Endpoint) WritePackets(r *stack.Route, gso *stack.GSO, pkts stack.Packe
 	}
 
 	return n, nil
-}
-
-// WriteRawPacket implements stack.LinkEndpoint.WriteRawPacket.
-func (e *Endpoint) WriteRawPacket(vv buffer.VectorisedView) *tcpip.Error {
-	p := PacketInfo{
-		Pkt: stack.NewPacketBuffer(stack.PacketBufferOptions{
-			Data: vv,
-		}),
-		Proto: 0,
-		GSO:   nil,
-	}
-
-	e.q.Write(p)
-
-	return nil
 }
 
 // Wait implements stack.LinkEndpoint.Wait.

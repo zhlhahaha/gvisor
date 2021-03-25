@@ -62,7 +62,7 @@ func (p *providerVFS2) Socket(t *kernel.Task, stype linux.SockType, protocol int
 
 	// Create the endpoint.
 	var ep tcpip.Endpoint
-	var e *tcpip.Error
+	var e tcpip.Error
 	wq := &waiter.Queue{}
 	if stype == linux.SOCK_RAW {
 		ep, e = eps.Stack.NewRawEndpoint(transProto, p.netProto, wq, associated)
@@ -102,7 +102,7 @@ func packetSocketVFS2(t *kernel.Task, epStack *Stack, stype linux.SockType, prot
 
 	// protocol is passed in network byte order, but netstack wants it in
 	// host order.
-	netProto := tcpip.NetworkProtocolNumber(ntohs(uint16(protocol)))
+	netProto := tcpip.NetworkProtocolNumber(socket.Ntohs(uint16(protocol)))
 
 	wq := &waiter.Queue{}
 	ep, err := epStack.Stack.NewPacketEndpoint(cooked, netProto, wq)

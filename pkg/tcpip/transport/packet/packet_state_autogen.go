@@ -23,6 +23,7 @@ func (p *packet) StateFields() []string {
 
 func (p *packet) beforeSave() {}
 
+// +checklocksignore
 func (p *packet) StateSave(stateSinkObject state.Sink) {
 	p.beforeSave()
 	var dataValue buffer.VectorisedView = p.saveData()
@@ -35,6 +36,7 @@ func (p *packet) StateSave(stateSinkObject state.Sink) {
 
 func (p *packet) afterLoad() {}
 
+// +checklocksignore
 func (p *packet) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &p.packetEntry)
 	stateSourceObject.Load(2, &p.timestampNS)
@@ -50,6 +52,7 @@ func (ep *endpoint) StateTypeName() string {
 func (ep *endpoint) StateFields() []string {
 	return []string{
 		"TransportEndpointInfo",
+		"DefaultSocketOptionsHandler",
 		"netProto",
 		"waiterQueue",
 		"cooked",
@@ -57,56 +60,50 @@ func (ep *endpoint) StateFields() []string {
 		"rcvBufSizeMax",
 		"rcvBufSize",
 		"rcvClosed",
-		"sndBufSize",
-		"sndBufSizeMax",
 		"closed",
 		"bound",
 		"boundNIC",
-		"linger",
 		"lastError",
 		"ops",
 	}
 }
 
+// +checklocksignore
 func (ep *endpoint) StateSave(stateSinkObject state.Sink) {
 	ep.beforeSave()
 	var rcvBufSizeMaxValue int = ep.saveRcvBufSizeMax()
-	stateSinkObject.SaveValue(5, rcvBufSizeMaxValue)
-	var lastErrorValue string = ep.saveLastError()
-	stateSinkObject.SaveValue(14, lastErrorValue)
+	stateSinkObject.SaveValue(6, rcvBufSizeMaxValue)
 	stateSinkObject.Save(0, &ep.TransportEndpointInfo)
-	stateSinkObject.Save(1, &ep.netProto)
-	stateSinkObject.Save(2, &ep.waiterQueue)
-	stateSinkObject.Save(3, &ep.cooked)
-	stateSinkObject.Save(4, &ep.rcvList)
-	stateSinkObject.Save(6, &ep.rcvBufSize)
-	stateSinkObject.Save(7, &ep.rcvClosed)
-	stateSinkObject.Save(8, &ep.sndBufSize)
-	stateSinkObject.Save(9, &ep.sndBufSizeMax)
-	stateSinkObject.Save(10, &ep.closed)
-	stateSinkObject.Save(11, &ep.bound)
-	stateSinkObject.Save(12, &ep.boundNIC)
-	stateSinkObject.Save(13, &ep.linger)
-	stateSinkObject.Save(15, &ep.ops)
+	stateSinkObject.Save(1, &ep.DefaultSocketOptionsHandler)
+	stateSinkObject.Save(2, &ep.netProto)
+	stateSinkObject.Save(3, &ep.waiterQueue)
+	stateSinkObject.Save(4, &ep.cooked)
+	stateSinkObject.Save(5, &ep.rcvList)
+	stateSinkObject.Save(7, &ep.rcvBufSize)
+	stateSinkObject.Save(8, &ep.rcvClosed)
+	stateSinkObject.Save(9, &ep.closed)
+	stateSinkObject.Save(10, &ep.bound)
+	stateSinkObject.Save(11, &ep.boundNIC)
+	stateSinkObject.Save(12, &ep.lastError)
+	stateSinkObject.Save(13, &ep.ops)
 }
 
+// +checklocksignore
 func (ep *endpoint) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &ep.TransportEndpointInfo)
-	stateSourceObject.Load(1, &ep.netProto)
-	stateSourceObject.Load(2, &ep.waiterQueue)
-	stateSourceObject.Load(3, &ep.cooked)
-	stateSourceObject.Load(4, &ep.rcvList)
-	stateSourceObject.Load(6, &ep.rcvBufSize)
-	stateSourceObject.Load(7, &ep.rcvClosed)
-	stateSourceObject.Load(8, &ep.sndBufSize)
-	stateSourceObject.Load(9, &ep.sndBufSizeMax)
-	stateSourceObject.Load(10, &ep.closed)
-	stateSourceObject.Load(11, &ep.bound)
-	stateSourceObject.Load(12, &ep.boundNIC)
-	stateSourceObject.Load(13, &ep.linger)
-	stateSourceObject.Load(15, &ep.ops)
-	stateSourceObject.LoadValue(5, new(int), func(y interface{}) { ep.loadRcvBufSizeMax(y.(int)) })
-	stateSourceObject.LoadValue(14, new(string), func(y interface{}) { ep.loadLastError(y.(string)) })
+	stateSourceObject.Load(1, &ep.DefaultSocketOptionsHandler)
+	stateSourceObject.Load(2, &ep.netProto)
+	stateSourceObject.Load(3, &ep.waiterQueue)
+	stateSourceObject.Load(4, &ep.cooked)
+	stateSourceObject.Load(5, &ep.rcvList)
+	stateSourceObject.Load(7, &ep.rcvBufSize)
+	stateSourceObject.Load(8, &ep.rcvClosed)
+	stateSourceObject.Load(9, &ep.closed)
+	stateSourceObject.Load(10, &ep.bound)
+	stateSourceObject.Load(11, &ep.boundNIC)
+	stateSourceObject.Load(12, &ep.lastError)
+	stateSourceObject.Load(13, &ep.ops)
+	stateSourceObject.LoadValue(6, new(int), func(y interface{}) { ep.loadRcvBufSizeMax(y.(int)) })
 	stateSourceObject.AfterLoad(ep.afterLoad)
 }
 
@@ -123,6 +120,7 @@ func (l *packetList) StateFields() []string {
 
 func (l *packetList) beforeSave() {}
 
+// +checklocksignore
 func (l *packetList) StateSave(stateSinkObject state.Sink) {
 	l.beforeSave()
 	stateSinkObject.Save(0, &l.head)
@@ -131,6 +129,7 @@ func (l *packetList) StateSave(stateSinkObject state.Sink) {
 
 func (l *packetList) afterLoad() {}
 
+// +checklocksignore
 func (l *packetList) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &l.head)
 	stateSourceObject.Load(1, &l.tail)
@@ -149,6 +148,7 @@ func (e *packetEntry) StateFields() []string {
 
 func (e *packetEntry) beforeSave() {}
 
+// +checklocksignore
 func (e *packetEntry) StateSave(stateSinkObject state.Sink) {
 	e.beforeSave()
 	stateSinkObject.Save(0, &e.next)
@@ -157,6 +157,7 @@ func (e *packetEntry) StateSave(stateSinkObject state.Sink) {
 
 func (e *packetEntry) afterLoad() {}
 
+// +checklocksignore
 func (e *packetEntry) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &e.next)
 	stateSourceObject.Load(1, &e.prev)

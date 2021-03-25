@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
-	"gvisor.dev/gvisor/pkg/binary"
 	"gvisor.dev/gvisor/pkg/marshal"
 	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
@@ -457,7 +456,7 @@ func GetSockOpt(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sy
 		return 0, nil, e.ToError()
 	}
 
-	vLen := int32(binary.Size(v))
+	vLen := int32(v.SizeBytes())
 	if _, err := primitive.CopyInt32Out(t, optLenAddr, vLen); err != nil {
 		return 0, nil, err
 	}
@@ -658,6 +657,10 @@ func RecvMMsg(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sysc
 		return 0, nil, syserror.EINVAL
 	}
 
+	if vlen > linux.UIO_MAXIOV {
+		vlen = linux.UIO_MAXIOV
+	}
+
 	// Reject flags that we don't handle yet.
 	if flags & ^(baseRecvFlags|linux.MSG_CMSG_CLOEXEC|linux.MSG_ERRQUEUE) != 0 {
 		return 0, nil, syserror.EINVAL
@@ -747,11 +750,6 @@ func recvSingleMsg(t *kernel.Task, s socket.Socket, msgPtr usermem.Addr, flags i
 	})
 	if err != nil {
 		return 0, err
-	}
-
-	// FIXME(b/63594852): Pretend we have an empty error queue.
-	if flags&linux.MSG_ERRQUEUE != 0 {
-		return 0, syserror.EAGAIN
 	}
 
 	// Fast path when no control message nor name buffers are provided.
@@ -944,6 +942,10 @@ func SendMMsg(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sysc
 		return 0, nil, syserror.EINVAL
 	}
 
+	if vlen > linux.UIO_MAXIOV {
+		vlen = linux.UIO_MAXIOV
+	}
+
 	// Get socket from the file descriptor.
 	file := t.GetFile(fd)
 	if file == nil {
@@ -1035,7 +1037,7 @@ func sendSingleMsg(t *kernel.Task, s socket.Socket, file *fs.File, msgPtr userme
 		return 0, err
 	}
 
-	controlMessages, err := control.Parse(t, s, controlData)
+	controlMessages, err := control.Parse(t, s, controlData, t.Arch().Width())
 	if err != nil {
 		return 0, err
 	}

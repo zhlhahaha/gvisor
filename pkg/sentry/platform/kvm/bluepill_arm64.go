@@ -17,15 +17,14 @@
 package kvm
 
 import (
-	"syscall"
-
+	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/ring0"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
-	"gvisor.dev/gvisor/pkg/sentry/platform/ring0"
 )
 
 var (
 	// The action for bluepillSignal is changed by sigaction().
-	bluepillSignal = syscall.SIGILL
+	bluepillSignal = unix.SIGILL
 
 	// vcpuSErrBounce is the event of system error for bouncing KVM.
 	vcpuSErrBounce = kvmVcpuEvents{
@@ -40,6 +39,13 @@ var (
 			sErrPending: 1,
 			sErrHasEsr:  1,
 			sErrEsr:     _ESR_ELx_SERR_NMI,
+		},
+	}
+
+	// vcpuExtDabt is the event of ext_dabt.
+	vcpuExtDabt = kvmVcpuEvents{
+		exception: exception{
+			extDabtPending: 1,
 		},
 	}
 )
@@ -86,7 +92,7 @@ func bluepillArchExit(c *vCPU, context *arch.SignalContext64) {
 
 	lazyVfp := c.GetLazyVFP()
 	if lazyVfp != 0 {
-		fpsimd := fpsimdPtr((*byte)(c.floatingPointState))
+		fpsimd := fpsimdPtr(c.floatingPointState.BytePointer())
 		context.Fpsimd64.Fpsr = fpsimd.Fpsr
 		context.Fpsimd64.Fpcr = fpsimd.Fpcr
 		context.Fpsimd64.Vregs = fpsimd.Vregs
@@ -104,14 +110,14 @@ func (c *vCPU) KernelSyscall() {
 		regs.Pc -= 4 // Rewind.
 	}
 
-	vfpEnable := ring0.CPACREL1()
-	if vfpEnable != 0 {
-		fpsimd := fpsimdPtr((*byte)(c.floatingPointState))
+	fpDisableTrap := ring0.CPACREL1()
+	if fpDisableTrap != 0 {
+		fpsimd := fpsimdPtr(c.floatingPointState.BytePointer())
 		fpcr := ring0.GetFPCR()
 		fpsr := ring0.GetFPSR()
 		fpsimd.Fpcr = uint32(fpcr)
 		fpsimd.Fpsr = uint32(fpsr)
-		ring0.SaveVRegs((*byte)(c.floatingPointState))
+		ring0.SaveVRegs(c.floatingPointState.BytePointer())
 	}
 
 	ring0.Halt()
@@ -128,14 +134,14 @@ func (c *vCPU) KernelException(vector ring0.Vector) {
 		regs.Pc = 0
 	}
 
-	vfpEnable := ring0.CPACREL1()
-	if vfpEnable != 0 {
-		fpsimd := fpsimdPtr((*byte)(c.floatingPointState))
+	fpDisableTrap := ring0.CPACREL1()
+	if fpDisableTrap != 0 {
+		fpsimd := fpsimdPtr(c.floatingPointState.BytePointer())
 		fpcr := ring0.GetFPCR()
 		fpsr := ring0.GetFPSR()
 		fpsimd.Fpcr = uint32(fpcr)
 		fpsimd.Fpsr = uint32(fpsr)
-		ring0.SaveVRegs((*byte)(c.floatingPointState))
+		ring0.SaveVRegs(c.floatingPointState.BytePointer())
 	}
 
 	ring0.Halt()

@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"sync/atomic"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/rand"
@@ -27,6 +28,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
+	"gvisor.dev/gvisor/pkg/tcpip/ports"
 	"gvisor.dev/gvisor/pkg/tcpip/seqnum"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/waiter"
@@ -199,7 +201,7 @@ func (l *listenContext) isCookieValid(id stack.TransportEndpointID, cookie seqnu
 
 // createConnectingEndpoint creates a new endpoint in a connecting state, with
 // the connection parameters given by the arguments.
-func (l *listenContext) createConnectingEndpoint(s *segment, iss seqnum.Value, irs seqnum.Value, rcvdSynOpts *header.TCPSynOptions, queue *waiter.Queue) (*endpoint, *tcpip.Error) {
+func (l *listenContext) createConnectingEndpoint(s *segment, iss seqnum.Value, irs seqnum.Value, rcvdSynOpts *header.TCPSynOptions, queue *waiter.Queue) (*endpoint, tcpip.Error) {
 	// Create a new endpoint.
 	netProto := l.netProto
 	if netProto == 0 {
@@ -210,10 +212,9 @@ func (l *listenContext) createConnectingEndpoint(s *segment, iss seqnum.Value, i
 	if err != nil {
 		return nil, err
 	}
-	route.ResolveWith(s.remoteLinkAddr)
 
 	n := newEndpoint(l.stack, netProto, queue)
-	n.v6only = l.v6Only
+	n.ops.SetV6Only(l.v6Only)
 	n.ID = s.id
 	n.boundNICID = s.nicID
 	n.route = route
@@ -243,7 +244,7 @@ func (l *listenContext) createConnectingEndpoint(s *segment, iss seqnum.Value, i
 // On success, a handshake h is returned with h.ep.mu held.
 //
 // Precondition: if l.listenEP != nil, l.listenEP.mu must be locked.
-func (l *listenContext) startHandshake(s *segment, opts *header.TCPSynOptions, queue *waiter.Queue, owner tcpip.PacketOwner) (*handshake, *tcpip.Error) {
+func (l *listenContext) startHandshake(s *segment, opts *header.TCPSynOptions, queue *waiter.Queue, owner tcpip.PacketOwner) (*handshake, tcpip.Error) {
 	// Create new endpoint.
 	irs := s.sequenceNumber
 	isn := generateSecureISN(s.id, l.stack.Seed())
@@ -268,7 +269,7 @@ func (l *listenContext) startHandshake(s *segment, opts *header.TCPSynOptions, q
 			ep.mu.Unlock()
 			ep.Close()
 
-			return nil, tcpip.ErrConnectionAborted
+			return nil, &tcpip.ErrConnectionAborted{}
 		}
 		l.addPendingEndpoint(ep)
 
@@ -282,14 +283,14 @@ func (l *listenContext) startHandshake(s *segment, opts *header.TCPSynOptions, q
 
 			l.removePendingEndpoint(ep)
 
-			return nil, tcpip.ErrConnectionAborted
+			return nil, &tcpip.ErrConnectionAborted{}
 		}
 
 		deferAccept = l.listenEP.deferAccept
 	}
 
 	// Register new endpoint so that packets are routed to it.
-	if err := ep.stack.RegisterTransportEndpoint(ep.boundNICID, ep.effectiveNetProtos, ProtocolNumber, ep.ID, ep, ep.boundPortFlags, ep.boundBindToDevice); err != nil {
+	if err := ep.stack.RegisterTransportEndpoint(ep.effectiveNetProtos, ProtocolNumber, ep.ID, ep, ep.boundPortFlags, ep.boundBindToDevice); err != nil {
 		ep.mu.Unlock()
 		ep.Close()
 
@@ -306,10 +307,7 @@ func (l *listenContext) startHandshake(s *segment, opts *header.TCPSynOptions, q
 
 	// Initialize and start the handshake.
 	h := ep.newPassiveHandshake(isn, irs, opts, deferAccept)
-	if err := h.start(); err != nil {
-		l.cleanupFailedHandshake(h)
-		return nil, err
-	}
+	h.start()
 	return h, nil
 }
 
@@ -317,7 +315,7 @@ func (l *listenContext) startHandshake(s *segment, opts *header.TCPSynOptions, q
 // established endpoint is returned with e.mu held.
 //
 // Precondition: if l.listenEP != nil, l.listenEP.mu must be locked.
-func (l *listenContext) performHandshake(s *segment, opts *header.TCPSynOptions, queue *waiter.Queue, owner tcpip.PacketOwner) (*endpoint, *tcpip.Error) {
+func (l *listenContext) performHandshake(s *segment, opts *header.TCPSynOptions, queue *waiter.Queue, owner tcpip.PacketOwner) (*endpoint, tcpip.Error) {
 	h, err := l.startHandshake(s, opts, queue, owner)
 	if err != nil {
 		return nil, err
@@ -393,7 +391,7 @@ func (l *listenContext) cleanupCompletedHandshake(h *handshake) {
 // deliverAccepted delivers the newly-accepted endpoint to the listener. If the
 // endpoint has transitioned out of the listen state (acceptedChan is nil),
 // the new endpoint is closed instead.
-func (e *endpoint) deliverAccepted(n *endpoint) {
+func (e *endpoint) deliverAccepted(n *endpoint, withSynCookie bool) {
 	e.mu.Lock()
 	e.pendingAccepted.Add(1)
 	e.mu.Unlock()
@@ -408,8 +406,11 @@ func (e *endpoint) deliverAccepted(n *endpoint) {
 		}
 		select {
 		case e.acceptedChan <- n:
+			if !withSynCookie {
+				atomic.AddInt32(&e.synRcvdCount, -1)
+			}
 			e.acceptMu.Unlock()
-			e.waiterQueue.Notify(waiter.EventIn)
+			e.waiterQueue.Notify(waiter.ReadableEvents)
 			return
 		default:
 			e.acceptCond.Wait()
@@ -436,15 +437,16 @@ func (e *endpoint) propagateInheritableOptionsLocked(n *endpoint) {
 // * e.mu is held.
 func (e *endpoint) reserveTupleLocked() bool {
 	dest := tcpip.FullAddress{Addr: e.ID.RemoteAddress, Port: e.ID.RemotePort}
-	if !e.stack.ReserveTuple(
-		e.effectiveNetProtos,
-		ProtocolNumber,
-		e.ID.LocalAddress,
-		e.ID.LocalPort,
-		e.boundPortFlags,
-		e.boundBindToDevice,
-		dest,
-	) {
+	portRes := ports.Reservation{
+		Networks:     e.effectiveNetProtos,
+		Transport:    ProtocolNumber,
+		Addr:         e.ID.LocalAddress,
+		Port:         e.ID.LocalPort,
+		Flags:        e.boundPortFlags,
+		BindToDevice: e.boundBindToDevice,
+		Dest:         dest,
+	}
+	if !e.stack.ReserveTuple(portRes) {
 		return false
 	}
 
@@ -460,7 +462,7 @@ func (e *endpoint) reserveTupleLocked() bool {
 // can't really have any registered waiters except when stack.Wait() is called
 // which waits for all registered endpoints to stop and expects an EventHUp.
 func (e *endpoint) notifyAborted() {
-	e.waiterQueue.Notify(waiter.EventHUp | waiter.EventErr | waiter.EventIn | waiter.EventOut)
+	e.waiterQueue.Notify(waiter.EventHUp | waiter.EventErr | waiter.ReadableEvents | waiter.WritableEvents)
 }
 
 // handleSynSegment is called in its own goroutine once the listening endpoint
@@ -471,14 +473,14 @@ func (e *endpoint) notifyAborted() {
 // cookies to accept connections.
 //
 // Precondition: if ctx.listenEP != nil, ctx.listenEP.mu must be locked.
-func (e *endpoint) handleSynSegment(ctx *listenContext, s *segment, opts *header.TCPSynOptions) *tcpip.Error {
+func (e *endpoint) handleSynSegment(ctx *listenContext, s *segment, opts *header.TCPSynOptions) tcpip.Error {
 	defer s.decRef()
 
 	h, err := ctx.startHandshake(s, opts, &waiter.Queue{}, e.owner)
 	if err != nil {
 		e.stack.Stats().TCP.FailedConnectionAttempts.Increment()
 		e.stats.FailedConnectionAttempts.Increment()
-		e.synRcvdCount--
+		atomic.AddInt32(&e.synRcvdCount, -1)
 		return err
 	}
 
@@ -488,18 +490,13 @@ func (e *endpoint) handleSynSegment(ctx *listenContext, s *segment, opts *header
 			e.stack.Stats().TCP.FailedConnectionAttempts.Increment()
 			e.stats.FailedConnectionAttempts.Increment()
 			ctx.cleanupFailedHandshake(h)
-			e.mu.Lock()
-			e.synRcvdCount--
-			e.mu.Unlock()
+			atomic.AddInt32(&e.synRcvdCount, -1)
 			return
 		}
 		ctx.cleanupCompletedHandshake(h)
-		e.mu.Lock()
-		e.synRcvdCount--
-		e.mu.Unlock()
 		h.ep.startAcceptedLoop()
 		e.stack.Stats().TCP.PassiveConnectionOpenings.Increment()
-		e.deliverAccepted(h.ep)
+		e.deliverAccepted(h.ep, false /*withSynCookie*/)
 	}() // S/R-SAFE: synRcvdCount is the barrier.
 
 	return nil
@@ -507,17 +504,17 @@ func (e *endpoint) handleSynSegment(ctx *listenContext, s *segment, opts *header
 
 func (e *endpoint) incSynRcvdCount() bool {
 	e.acceptMu.Lock()
-	canInc := e.synRcvdCount < cap(e.acceptedChan)
+	canInc := int(atomic.LoadInt32(&e.synRcvdCount)) < cap(e.acceptedChan)
 	e.acceptMu.Unlock()
 	if canInc {
-		e.synRcvdCount++
+		atomic.AddInt32(&e.synRcvdCount, 1)
 	}
 	return canInc
 }
 
 func (e *endpoint) acceptQueueIsFull() bool {
 	e.acceptMu.Lock()
-	full := len(e.acceptedChan)+e.synRcvdCount >= cap(e.acceptedChan)
+	full := len(e.acceptedChan)+int(atomic.LoadInt32(&e.synRcvdCount)) >= cap(e.acceptedChan)
 	e.acceptMu.Unlock()
 	return full
 }
@@ -526,7 +523,7 @@ func (e *endpoint) acceptQueueIsFull() bool {
 // and needs to handle it.
 //
 // Precondition: if ctx.listenEP != nil, ctx.listenEP.mu must be locked.
-func (e *endpoint) handleListenSegment(ctx *listenContext, s *segment) *tcpip.Error {
+func (e *endpoint) handleListenSegment(ctx *listenContext, s *segment) tcpip.Error {
 	e.rcvListMu.Lock()
 	rcvClosed := e.rcvClosed
 	e.rcvListMu.Unlock()
@@ -573,7 +570,6 @@ func (e *endpoint) handleListenSegment(ctx *listenContext, s *segment) *tcpip.Er
 				return err
 			}
 			defer route.Release()
-			route.ResolveWith(s.remoteLinkAddr)
 
 			// Send SYN without window scaling because we currently
 			// don't encode this information in the cookie.
@@ -599,7 +595,7 @@ func (e *endpoint) handleListenSegment(ctx *listenContext, s *segment) *tcpip.Er
 				ack:    s.sequenceNumber + 1,
 				rcvWnd: ctx.rcvWnd,
 			}
-			if err := e.sendSynTCP(&route, fields, synOpts); err != nil {
+			if err := e.sendSynTCP(route, fields, synOpts); err != nil {
 				return err
 			}
 			e.stack.Stats().TCP.ListenOverflowSynCookieSent.Increment()
@@ -697,7 +693,7 @@ func (e *endpoint) handleListenSegment(ctx *listenContext, s *segment) *tcpip.Er
 		}
 
 		// Register new endpoint so that packets are routed to it.
-		if err := n.stack.RegisterTransportEndpoint(n.boundNICID, n.effectiveNetProtos, ProtocolNumber, n.ID, n, n.boundPortFlags, n.boundBindToDevice); err != nil {
+		if err := n.stack.RegisterTransportEndpoint(n.effectiveNetProtos, ProtocolNumber, n.ID, n, n.boundPortFlags, n.boundBindToDevice); err != nil {
 			n.mu.Unlock()
 			n.Close()
 
@@ -740,7 +736,7 @@ func (e *endpoint) handleListenSegment(ctx *listenContext, s *segment) *tcpip.Er
 		// Start the protocol goroutine.
 		n.startAcceptedLoop()
 		e.stack.Stats().TCP.PassiveConnectionOpenings.Increment()
-		go e.deliverAccepted(n)
+		go e.deliverAccepted(n, true /*withSynCookie*/)
 		return nil
 
 	default:
@@ -752,7 +748,7 @@ func (e *endpoint) handleListenSegment(ctx *listenContext, s *segment) *tcpip.Er
 // its own goroutine and is responsible for handling connection requests.
 func (e *endpoint) protocolListenLoop(rcvWnd seqnum.Size) {
 	e.mu.Lock()
-	v6Only := e.v6only
+	v6Only := e.ops.GetV6Only()
 	ctx := newListenContext(e.stack, e, rcvWnd, v6Only, e.NetProto)
 
 	defer func() {
@@ -775,10 +771,10 @@ func (e *endpoint) protocolListenLoop(rcvWnd seqnum.Size) {
 		e.drainClosingSegmentQueue()
 
 		// Notify waiters that the endpoint is shutdown.
-		e.waiterQueue.Notify(waiter.EventIn | waiter.EventOut | waiter.EventHUp | waiter.EventErr)
+		e.waiterQueue.Notify(waiter.ReadableEvents | waiter.WritableEvents | waiter.EventHUp | waiter.EventErr)
 	}()
 
-	s := sleep.Sleeper{}
+	var s sleep.Sleeper
 	s.AddWaker(&e.notificationWaker, wakerForNotification)
 	s.AddWaker(&e.newSegmentWaker, wakerForNewSegment)
 	for {

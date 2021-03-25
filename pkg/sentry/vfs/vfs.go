@@ -23,7 +23,9 @@
 //         Dentry.mu
 //           Locks acquired by FilesystemImpls between Prepare{Delete,Rename}Dentry and Commit{Delete,Rename*}Dentry
 //         VirtualFilesystem.filesystemsMu
-//       EpollInstance.mu
+//       fdnotifier.notifier.mu
+//         EpollInstance.mu
+//           Locks acquired by FileDescriptionImpl.Readiness
 //       Inotify.mu
 //         Watches.mu
 //           Inotify.evMu
@@ -41,6 +43,7 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/fspath"
+	"gvisor.dev/gvisor/pkg/sentry/fsmetric"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/socket/unix/transport"
 	"gvisor.dev/gvisor/pkg/sync"
@@ -381,6 +384,8 @@ func (vfs *VirtualFilesystem) MknodAt(ctx context.Context, creds *auth.Credentia
 // OpenAt returns a FileDescription providing access to the file at the given
 // path. A reference is taken on the returned FileDescription.
 func (vfs *VirtualFilesystem) OpenAt(ctx context.Context, creds *auth.Credentials, pop *PathOperation, opts *OpenOptions) (*FileDescription, error) {
+	fsmetric.Opens.Increment()
+
 	// Remove:
 	//
 	// - O_CLOEXEC, which affects file descriptors and therefore must be
@@ -421,6 +426,20 @@ func (vfs *VirtualFilesystem) OpenAt(ctx context.Context, creds *auth.Credential
 	if opts.Flags&linux.O_DIRECTORY != 0 {
 		rp.mustBeDir = true
 		rp.mustBeDirOrig = true
+	}
+	// Ignore O_PATH for verity, as verity performs extra operations on the fd for verification.
+	// The underlying filesystem that verity wraps opens the fd with O_PATH.
+	if opts.Flags&linux.O_PATH != 0 && rp.mount.fs.FilesystemType().Name() != "verity" {
+		vd, err := vfs.GetDentryAt(ctx, creds, pop, &GetDentryOptions{})
+		if err != nil {
+			return nil, err
+		}
+		fd := &opathFD{}
+		if err := fd.vfsfd.Init(fd, opts.Flags, vd.Mount(), vd.Dentry(), &FileDescriptionOptions{}); err != nil {
+			return nil, err
+		}
+		vd.DecRef(ctx)
+		return &fd.vfsfd, err
 	}
 	for {
 		fd, err := rp.mount.fs.impl.OpenAt(ctx, rp, *opts)

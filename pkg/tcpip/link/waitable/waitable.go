@@ -22,19 +22,18 @@
 package waitable
 
 import (
-	"gvisor.dev/gvisor/pkg/gate"
+	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
 // Endpoint is a waitable link-layer endpoint.
 type Endpoint struct {
-	dispatchGate gate.Gate
+	dispatchGate sync.Gate
 	dispatcher   stack.NetworkDispatcher
 
-	writeGate gate.Gate
+	writeGate sync.Gate
 	lower     stack.LinkEndpoint
 }
 
@@ -109,7 +108,7 @@ func (e *Endpoint) LinkAddress() tcpip.LinkAddress {
 // WritePacket implements stack.LinkEndpoint.WritePacket. It is called by
 // higher-level protocols to write packets. It only forwards packets to the
 // lower endpoint if Wait or WaitWrite haven't been called.
-func (e *Endpoint) WritePacket(r *stack.Route, gso *stack.GSO, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) *tcpip.Error {
+func (e *Endpoint) WritePacket(r stack.RouteInfo, gso *stack.GSO, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) tcpip.Error {
 	if !e.writeGate.Enter() {
 		return nil
 	}
@@ -122,7 +121,7 @@ func (e *Endpoint) WritePacket(r *stack.Route, gso *stack.GSO, protocol tcpip.Ne
 // WritePackets implements stack.LinkEndpoint.WritePackets. It is called by
 // higher-level protocols to write packets. It only forwards packets to the
 // lower endpoint if Wait or WaitWrite haven't been called.
-func (e *Endpoint) WritePackets(r *stack.Route, gso *stack.GSO, pkts stack.PacketBufferList, protocol tcpip.NetworkProtocolNumber) (int, *tcpip.Error) {
+func (e *Endpoint) WritePackets(r stack.RouteInfo, gso *stack.GSO, pkts stack.PacketBufferList, protocol tcpip.NetworkProtocolNumber) (int, tcpip.Error) {
 	if !e.writeGate.Enter() {
 		return pkts.Len(), nil
 	}
@@ -130,17 +129,6 @@ func (e *Endpoint) WritePackets(r *stack.Route, gso *stack.GSO, pkts stack.Packe
 	n, err := e.lower.WritePackets(r, gso, pkts, protocol)
 	e.writeGate.Leave()
 	return n, err
-}
-
-// WriteRawPacket implements stack.LinkEndpoint.WriteRawPacket.
-func (e *Endpoint) WriteRawPacket(vv buffer.VectorisedView) *tcpip.Error {
-	if !e.writeGate.Enter() {
-		return nil
-	}
-
-	err := e.lower.WriteRawPacket(vv)
-	e.writeGate.Leave()
-	return err
 }
 
 // WaitWrite prevents new calls to WritePacket from reaching the lower endpoint,

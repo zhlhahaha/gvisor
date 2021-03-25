@@ -152,23 +152,23 @@ func (s *SignalInfo) FixSignalCodeForUser() {
 	}
 }
 
-// Pid returns the si_pid field.
-func (s *SignalInfo) Pid() int32 {
+// PID returns the si_pid field.
+func (s *SignalInfo) PID() int32 {
 	return int32(usermem.ByteOrder.Uint32(s.Fields[0:4]))
 }
 
-// SetPid mutates the si_pid field.
-func (s *SignalInfo) SetPid(val int32) {
+// SetPID mutates the si_pid field.
+func (s *SignalInfo) SetPID(val int32) {
 	usermem.ByteOrder.PutUint32(s.Fields[0:4], uint32(val))
 }
 
-// Uid returns the si_uid field.
-func (s *SignalInfo) Uid() int32 {
+// UID returns the si_uid field.
+func (s *SignalInfo) UID() int32 {
 	return int32(usermem.ByteOrder.Uint32(s.Fields[4:8]))
 }
 
-// SetUid mutates the si_uid field.
-func (s *SignalInfo) SetUid(val int32) {
+// SetUID mutates the si_uid field.
+func (s *SignalInfo) SetUID(val int32) {
 	usermem.ByteOrder.PutUint32(s.Fields[4:8], uint32(val))
 }
 
@@ -250,4 +250,27 @@ func (s *SignalInfo) Arch() uint32 {
 // SetArch mutates the si_arch field.
 func (s *SignalInfo) SetArch(val uint32) {
 	usermem.ByteOrder.PutUint32(s.Fields[12:16], val)
+}
+
+// Band returns the si_band field.
+func (s *SignalInfo) Band() int64 {
+	return int64(usermem.ByteOrder.Uint64(s.Fields[0:8]))
+}
+
+// SetBand mutates the si_band field.
+func (s *SignalInfo) SetBand(val int64) {
+	// Note: this assumes the platform uses `long` as `__ARCH_SI_BAND_T`.
+	// On some platforms, which gVisor doesn't support, `__ARCH_SI_BAND_T` is
+	// `int`. See siginfo.h.
+	usermem.ByteOrder.PutUint64(s.Fields[0:8], uint64(val))
+}
+
+// FD returns the si_fd field.
+func (s *SignalInfo) FD() uint32 {
+	return usermem.ByteOrder.Uint32(s.Fields[8:12])
+}
+
+// SetFD mutates the si_fd field.
+func (s *SignalInfo) SetFD(val uint32) {
+	usermem.ByteOrder.PutUint32(s.Fields[8:12], val)
 }

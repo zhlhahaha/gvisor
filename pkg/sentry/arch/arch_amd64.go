@@ -20,11 +20,12 @@ import (
 	"bytes"
 	"fmt"
 	"math/rand"
-	"syscall"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/cpuid"
 	"gvisor.dev/gvisor/pkg/marshal"
 	"gvisor.dev/gvisor/pkg/marshal/primitive"
+	"gvisor.dev/gvisor/pkg/sentry/arch/fpu"
 	"gvisor.dev/gvisor/pkg/sentry/limits"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
@@ -105,7 +106,7 @@ const (
 // +stateify savable
 type context64 struct {
 	State
-	sigFPState []x86FPState // fpstate to be restored on sigreturn.
+	sigFPState []fpu.State // fpstate to be restored on sigreturn.
 }
 
 // Arch implements Context.Arch.
@@ -113,12 +114,16 @@ func (c *context64) Arch() Arch {
 	return AMD64
 }
 
-func (c *context64) copySigFPState() []x86FPState {
-	var sigfps []x86FPState
+func (c *context64) copySigFPState() []fpu.State {
+	var sigfps []fpu.State
 	for _, s := range c.sigFPState {
-		sigfps = append(sigfps, s.fork())
+		sigfps = append(sigfps, s.Fork())
 	}
 	return sigfps
+}
+
+func (c *context64) FloatingPointData() *fpu.State {
+	return &c.State.fpState
 }
 
 // Fork returns an exact copy of this context.
@@ -210,7 +215,7 @@ func mmapRand(max uint64) usermem.Addr {
 func (c *context64) NewMmapLayout(min, max usermem.Addr, r *limits.LimitSet) (MmapLayout, error) {
 	min, ok := min.RoundUp()
 	if !ok {
-		return MmapLayout{}, syscall.EINVAL
+		return MmapLayout{}, unix.EINVAL
 	}
 	if max > maxAddr64 {
 		max = maxAddr64
@@ -218,7 +223,7 @@ func (c *context64) NewMmapLayout(min, max usermem.Addr, r *limits.LimitSet) (Mm
 	max = max.RoundDown()
 
 	if min > max {
-		return MmapLayout{}, syscall.EINVAL
+		return MmapLayout{}, unix.EINVAL
 	}
 
 	stackSize := r.Get(limits.Stack)
@@ -297,7 +302,7 @@ const userStructSize = 928
 // PtracePeekUser implements Context.PtracePeekUser.
 func (c *context64) PtracePeekUser(addr uintptr) (marshal.Marshallable, error) {
 	if addr&7 != 0 || addr >= userStructSize {
-		return nil, syscall.EIO
+		return nil, unix.EIO
 	}
 	// PTRACE_PEEKUSER and PTRACE_POKEUSER are only effective on regs and
 	// u_debugreg, returning 0 or silently no-oping for other fields
@@ -315,7 +320,7 @@ func (c *context64) PtracePeekUser(addr uintptr) (marshal.Marshallable, error) {
 // PtracePokeUser implements Context.PtracePokeUser.
 func (c *context64) PtracePokeUser(addr, data uintptr) error {
 	if addr&7 != 0 || addr >= userStructSize {
-		return syscall.EIO
+		return unix.EIO
 	}
 	if addr < uintptr(ptraceRegistersSize) {
 		regs := c.ptraceGetRegs()

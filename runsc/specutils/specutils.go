@@ -26,12 +26,12 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/cenkalti/backoff"
 	"github.com/mohae/deepcopy"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/bits"
 	"gvisor.dev/gvisor/pkg/log"
@@ -334,14 +334,13 @@ func capsFromNames(names []string, skipSet map[linux.Capability]struct{}) (auth.
 
 // Is9PMount returns true if the given mount can be mounted as an external gofer.
 func Is9PMount(m specs.Mount) bool {
-	return m.Type == "bind" && m.Source != "" && IsSupportedDevMount(m)
+	return m.Type == "bind" && m.Source != "" && IsVFS1SupportedDevMount(m)
 }
 
-// IsSupportedDevMount returns true if the mount is a supported /dev mount.
-// Only mount that does not conflict with runsc default /dev mount is
-// supported.
-func IsSupportedDevMount(m specs.Mount) bool {
-	// These are devices exist inside sentry. See pkg/sentry/fs/dev/dev.go
+// IsVFS1SupportedDevMount returns true if m.Destination does not specify a
+// path that is hardcoded by VFS1's implementation of /dev.
+func IsVFS1SupportedDevMount(m specs.Mount) bool {
+	// See pkg/sentry/fs/dev/dev.go.
 	var existingDevices = []string{
 		"/dev/fd", "/dev/stdin", "/dev/stdout", "/dev/stderr",
 		"/dev/null", "/dev/zero", "/dev/full", "/dev/random",
@@ -375,9 +374,9 @@ func WaitForReady(pid int, timeout time.Duration, ready func() (bool, error)) er
 		// Check if the process is still running.
 		// If the process is alive, child is 0 because of the NOHANG option.
 		// If the process has terminated, child equals the process id.
-		var ws syscall.WaitStatus
-		var ru syscall.Rusage
-		child, err := syscall.Wait4(pid, &ws, syscall.WNOHANG, &ru)
+		var ws unix.WaitStatus
+		var ru unix.Rusage
+		child, err := unix.Wait4(pid, &ws, unix.WNOHANG, &ru)
 		if err != nil {
 			return backoff.Permanent(fmt.Errorf("error waiting for process: %v", err))
 		} else if child == pid {
@@ -437,7 +436,7 @@ func Mount(src, dst, typ string, flags uint32) error {
 			return fmt.Errorf("mkdir(%q) failed: %v", parent, err)
 		}
 		// Create the destination file if it does not exist.
-		f, err := os.OpenFile(dst, syscall.O_CREAT, 0777)
+		f, err := os.OpenFile(dst, unix.O_CREAT, 0777)
 		if err != nil {
 			return fmt.Errorf("open(%q) failed: %v", dst, err)
 		}
@@ -445,7 +444,7 @@ func Mount(src, dst, typ string, flags uint32) error {
 	}
 
 	// Do the mount.
-	if err := syscall.Mount(src, dst, typ, uintptr(flags), ""); err != nil {
+	if err := unix.Mount(src, dst, typ, uintptr(flags), ""); err != nil {
 		return fmt.Errorf("mount(%q, %q, %d) failed: %v", src, dst, flags, err)
 	}
 	return nil
@@ -466,7 +465,7 @@ func ContainsStr(strs []string, str string) bool {
 func RetryEintr(f func() (uintptr, uintptr, error)) (uintptr, uintptr, error) {
 	for {
 		r1, r2, err := f()
-		if err != syscall.EINTR {
+		if err != unix.EINTR {
 			return r1, r2, err
 		}
 	}
@@ -491,6 +490,31 @@ func EnvVar(env []string, name string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// ResolveEnvs transforms lists of environment variables into a single list of
+// environment variables. If a variable is defined multiple times, the last
+// value is used.
+func ResolveEnvs(envs ...[]string) ([]string, error) {
+	// First create a map of variable names to values. This removes any
+	// duplicates.
+	envMap := make(map[string]string)
+	for _, env := range envs {
+		for _, str := range env {
+			parts := strings.SplitN(str, "=", 2)
+			if len(parts) != 2 {
+				return nil, fmt.Errorf("invalid variable: %s", str)
+			}
+			envMap[parts[0]] = parts[1]
+		}
+	}
+	// Reassemble envMap into a list of environment variables of the form
+	// NAME=VALUE.
+	env := make([]string, 0, len(envMap))
+	for k, v := range envMap {
+		env = append(env, fmt.Sprintf("%s=%s", k, v))
+	}
+	return env, nil
 }
 
 // FaqErrorMsg returns an error message pointing to the FAQ.

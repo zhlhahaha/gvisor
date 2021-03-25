@@ -41,9 +41,11 @@ var (
 // NewConnectionless creates a new unbound dgram endpoint.
 func NewConnectionless(ctx context.Context) Endpoint {
 	ep := &connectionlessEndpoint{baseEndpoint{Queue: &waiter.Queue{}}}
-	q := queue{ReaderQueue: ep.Queue, WriterQueue: &waiter.Queue{}, limit: initialLimit}
+	q := queue{ReaderQueue: ep.Queue, WriterQueue: &waiter.Queue{}, limit: defaultBufferSize}
 	q.InitRefs()
 	ep.receiver = &queueReceiver{readQueue: &q}
+	ep.ops.SetSendBufferSize(defaultBufferSize, false /* notify */)
+	ep.ops.InitHandler(ep, &stackHandler{}, getSendBufferLimits)
 	return ep
 }
 
@@ -189,13 +191,13 @@ func (e *connectionlessEndpoint) Readiness(mask waiter.EventMask) waiter.EventMa
 	defer e.Unlock()
 
 	ready := waiter.EventMask(0)
-	if mask&waiter.EventIn != 0 && e.receiver.Readable() {
-		ready |= waiter.EventIn
+	if mask&waiter.ReadableEvents != 0 && e.receiver.Readable() {
+		ready |= waiter.ReadableEvents
 	}
 
 	if e.Connected() {
-		if mask&waiter.EventOut != 0 && e.connected.Writable() {
-			ready |= waiter.EventOut
+		if mask&waiter.WritableEvents != 0 && e.connected.Writable() {
+			ready |= waiter.WritableEvents
 		}
 	}
 
@@ -215,4 +217,12 @@ func (e *connectionlessEndpoint) State() uint32 {
 	default:
 		return linux.SS_DISCONNECTING
 	}
+}
+
+// OnSetSendBufferSize implements tcpip.SocketOptionsHandler.OnSetSendBufferSize.
+func (e *connectionlessEndpoint) OnSetSendBufferSize(v int64) (newSz int64) {
+	if e.Connected() {
+		return e.baseEndpoint.connected.SetSendBufferSize(v)
+	}
+	return v
 }

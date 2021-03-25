@@ -16,9 +16,9 @@ package safemem
 
 import (
 	"fmt"
-	"reflect"
 	"unsafe"
 
+	"gvisor.dev/gvisor/pkg/gohacks"
 	"gvisor.dev/gvisor/pkg/safecopy"
 )
 
@@ -68,29 +68,29 @@ func blockFromSlice(slice []byte, needSafecopy bool) Block {
 	}
 }
 
-// BlockFromSafePointer returns a Block equivalent to [ptr, ptr+len), which is
+// BlockFromSafePointer returns a Block equivalent to [ptr, ptr+length), which is
 // safe to access without safecopy.
 //
-// Preconditions: ptr+len does not overflow.
-func BlockFromSafePointer(ptr unsafe.Pointer, len int) Block {
-	return blockFromPointer(ptr, len, false)
+// Preconditions: ptr+length does not overflow.
+func BlockFromSafePointer(ptr unsafe.Pointer, length int) Block {
+	return blockFromPointer(ptr, length, false)
 }
 
 // BlockFromUnsafePointer returns a Block equivalent to [ptr, ptr+len), which
 // is not safe to access without safecopy.
 //
 // Preconditions: ptr+len does not overflow.
-func BlockFromUnsafePointer(ptr unsafe.Pointer, len int) Block {
-	return blockFromPointer(ptr, len, true)
+func BlockFromUnsafePointer(ptr unsafe.Pointer, length int) Block {
+	return blockFromPointer(ptr, length, true)
 }
 
-func blockFromPointer(ptr unsafe.Pointer, len int, needSafecopy bool) Block {
-	if uptr := uintptr(ptr); uptr+uintptr(len) < uptr {
-		panic(fmt.Sprintf("ptr %#x + len %#x overflows", ptr, len))
+func blockFromPointer(ptr unsafe.Pointer, length int, needSafecopy bool) Block {
+	if uptr := uintptr(ptr); uptr+uintptr(length) < uptr {
+		panic(fmt.Sprintf("ptr %#x + len %#x overflows", uptr, length))
 	}
 	return Block{
 		start:        ptr,
-		length:       len,
+		length:       length,
 		needSafecopy: needSafecopy,
 	}
 }
@@ -148,12 +148,11 @@ func (b Block) TakeFirst64(n uint64) Block {
 
 // ToSlice returns a []byte equivalent to b.
 func (b Block) ToSlice() []byte {
-	var bs []byte
-	hdr := (*reflect.SliceHeader)(unsafe.Pointer(&bs))
-	hdr.Data = uintptr(b.start)
-	hdr.Len = b.length
-	hdr.Cap = b.length
-	return bs
+	return *(*[]byte)(unsafe.Pointer(&gohacks.SliceHeader{
+		Data: b.start,
+		Len:  b.length,
+		Cap:  b.length,
+	}))
 }
 
 // Addr returns b's start address as a uintptr. It returns uintptr instead of

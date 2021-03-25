@@ -29,17 +29,17 @@ import (
 )
 
 const (
-	valueMax = 32767 // SEMVMX
+	// Maximum semaphore value.
+	valueMax = linux.SEMVMX
 
-	// semaphoresMax is "maximum number of semaphores per semaphore ID" (SEMMSL).
-	semaphoresMax = 32000
+	// Maximum number of semaphore sets.
+	setsMax = linux.SEMMNI
 
-	// setMax is "system-wide limit on the number of semaphore sets" (SEMMNI).
-	setsMax = 32000
+	// Maximum number of semaphroes in a semaphore set.
+	semsMax = linux.SEMMSL
 
-	// semaphoresTotalMax is "system-wide limit on the number of semaphores"
-	// (SEMMNS = SEMMNI*SEMMSL).
-	semaphoresTotalMax = 1024000000
+	// Maximum number of semaphores in all semaphroe sets.
+	semsTotalMax = linux.SEMMNS
 )
 
 // Registry maintains a set of semaphores that can be found by key or ID.
@@ -52,6 +52,9 @@ type Registry struct {
 	mu         sync.Mutex `state:"nosave"`
 	semaphores map[int32]*Set
 	lastIDUsed int32
+	// indexes maintains a mapping between a set's index in virtual array and
+	// its identifier.
+	indexes map[int32]int32
 }
 
 // Set represents a set of semaphores that can be operated atomically.
@@ -113,6 +116,7 @@ func NewRegistry(userNS *auth.UserNamespace) *Registry {
 	return &Registry{
 		userNS:     userNS,
 		semaphores: make(map[int32]*Set),
+		indexes:    make(map[int32]int32),
 	}
 }
 
@@ -122,7 +126,7 @@ func NewRegistry(userNS *auth.UserNamespace) *Registry {
 // be found. If exclusive is true, it fails if a set with the same key already
 // exists.
 func (r *Registry) FindOrCreate(ctx context.Context, key, nsems int32, mode linux.FileMode, private, create, exclusive bool) (*Set, error) {
-	if nsems < 0 || nsems > semaphoresMax {
+	if nsems < 0 || nsems > semsMax {
 		return nil, syserror.EINVAL
 	}
 
@@ -163,10 +167,13 @@ func (r *Registry) FindOrCreate(ctx context.Context, key, nsems int32, mode linu
 	}
 
 	// Apply system limits.
+	//
+	// Map semaphores and map indexes in a registry are of the same size,
+	// check map semaphores only here for the system limit.
 	if len(r.semaphores) >= setsMax {
 		return nil, syserror.EINVAL
 	}
-	if r.totalSems() > int(semaphoresTotalMax-nsems) {
+	if r.totalSems() > int(semsTotalMax-nsems) {
 		return nil, syserror.EINVAL
 	}
 
@@ -174,6 +181,53 @@ func (r *Registry) FindOrCreate(ctx context.Context, key, nsems int32, mode linu
 	owner := fs.FileOwnerFromContext(ctx)
 	perms := fs.FilePermsFromMode(mode)
 	return r.newSet(ctx, key, owner, owner, perms, nsems)
+}
+
+// IPCInfo returns information about system-wide semaphore limits and parameters.
+func (r *Registry) IPCInfo() *linux.SemInfo {
+	return &linux.SemInfo{
+		SemMap: linux.SEMMAP,
+		SemMni: linux.SEMMNI,
+		SemMns: linux.SEMMNS,
+		SemMnu: linux.SEMMNU,
+		SemMsl: linux.SEMMSL,
+		SemOpm: linux.SEMOPM,
+		SemUme: linux.SEMUME,
+		SemUsz: linux.SEMUSZ,
+		SemVmx: linux.SEMVMX,
+		SemAem: linux.SEMAEM,
+	}
+}
+
+// SemInfo returns a seminfo structure containing the same information as
+// for IPC_INFO, except that SemUsz field returns the number of existing
+// semaphore sets, and SemAem field returns the number of existing semaphores.
+func (r *Registry) SemInfo() *linux.SemInfo {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	info := r.IPCInfo()
+	info.SemUsz = uint32(len(r.semaphores))
+	info.SemAem = uint32(r.totalSems())
+
+	return info
+}
+
+// HighestIndex returns the index of the highest used entry in
+// the kernel's array.
+func (r *Registry) HighestIndex() int32 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// By default, highest used index is 0 even though
+	// there is no semaphroe set.
+	var highestIndex int32
+	for index := range r.indexes {
+		if index > highestIndex {
+			highestIndex = index
+		}
+	}
+	return highestIndex
 }
 
 // RemoveID removes set with give 'id' from the registry and marks the set as
@@ -186,6 +240,11 @@ func (r *Registry) RemoveID(id int32, creds *auth.Credentials) error {
 	if set == nil {
 		return syserror.EINVAL
 	}
+	index, found := r.findIndexByID(id)
+	if !found {
+		// Inconsistent state.
+		panic(fmt.Sprintf("unable to find an index for ID: %d", id))
+	}
 
 	set.mu.Lock()
 	defer set.mu.Unlock()
@@ -197,6 +256,7 @@ func (r *Registry) RemoveID(id int32, creds *auth.Credentials) error {
 	}
 
 	delete(r.semaphores, set.ID)
+	delete(r.indexes, index)
 	set.destroy()
 	return nil
 }
@@ -220,6 +280,11 @@ func (r *Registry) newSet(ctx context.Context, key int32, owner, creator fs.File
 			continue
 		}
 		if r.semaphores[id] == nil {
+			index, found := r.findFirstAvailableIndex()
+			if !found {
+				panic("unable to find an available index")
+			}
+			r.indexes[index] = id
 			r.lastIDUsed = id
 			r.semaphores[id] = set
 			set.ID = id
@@ -238,6 +303,18 @@ func (r *Registry) FindByID(id int32) *Set {
 	return r.semaphores[id]
 }
 
+// FindByIndex looks up a set given an index.
+func (r *Registry) FindByIndex(index int32) *Set {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	id, present := r.indexes[index]
+	if !present {
+		return nil
+	}
+	return r.semaphores[id]
+}
+
 func (r *Registry) findByKey(key int32) *Set {
 	for _, v := range r.semaphores {
 		if v.key == key {
@@ -245,6 +322,24 @@ func (r *Registry) findByKey(key int32) *Set {
 		}
 	}
 	return nil
+}
+
+func (r *Registry) findIndexByID(id int32) (int32, bool) {
+	for k, v := range r.indexes {
+		if v == id {
+			return k, true
+		}
+	}
+	return 0, false
+}
+
+func (r *Registry) findFirstAvailableIndex() (int32, bool) {
+	for index := int32(0); index < setsMax; index++ {
+		if _, present := r.indexes[index]; !present {
+			return index, true
+		}
+	}
+	return 0, false
 }
 
 func (r *Registry) totalSems() int {
@@ -286,15 +381,24 @@ func (s *Set) Change(ctx context.Context, creds *auth.Credentials, owner fs.File
 
 // GetStat extracts semid_ds information from the set.
 func (s *Set) GetStat(creds *auth.Credentials) (*linux.SemidDS, error) {
+	// "The calling process must have read permission on the semaphore set."
+	return s.semStat(creds, fs.PermMask{Read: true})
+}
+
+// GetStatAny extracts semid_ds information from the set without requiring read access.
+func (s *Set) GetStatAny(creds *auth.Credentials) (*linux.SemidDS, error) {
+	return s.semStat(creds, fs.PermMask{})
+}
+
+func (s *Set) semStat(creds *auth.Credentials, permMask fs.PermMask) (*linux.SemidDS, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// "The calling process must have read permission on the semaphore set."
-	if !s.checkPerms(creds, fs.PermMask{Read: true}) {
+	if !s.checkPerms(creds, permMask) {
 		return nil, syserror.EACCES
 	}
 
-	ds := &linux.SemidDS{
+	return &linux.SemidDS{
 		SemPerm: linux.IPCPerm{
 			Key:  uint32(s.key),
 			UID:  uint32(creds.UserNamespace.MapFromKUID(s.owner.UID)),
@@ -307,8 +411,7 @@ func (s *Set) GetStat(creds *auth.Credentials) (*linux.SemidDS, error) {
 		SemOTime: s.opTime.TimeT(),
 		SemCTime: s.changeTime.TimeT(),
 		SemNSems: uint64(s.Size()),
-	}
-	return ds, nil
+	}, nil
 }
 
 // SetVal overrides a semaphore value, waking up waiters as needed.

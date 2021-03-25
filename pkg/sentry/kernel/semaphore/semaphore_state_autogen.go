@@ -15,24 +15,29 @@ func (r *Registry) StateFields() []string {
 		"userNS",
 		"semaphores",
 		"lastIDUsed",
+		"indexes",
 	}
 }
 
 func (r *Registry) beforeSave() {}
 
+// +checklocksignore
 func (r *Registry) StateSave(stateSinkObject state.Sink) {
 	r.beforeSave()
 	stateSinkObject.Save(0, &r.userNS)
 	stateSinkObject.Save(1, &r.semaphores)
 	stateSinkObject.Save(2, &r.lastIDUsed)
+	stateSinkObject.Save(3, &r.indexes)
 }
 
 func (r *Registry) afterLoad() {}
 
+// +checklocksignore
 func (r *Registry) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &r.userNS)
 	stateSourceObject.Load(1, &r.semaphores)
 	stateSourceObject.Load(2, &r.lastIDUsed)
+	stateSourceObject.Load(3, &r.indexes)
 }
 
 func (s *Set) StateTypeName() string {
@@ -56,6 +61,7 @@ func (s *Set) StateFields() []string {
 
 func (s *Set) beforeSave() {}
 
+// +checklocksignore
 func (s *Set) StateSave(stateSinkObject state.Sink) {
 	s.beforeSave()
 	stateSinkObject.Save(0, &s.registry)
@@ -72,6 +78,7 @@ func (s *Set) StateSave(stateSinkObject state.Sink) {
 
 func (s *Set) afterLoad() {}
 
+// +checklocksignore
 func (s *Set) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &s.registry)
 	stateSourceObject.Load(1, &s.ID)
@@ -98,6 +105,7 @@ func (s *sem) StateFields() []string {
 
 func (s *sem) beforeSave() {}
 
+// +checklocksignore
 func (s *sem) StateSave(stateSinkObject state.Sink) {
 	s.beforeSave()
 	if !state.IsZeroValue(&s.waiters) {
@@ -109,6 +117,7 @@ func (s *sem) StateSave(stateSinkObject state.Sink) {
 
 func (s *sem) afterLoad() {}
 
+// +checklocksignore
 func (s *sem) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &s.value)
 	stateSourceObject.Load(1, &s.pid)
@@ -128,6 +137,7 @@ func (w *waiter) StateFields() []string {
 
 func (w *waiter) beforeSave() {}
 
+// +checklocksignore
 func (w *waiter) StateSave(stateSinkObject state.Sink) {
 	w.beforeSave()
 	stateSinkObject.Save(0, &w.waiterEntry)
@@ -137,6 +147,7 @@ func (w *waiter) StateSave(stateSinkObject state.Sink) {
 
 func (w *waiter) afterLoad() {}
 
+// +checklocksignore
 func (w *waiter) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &w.waiterEntry)
 	stateSourceObject.Load(1, &w.value)
@@ -156,6 +167,7 @@ func (l *waiterList) StateFields() []string {
 
 func (l *waiterList) beforeSave() {}
 
+// +checklocksignore
 func (l *waiterList) StateSave(stateSinkObject state.Sink) {
 	l.beforeSave()
 	stateSinkObject.Save(0, &l.head)
@@ -164,6 +176,7 @@ func (l *waiterList) StateSave(stateSinkObject state.Sink) {
 
 func (l *waiterList) afterLoad() {}
 
+// +checklocksignore
 func (l *waiterList) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &l.head)
 	stateSourceObject.Load(1, &l.tail)
@@ -182,6 +195,7 @@ func (e *waiterEntry) StateFields() []string {
 
 func (e *waiterEntry) beforeSave() {}
 
+// +checklocksignore
 func (e *waiterEntry) StateSave(stateSinkObject state.Sink) {
 	e.beforeSave()
 	stateSinkObject.Save(0, &e.next)
@@ -190,6 +204,7 @@ func (e *waiterEntry) StateSave(stateSinkObject state.Sink) {
 
 func (e *waiterEntry) afterLoad() {}
 
+// +checklocksignore
 func (e *waiterEntry) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &e.next)
 	stateSourceObject.Load(1, &e.prev)

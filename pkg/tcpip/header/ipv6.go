@@ -18,7 +18,6 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
-	"strings"
 
 	"gvisor.dev/gvisor/pkg/tcpip"
 )
@@ -48,11 +47,13 @@ type IPv6Fields struct {
 	// FlowLabel is the "flow label" field of an IPv6 packet.
 	FlowLabel uint32
 
-	// PayloadLength is the "payload length" field of an IPv6 packet.
+	// PayloadLength is the "payload length" field of an IPv6 packet, including
+	// the length of all extension headers.
 	PayloadLength uint16
 
-	// NextHeader is the "next header" field of an IPv6 packet.
-	NextHeader uint8
+	// TransportProtocol is the transport layer protocol number. Serialized in the
+	// last "next header" field of the IPv6 header + extension headers.
+	TransportProtocol tcpip.TransportProtocolNumber
 
 	// HopLimit is the "Hop Limit" field of an IPv6 packet.
 	HopLimit uint8
@@ -62,6 +63,9 @@ type IPv6Fields struct {
 
 	// DstAddr is the "destination ip address" of an IPv6 packet.
 	DstAddr tcpip.Address
+
+	// ExtensionHeaders are the extension headers following the IPv6 header.
+	ExtensionHeaders IPv6ExtHdrSerializer
 }
 
 // IPv6 represents an ipv6 header stored in a byte array.
@@ -148,13 +152,17 @@ const (
 // IPv6EmptySubnet is the empty IPv6 subnet. It may also be known as the
 // catch-all or wildcard subnet. That is, all IPv6 addresses are considered to
 // be contained within this subnet.
-var IPv6EmptySubnet = func() tcpip.Subnet {
-	subnet, err := tcpip.NewSubnet(IPv6Any, tcpip.AddressMask(IPv6Any))
-	if err != nil {
-		panic(err)
-	}
-	return subnet
-}()
+var IPv6EmptySubnet = tcpip.AddressWithPrefix{
+	Address:   IPv6Any,
+	PrefixLen: 0,
+}.Subnet()
+
+// IPv4MappedIPv6Subnet is the prefix for an IPv4 mapped IPv6 address as defined
+// by RFC 4291 section 2.5.5.
+var IPv4MappedIPv6Subnet = tcpip.AddressWithPrefix{
+	Address:   "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\x00\x00\x00\x00",
+	PrefixLen: 96,
+}.Subnet()
 
 // IPv6LinkLocalPrefix is the prefix for IPv6 link-local addresses, as defined
 // by RFC 4291 section 2.5.6.
@@ -253,12 +261,14 @@ func (IPv6) SetChecksum(uint16) {
 
 // Encode encodes all the fields of the ipv6 header.
 func (b IPv6) Encode(i *IPv6Fields) {
+	extHdr := b[IPv6MinimumSize:]
 	b.SetTOS(i.TrafficClass, i.FlowLabel)
 	b.SetPayloadLength(i.PayloadLength)
-	b[IPv6NextHeaderOffset] = i.NextHeader
 	b[hopLimit] = i.HopLimit
 	b.SetSourceAddress(i.SrcAddr)
 	b.SetDestinationAddress(i.DstAddr)
+	nextHeader, _ := i.ExtensionHeaders.Serialize(i.TransportProtocol, extHdr)
+	b[IPv6NextHeaderOffset] = nextHeader
 }
 
 // IsValid performs basic validation on the packet.
@@ -286,7 +296,7 @@ func IsV4MappedAddress(addr tcpip.Address) bool {
 		return false
 	}
 
-	return strings.HasPrefix(string(addr), "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff")
+	return IPv4MappedIPv6Subnet.Contains(addr)
 }
 
 // IsV6MulticastAddress determines if the provided address is an IPv6
@@ -392,17 +402,6 @@ func IsV6LinkLocalMulticastAddress(addr tcpip.Address) bool {
 	return IsV6MulticastAddress(addr) && addr[ipv6MulticastAddressScopeByteIdx]&ipv6MulticastAddressScopeMask == ipv6LinkLocalMulticastScope
 }
 
-// IsV6UniqueLocalAddress determines if the provided address is an IPv6
-// unique-local address (within the prefix FC00::/7).
-func IsV6UniqueLocalAddress(addr tcpip.Address) bool {
-	if len(addr) != IPv6AddressSize {
-		return false
-	}
-	// According to RFC 4193 section 3.1, a unique local address has the prefix
-	// FC00::/7.
-	return (addr[0] & 0xfe) == 0xfc
-}
-
 // AppendOpaqueInterfaceIdentifier appends a 64 bit opaque interface identifier
 // (IID) to buf as outlined by RFC 7217 and returns the extended buffer.
 //
@@ -449,17 +448,14 @@ const (
 	// LinkLocalScope indicates a link-local address.
 	LinkLocalScope IPv6AddressScope = iota
 
-	// UniqueLocalScope indicates a unique-local address.
-	UniqueLocalScope
-
 	// GlobalScope indicates a global address.
 	GlobalScope
 )
 
 // ScopeForIPv6Address returns the scope for an IPv6 address.
-func ScopeForIPv6Address(addr tcpip.Address) (IPv6AddressScope, *tcpip.Error) {
+func ScopeForIPv6Address(addr tcpip.Address) (IPv6AddressScope, tcpip.Error) {
 	if len(addr) != IPv6AddressSize {
-		return GlobalScope, tcpip.ErrBadAddress
+		return GlobalScope, &tcpip.ErrBadAddress{}
 	}
 
 	switch {
@@ -468,9 +464,6 @@ func ScopeForIPv6Address(addr tcpip.Address) (IPv6AddressScope, *tcpip.Error) {
 
 	case IsV6LinkLocalAddress(addr):
 		return LinkLocalScope, nil
-
-	case IsV6UniqueLocalAddress(addr):
-		return UniqueLocalScope, nil
 
 	default:
 		return GlobalScope, nil

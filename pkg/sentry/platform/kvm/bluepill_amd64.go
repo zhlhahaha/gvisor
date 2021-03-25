@@ -17,15 +17,14 @@
 package kvm
 
 import (
-	"syscall"
-
+	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/ring0"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
-	"gvisor.dev/gvisor/pkg/sentry/platform/ring0"
 )
 
 var (
 	// The action for bluepillSignal is changed by sigaction().
-	bluepillSignal = syscall.SIGSEGV
+	bluepillSignal = unix.SIGSEGV
 )
 
 // bluepillArchEnter is called during bluepillEnter.
@@ -74,7 +73,7 @@ func (c *vCPU) KernelSyscall() {
 	// We only trigger a bluepill entry in the bluepill function, and can
 	// therefore be guaranteed that there is no floating point state to be
 	// loaded on resuming from halt. We only worry about saving on exit.
-	ring0.SaveFloatingPoint((*byte)(c.floatingPointState)) // escapes: no.
+	ring0.SaveFloatingPoint(c.floatingPointState.BytePointer()) // escapes: no.
 	ring0.Halt()
 	ring0.WriteFS(uintptr(regs.Fs_base)) // escapes: no, reload host segment.
 }
@@ -93,7 +92,7 @@ func (c *vCPU) KernelException(vector ring0.Vector) {
 		regs.Rip = 0
 	}
 	// See above.
-	ring0.SaveFloatingPoint((*byte)(c.floatingPointState)) // escapes: no.
+	ring0.SaveFloatingPoint(c.floatingPointState.BytePointer()) // escapes: no.
 	ring0.Halt()
 	ring0.WriteFS(uintptr(regs.Fs_base)) // escapes: no; reload host segment.
 }
@@ -125,5 +124,5 @@ func bluepillArchExit(c *vCPU, context *arch.SignalContext64) {
 	// Set the context pointer to the saved floating point state. This is
 	// where the guest data has been serialized, the kernel will restore
 	// from this new pointer value.
-	context.Fpstate = uint64(uintptrValue((*byte)(c.floatingPointState)))
+	context.Fpstate = uint64(uintptrValue(c.floatingPointState.BytePointer()))
 }

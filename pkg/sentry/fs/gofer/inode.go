@@ -16,8 +16,8 @@ package gofer
 
 import (
 	"errors"
-	"syscall"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/fd"
@@ -117,7 +117,7 @@ type inodeFileState struct {
 	// loading is acquired when the inodeFileState begins an asynchronous
 	// load. It releases when the load is complete. Callers that require all
 	// state to be available should call waitForLoad() to ensure that.
-	loading sync.Mutex `state:".(struct{})"`
+	loading sync.CrossGoroutineMutex `state:".(struct{})"`
 
 	// savedUAttr is only allocated during S/R. It points to the save-time
 	// unstable attributes and is used to validate restore-time ones.
@@ -273,7 +273,7 @@ func (i *inodeFileState) recreateReadHandles(ctx context.Context, writer *handle
 	// operations on the old will see the new data. Then, make the new handle take
 	// ownereship of the old FD and mark the old readHandle to not close the FD
 	// when done.
-	if err := syscall.Dup3(h.Host.FD(), i.readHandles.Host.FD(), syscall.O_CLOEXEC); err != nil {
+	if err := unix.Dup3(h.Host.FD(), i.readHandles.Host.FD(), unix.O_CLOEXEC); err != nil {
 		return err
 	}
 
@@ -475,6 +475,9 @@ func (i *inodeOperations) Check(ctx context.Context, inode *fs.Inode, p fs.PermM
 func (i *inodeOperations) GetFile(ctx context.Context, d *fs.Dirent, flags fs.FileFlags) (*fs.File, error) {
 	switch d.Inode.StableAttr.Type {
 	case fs.Socket:
+		if i.session().overrides != nil {
+			return nil, syserror.ENXIO
+		}
 		return i.getFileSocket(ctx, d, flags)
 	case fs.Pipe:
 		return i.getFilePipe(ctx, d, flags)
@@ -486,7 +489,7 @@ func (i *inodeOperations) GetFile(ctx context.Context, d *fs.Dirent, flags fs.Fi
 func (i *inodeOperations) getFileSocket(ctx context.Context, d *fs.Dirent, flags fs.FileFlags) (*fs.File, error) {
 	f, err := i.fileState.file.connect(ctx, p9.AnonymousSocket)
 	if err != nil {
-		return nil, syscall.EIO
+		return nil, unix.EIO
 	}
 	fsf, err := host.NewSocketWithDirent(ctx, d, f, flags)
 	if err != nil {
@@ -651,7 +654,7 @@ func (i *inodeOperations) WriteOut(ctx context.Context, inode *fs.Inode) error {
 // Readlink implements fs.InodeOperations.Readlink.
 func (i *inodeOperations) Readlink(ctx context.Context, inode *fs.Inode) (string, error) {
 	if !fs.IsSymlink(inode.StableAttr) {
-		return "", syscall.ENOLINK
+		return "", unix.ENOLINK
 	}
 	return i.fileState.file.readlink(ctx)
 }
@@ -701,10 +704,10 @@ func (i *inodeOperations) configureMMap(file *fs.File, opts *memmap.MMapOpts) er
 }
 
 func init() {
-	syserror.AddErrorUnwrapper(func(err error) (syscall.Errno, bool) {
+	syserror.AddErrorUnwrapper(func(err error) (unix.Errno, bool) {
 		if _, ok := err.(p9.ErrSocket); ok {
 			// Treat as an I/O error.
-			return syscall.EIO, true
+			return unix.EIO, true
 		}
 		return 0, false
 	})

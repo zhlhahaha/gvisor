@@ -21,6 +21,7 @@ func (i *IOEvent) StateFields() []string {
 
 func (i *IOEvent) beforeSave() {}
 
+// +checklocksignore
 func (i *IOEvent) StateSave(stateSinkObject state.Sink) {
 	i.beforeSave()
 	stateSinkObject.Save(0, &i.Data)
@@ -31,6 +32,7 @@ func (i *IOEvent) StateSave(stateSinkObject state.Sink) {
 
 func (i *IOEvent) afterLoad() {}
 
+// +checklocksignore
 func (i *IOEvent) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &i.Data)
 	stateSourceObject.Load(1, &i.Obj)
@@ -53,6 +55,7 @@ func (b *BPFInstruction) StateFields() []string {
 
 func (b *BPFInstruction) beforeSave() {}
 
+// +checklocksignore
 func (b *BPFInstruction) StateSave(stateSinkObject state.Sink) {
 	b.beforeSave()
 	stateSinkObject.Save(0, &b.OpCode)
@@ -63,11 +66,43 @@ func (b *BPFInstruction) StateSave(stateSinkObject state.Sink) {
 
 func (b *BPFInstruction) afterLoad() {}
 
+// +checklocksignore
 func (b *BPFInstruction) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &b.OpCode)
 	stateSourceObject.Load(1, &b.JumpIfTrue)
 	stateSourceObject.Load(2, &b.JumpIfFalse)
 	stateSourceObject.Load(3, &b.K)
+}
+
+func (c *ControlMessageIPPacketInfo) StateTypeName() string {
+	return "pkg/abi/linux.ControlMessageIPPacketInfo"
+}
+
+func (c *ControlMessageIPPacketInfo) StateFields() []string {
+	return []string{
+		"NIC",
+		"LocalAddr",
+		"DestinationAddr",
+	}
+}
+
+func (c *ControlMessageIPPacketInfo) beforeSave() {}
+
+// +checklocksignore
+func (c *ControlMessageIPPacketInfo) StateSave(stateSinkObject state.Sink) {
+	c.beforeSave()
+	stateSinkObject.Save(0, &c.NIC)
+	stateSinkObject.Save(1, &c.LocalAddr)
+	stateSinkObject.Save(2, &c.DestinationAddr)
+}
+
+func (c *ControlMessageIPPacketInfo) afterLoad() {}
+
+// +checklocksignore
+func (c *ControlMessageIPPacketInfo) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &c.NIC)
+	stateSourceObject.Load(1, &c.LocalAddr)
+	stateSourceObject.Load(2, &c.DestinationAddr)
 }
 
 func (t *KernelTermios) StateTypeName() string {
@@ -89,6 +124,7 @@ func (t *KernelTermios) StateFields() []string {
 
 func (t *KernelTermios) beforeSave() {}
 
+// +checklocksignore
 func (t *KernelTermios) StateSave(stateSinkObject state.Sink) {
 	t.beforeSave()
 	stateSinkObject.Save(0, &t.InputFlags)
@@ -103,6 +139,7 @@ func (t *KernelTermios) StateSave(stateSinkObject state.Sink) {
 
 func (t *KernelTermios) afterLoad() {}
 
+// +checklocksignore
 func (t *KernelTermios) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &t.InputFlags)
 	stateSourceObject.Load(1, &t.OutputFlags)
@@ -127,6 +164,7 @@ func (w *WindowSize) StateFields() []string {
 
 func (w *WindowSize) beforeSave() {}
 
+// +checklocksignore
 func (w *WindowSize) StateSave(stateSinkObject state.Sink) {
 	w.beforeSave()
 	stateSinkObject.Save(0, &w.Rows)
@@ -135,6 +173,7 @@ func (w *WindowSize) StateSave(stateSinkObject state.Sink) {
 
 func (w *WindowSize) afterLoad() {}
 
+// +checklocksignore
 func (w *WindowSize) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &w.Rows)
 	stateSourceObject.Load(1, &w.Cols)
@@ -143,6 +182,7 @@ func (w *WindowSize) StateLoad(stateSourceObject state.Source) {
 func init() {
 	state.Register((*IOEvent)(nil))
 	state.Register((*BPFInstruction)(nil))
+	state.Register((*ControlMessageIPPacketInfo)(nil))
 	state.Register((*KernelTermios)(nil))
 	state.Register((*WindowSize)(nil))
 }

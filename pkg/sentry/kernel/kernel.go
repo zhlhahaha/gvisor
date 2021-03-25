@@ -214,9 +214,11 @@ type Kernel struct {
 	// netlinkPorts manages allocation of netlink socket port IDs.
 	netlinkPorts *port.Manager
 
-	// saveErr is the error causing the sandbox to exit during save, if
-	// any. It is protected by extMu.
-	saveErr error `state:"nosave"`
+	// saveStatus is nil if the sandbox has not been saved, errSaved or
+	// errAutoSaved if it has been saved successfully, or the error causing the
+	// sandbox to exit during save.
+	// It is protected by extMu.
+	saveStatus error `state:"nosave"`
 
 	// danglingEndpoints is used to save / restore tcpip.DanglingEndpoints.
 	danglingEndpoints struct{} `state:".([]tcpip.Endpoint)"`
@@ -280,6 +282,18 @@ type Kernel struct {
 	// If set to true, report address space activation waits as if the task is in
 	// external wait so that the watchdog doesn't report the task stuck.
 	SleepForAddressSpaceActivation bool
+
+	// Exceptions to YAMA ptrace restrictions. Each key-value pair represents a
+	// tracee-tracer relationship. The key is a process (technically, the thread
+	// group leader) that can be traced by any thread that is a descendant of the
+	// value. If the value is nil, then anyone can trace the process represented by
+	// the key.
+	//
+	// ptraceExceptions is protected by the TaskSet mutex.
+	ptraceExceptions map[*Task]*Task
+
+	// YAMAPtraceScope is the current level of YAMA ptrace restrictions.
+	YAMAPtraceScope int32
 }
 
 // InitKernelArgs holds arguments to Init.
@@ -380,6 +394,8 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 	k.monotonicClock = &timekeeperClock{tk: args.Timekeeper, c: sentrytime.Monotonic}
 	k.futexes = futex.NewManager()
 	k.netlinkPorts = port.New()
+	k.ptraceExceptions = make(map[*Task]*Task)
+	k.YAMAPtraceScope = linux.YAMA_SCOPE_RELATIONAL
 
 	if VFS2Enabled {
 		ctx := k.SupervisorContext()
@@ -423,7 +439,6 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 
 		k.socketsVFS2 = make(map[*vfs.FileDescription]*SocketRecord)
 	}
-
 	return nil
 }
 
@@ -591,8 +606,8 @@ func (k *Kernel) flushWritesToFiles(ctx context.Context) error {
 			// Wrap this error in ErrSaveRejection so that it will trigger a save
 			// error, rather than a panic. This also allows us to distinguish Fsync
 			// errors from state file errors in state.Save.
-			return fs.ErrSaveRejection{
-				Err: fmt.Errorf("%q was not sufficiently synced: %v", name, err),
+			return &fs.ErrSaveRejection{
+				Err: fmt.Errorf("%q was not sufficiently synced: %w", name, err),
 			}
 		}
 		return nil
@@ -1431,8 +1446,8 @@ func (k *Kernel) GlobalInit() *ThreadGroup {
 	return k.globalInit
 }
 
-// TestOnly_SetGlobalInit sets the thread group with ID 1 in the root PID namespace.
-func (k *Kernel) TestOnly_SetGlobalInit(tg *ThreadGroup) {
+// TestOnlySetGlobalInit sets the thread group with ID 1 in the root PID namespace.
+func (k *Kernel) TestOnlySetGlobalInit(tg *ThreadGroup) {
 	k.globalInit = tg
 }
 
@@ -1481,12 +1496,42 @@ func (k *Kernel) NetlinkPorts() *port.Manager {
 	return k.netlinkPorts
 }
 
-// SaveError returns the sandbox error that caused the kernel to exit during
-// save.
-func (k *Kernel) SaveError() error {
+var (
+	errSaved     = errors.New("sandbox has been successfully saved")
+	errAutoSaved = errors.New("sandbox has been successfully auto-saved")
+)
+
+// SaveStatus returns the sandbox save status. If it was saved successfully,
+// autosaved indicates whether save was triggered by autosave. If it was not
+// saved successfully, err indicates the sandbox error that caused the kernel to
+// exit during save.
+func (k *Kernel) SaveStatus() (saved, autosaved bool, err error) {
 	k.extMu.Lock()
 	defer k.extMu.Unlock()
-	return k.saveErr
+	switch k.saveStatus {
+	case nil:
+		return false, false, nil
+	case errSaved:
+		return true, false, nil
+	case errAutoSaved:
+		return true, true, nil
+	default:
+		return false, false, k.saveStatus
+	}
+}
+
+// SetSaveSuccess sets the flag indicating that save completed successfully, if
+// no status was already set.
+func (k *Kernel) SetSaveSuccess(autosave bool) {
+	k.extMu.Lock()
+	defer k.extMu.Unlock()
+	if k.saveStatus == nil {
+		if autosave {
+			k.saveStatus = errAutoSaved
+		} else {
+			k.saveStatus = errSaved
+		}
+	}
 }
 
 // SetSaveError sets the sandbox error that caused the kernel to exit during
@@ -1494,8 +1539,8 @@ func (k *Kernel) SaveError() error {
 func (k *Kernel) SetSaveError(err error) {
 	k.extMu.Lock()
 	defer k.extMu.Unlock()
-	if k.saveErr == nil {
-		k.saveErr = err
+	if k.saveStatus == nil {
+		k.saveStatus = err
 	}
 }
 

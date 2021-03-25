@@ -19,7 +19,7 @@
 // be used to expose certain endpoints to the sentry while leaving others out,
 // for example, TCP endpoints and Unix-domain endpoints.
 //
-// Lock ordering: netstack => mm: ioSequencePayload copies user memory inside
+// Lock ordering: netstack => mm: ioSequenceReadWriter copies user memory inside
 // tcpip.Endpoint.Write(). Netstack is allowed to (and does) hold locks during
 // this operation.
 package netstack
@@ -28,22 +28,19 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"math"
 	"reflect"
-	"sync/atomic"
-	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
-	"gvisor.dev/gvisor/pkg/amutex"
 	"gvisor.dev/gvisor/pkg/binary"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/marshal"
 	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/metric"
-	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/fs"
 	"gvisor.dev/gvisor/pkg/sentry/fs/fsutil"
@@ -57,7 +54,6 @@ import (
 	"gvisor.dev/gvisor/pkg/syserr"
 	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
@@ -84,83 +80,138 @@ var Metrics = tcpip.Stats{
 	MalformedRcvdPackets:       mustCreateMetric("/netstack/malformed_received_packets", "Number of packets received by netstack that were deemed malformed."),
 	DroppedPackets:             mustCreateMetric("/netstack/dropped_packets", "Number of packets dropped by netstack due to full queues."),
 	ICMP: tcpip.ICMPStats{
-		V4PacketsSent: tcpip.ICMPv4SentPacketStats{
-			ICMPv4PacketStats: tcpip.ICMPv4PacketStats{
-				Echo:           mustCreateMetric("/netstack/icmp/v4/packets_sent/echo", "Total number of ICMPv4 echo packets sent by netstack."),
-				EchoReply:      mustCreateMetric("/netstack/icmp/v4/packets_sent/echo_reply", "Total number of ICMPv4 echo reply packets sent by netstack."),
-				DstUnreachable: mustCreateMetric("/netstack/icmp/v4/packets_sent/dst_unreachable", "Total number of ICMPv4 destination unreachable packets sent by netstack."),
-				SrcQuench:      mustCreateMetric("/netstack/icmp/v4/packets_sent/src_quench", "Total number of ICMPv4 source quench packets sent by netstack."),
-				Redirect:       mustCreateMetric("/netstack/icmp/v4/packets_sent/redirect", "Total number of ICMPv4 redirect packets sent by netstack."),
-				TimeExceeded:   mustCreateMetric("/netstack/icmp/v4/packets_sent/time_exceeded", "Total number of ICMPv4 time exceeded packets sent by netstack."),
-				ParamProblem:   mustCreateMetric("/netstack/icmp/v4/packets_sent/param_problem", "Total number of ICMPv4 parameter problem packets sent by netstack."),
-				Timestamp:      mustCreateMetric("/netstack/icmp/v4/packets_sent/timestamp", "Total number of ICMPv4 timestamp packets sent by netstack."),
-				TimestampReply: mustCreateMetric("/netstack/icmp/v4/packets_sent/timestamp_reply", "Total number of ICMPv4 timestamp reply packets sent by netstack."),
-				InfoRequest:    mustCreateMetric("/netstack/icmp/v4/packets_sent/info_request", "Total number of ICMPv4 information request packets sent by netstack."),
-				InfoReply:      mustCreateMetric("/netstack/icmp/v4/packets_sent/info_reply", "Total number of ICMPv4 information reply packets sent by netstack."),
+		V4: tcpip.ICMPv4Stats{
+			PacketsSent: tcpip.ICMPv4SentPacketStats{
+				ICMPv4PacketStats: tcpip.ICMPv4PacketStats{
+					EchoRequest:    mustCreateMetric("/netstack/icmp/v4/packets_sent/echo_request", "Number of ICMPv4 echo request packets sent by netstack."),
+					EchoReply:      mustCreateMetric("/netstack/icmp/v4/packets_sent/echo_reply", "Number of ICMPv4 echo reply packets sent by netstack."),
+					DstUnreachable: mustCreateMetric("/netstack/icmp/v4/packets_sent/dst_unreachable", "Number of ICMPv4 destination unreachable packets sent by netstack."),
+					SrcQuench:      mustCreateMetric("/netstack/icmp/v4/packets_sent/src_quench", "Number of ICMPv4 source quench packets sent by netstack."),
+					Redirect:       mustCreateMetric("/netstack/icmp/v4/packets_sent/redirect", "Number of ICMPv4 redirect packets sent by netstack."),
+					TimeExceeded:   mustCreateMetric("/netstack/icmp/v4/packets_sent/time_exceeded", "Number of ICMPv4 time exceeded packets sent by netstack."),
+					ParamProblem:   mustCreateMetric("/netstack/icmp/v4/packets_sent/param_problem", "Number of ICMPv4 parameter problem packets sent by netstack."),
+					Timestamp:      mustCreateMetric("/netstack/icmp/v4/packets_sent/timestamp", "Number of ICMPv4 timestamp packets sent by netstack."),
+					TimestampReply: mustCreateMetric("/netstack/icmp/v4/packets_sent/timestamp_reply", "Number of ICMPv4 timestamp reply packets sent by netstack."),
+					InfoRequest:    mustCreateMetric("/netstack/icmp/v4/packets_sent/info_request", "Number of ICMPv4 information request packets sent by netstack."),
+					InfoReply:      mustCreateMetric("/netstack/icmp/v4/packets_sent/info_reply", "Number of ICMPv4 information reply packets sent by netstack."),
+				},
+				Dropped:     mustCreateMetric("/netstack/icmp/v4/packets_sent/dropped", "Number of ICMPv4 packets dropped by netstack due to link layer errors."),
+				RateLimited: mustCreateMetric("/netstack/icmp/v4/packets_sent/rate_limited", "Number of ICMPv4 packets dropped by netstack due to rate limit being exceeded."),
 			},
-			Dropped: mustCreateMetric("/netstack/icmp/v4/packets_sent/dropped", "Total number of ICMPv4 packets dropped by netstack due to link layer errors."),
+			PacketsReceived: tcpip.ICMPv4ReceivedPacketStats{
+				ICMPv4PacketStats: tcpip.ICMPv4PacketStats{
+					EchoRequest:    mustCreateMetric("/netstack/icmp/v4/packets_received/echo_request", "Number of ICMPv4 echo request packets received by netstack."),
+					EchoReply:      mustCreateMetric("/netstack/icmp/v4/packets_received/echo_reply", "Number of ICMPv4 echo reply packets received by netstack."),
+					DstUnreachable: mustCreateMetric("/netstack/icmp/v4/packets_received/dst_unreachable", "Number of ICMPv4 destination unreachable packets received by netstack."),
+					SrcQuench:      mustCreateMetric("/netstack/icmp/v4/packets_received/src_quench", "Number of ICMPv4 source quench packets received by netstack."),
+					Redirect:       mustCreateMetric("/netstack/icmp/v4/packets_received/redirect", "Number of ICMPv4 redirect packets received by netstack."),
+					TimeExceeded:   mustCreateMetric("/netstack/icmp/v4/packets_received/time_exceeded", "Number of ICMPv4 time exceeded packets received by netstack."),
+					ParamProblem:   mustCreateMetric("/netstack/icmp/v4/packets_received/param_problem", "Number of ICMPv4 parameter problem packets received by netstack."),
+					Timestamp:      mustCreateMetric("/netstack/icmp/v4/packets_received/timestamp", "Number of ICMPv4 timestamp packets received by netstack."),
+					TimestampReply: mustCreateMetric("/netstack/icmp/v4/packets_received/timestamp_reply", "Number of ICMPv4 timestamp reply packets received by netstack."),
+					InfoRequest:    mustCreateMetric("/netstack/icmp/v4/packets_received/info_request", "Number of ICMPv4 information request packets received by netstack."),
+					InfoReply:      mustCreateMetric("/netstack/icmp/v4/packets_received/info_reply", "Number of ICMPv4 information reply packets received by netstack."),
+				},
+				Invalid: mustCreateMetric("/netstack/icmp/v4/packets_received/invalid", "Number of ICMPv4 packets received that the transport layer could not parse."),
+			},
 		},
-		V4PacketsReceived: tcpip.ICMPv4ReceivedPacketStats{
-			ICMPv4PacketStats: tcpip.ICMPv4PacketStats{
-				Echo:           mustCreateMetric("/netstack/icmp/v4/packets_received/echo", "Total number of ICMPv4 echo packets received by netstack."),
-				EchoReply:      mustCreateMetric("/netstack/icmp/v4/packets_received/echo_reply", "Total number of ICMPv4 echo reply packets received by netstack."),
-				DstUnreachable: mustCreateMetric("/netstack/icmp/v4/packets_received/dst_unreachable", "Total number of ICMPv4 destination unreachable packets received by netstack."),
-				SrcQuench:      mustCreateMetric("/netstack/icmp/v4/packets_received/src_quench", "Total number of ICMPv4 source quench packets received by netstack."),
-				Redirect:       mustCreateMetric("/netstack/icmp/v4/packets_received/redirect", "Total number of ICMPv4 redirect packets received by netstack."),
-				TimeExceeded:   mustCreateMetric("/netstack/icmp/v4/packets_received/time_exceeded", "Total number of ICMPv4 time exceeded packets received by netstack."),
-				ParamProblem:   mustCreateMetric("/netstack/icmp/v4/packets_received/param_problem", "Total number of ICMPv4 parameter problem packets received by netstack."),
-				Timestamp:      mustCreateMetric("/netstack/icmp/v4/packets_received/timestamp", "Total number of ICMPv4 timestamp packets received by netstack."),
-				TimestampReply: mustCreateMetric("/netstack/icmp/v4/packets_received/timestamp_reply", "Total number of ICMPv4 timestamp reply packets received by netstack."),
-				InfoRequest:    mustCreateMetric("/netstack/icmp/v4/packets_received/info_request", "Total number of ICMPv4 information request packets received by netstack."),
-				InfoReply:      mustCreateMetric("/netstack/icmp/v4/packets_received/info_reply", "Total number of ICMPv4 information reply packets received by netstack."),
+		V6: tcpip.ICMPv6Stats{
+			PacketsSent: tcpip.ICMPv6SentPacketStats{
+				ICMPv6PacketStats: tcpip.ICMPv6PacketStats{
+					EchoRequest:             mustCreateMetric("/netstack/icmp/v6/packets_sent/echo_request", "Number of ICMPv6 echo request packets sent by netstack."),
+					EchoReply:               mustCreateMetric("/netstack/icmp/v6/packets_sent/echo_reply", "Number of ICMPv6 echo reply packets sent by netstack."),
+					DstUnreachable:          mustCreateMetric("/netstack/icmp/v6/packets_sent/dst_unreachable", "Number of ICMPv6 destination unreachable packets sent by netstack."),
+					PacketTooBig:            mustCreateMetric("/netstack/icmp/v6/packets_sent/packet_too_big", "Number of ICMPv6 packet too big packets sent by netstack."),
+					TimeExceeded:            mustCreateMetric("/netstack/icmp/v6/packets_sent/time_exceeded", "Number of ICMPv6 time exceeded packets sent by netstack."),
+					ParamProblem:            mustCreateMetric("/netstack/icmp/v6/packets_sent/param_problem", "Number of ICMPv6 parameter problem packets sent by netstack."),
+					RouterSolicit:           mustCreateMetric("/netstack/icmp/v6/packets_sent/router_solicit", "Number of ICMPv6 router solicit packets sent by netstack."),
+					RouterAdvert:            mustCreateMetric("/netstack/icmp/v6/packets_sent/router_advert", "Number of ICMPv6 router advert packets sent by netstack."),
+					NeighborSolicit:         mustCreateMetric("/netstack/icmp/v6/packets_sent/neighbor_solicit", "Number of ICMPv6 neighbor solicit packets sent by netstack."),
+					NeighborAdvert:          mustCreateMetric("/netstack/icmp/v6/packets_sent/neighbor_advert", "Number of ICMPv6 neighbor advert packets sent by netstack."),
+					RedirectMsg:             mustCreateMetric("/netstack/icmp/v6/packets_sent/redirect_msg", "Number of ICMPv6 redirect message packets sent by netstack."),
+					MulticastListenerQuery:  mustCreateMetric("/netstack/icmp/v6/packets_sent/multicast_listener_query", "Number of ICMPv6 multicast listener query packets sent by netstack."),
+					MulticastListenerReport: mustCreateMetric("/netstack/icmp/v6/packets_sent/multicast_listener_report", "Number of ICMPv6 multicast listener report packets sent by netstack."),
+					MulticastListenerDone:   mustCreateMetric("/netstack/icmp/v6/packets_sent/multicast_listener_done", "Number of ICMPv6 multicast listener done packets sent by netstack."),
+				},
+				Dropped:     mustCreateMetric("/netstack/icmp/v6/packets_sent/dropped", "Number of ICMPv6 packets dropped by netstack due to link layer errors."),
+				RateLimited: mustCreateMetric("/netstack/icmp/v6/packets_sent/rate_limited", "Number of ICMPv6 packets dropped by netstack due to rate limit being exceeded."),
 			},
-			Invalid: mustCreateMetric("/netstack/icmp/v4/packets_received/invalid", "Total number of ICMPv4 packets received that the transport layer could not parse."),
+			PacketsReceived: tcpip.ICMPv6ReceivedPacketStats{
+				ICMPv6PacketStats: tcpip.ICMPv6PacketStats{
+					EchoRequest:             mustCreateMetric("/netstack/icmp/v6/packets_received/echo_request", "Number of ICMPv6 echo request packets received by netstack."),
+					EchoReply:               mustCreateMetric("/netstack/icmp/v6/packets_received/echo_reply", "Number of ICMPv6 echo reply packets received by netstack."),
+					DstUnreachable:          mustCreateMetric("/netstack/icmp/v6/packets_received/dst_unreachable", "Number of ICMPv6 destination unreachable packets received by netstack."),
+					PacketTooBig:            mustCreateMetric("/netstack/icmp/v6/packets_received/packet_too_big", "Number of ICMPv6 packet too big packets received by netstack."),
+					TimeExceeded:            mustCreateMetric("/netstack/icmp/v6/packets_received/time_exceeded", "Number of ICMPv6 time exceeded packets received by netstack."),
+					ParamProblem:            mustCreateMetric("/netstack/icmp/v6/packets_received/param_problem", "Number of ICMPv6 parameter problem packets received by netstack."),
+					RouterSolicit:           mustCreateMetric("/netstack/icmp/v6/packets_received/router_solicit", "Number of ICMPv6 router solicit packets received by netstack."),
+					RouterAdvert:            mustCreateMetric("/netstack/icmp/v6/packets_received/router_advert", "Number of ICMPv6 router advert packets received by netstack."),
+					NeighborSolicit:         mustCreateMetric("/netstack/icmp/v6/packets_received/neighbor_solicit", "Number of ICMPv6 neighbor solicit packets received by netstack."),
+					NeighborAdvert:          mustCreateMetric("/netstack/icmp/v6/packets_received/neighbor_advert", "Number of ICMPv6 neighbor advert packets received by netstack."),
+					RedirectMsg:             mustCreateMetric("/netstack/icmp/v6/packets_received/redirect_msg", "Number of ICMPv6 redirect message packets received by netstack."),
+					MulticastListenerQuery:  mustCreateMetric("/netstack/icmp/v6/packets_received/multicast_listener_query", "Number of ICMPv6 multicast listener query packets received by netstack."),
+					MulticastListenerReport: mustCreateMetric("/netstack/icmp/v6/packets_received/multicast_listener_report", "Number of ICMPv6 multicast listener report packets sent by netstack."),
+					MulticastListenerDone:   mustCreateMetric("/netstack/icmp/v6/packets_received/multicast_listener_done", "Number of ICMPv6 multicast listener done packets sent by netstack."),
+				},
+				Unrecognized:                   mustCreateMetric("/netstack/icmp/v6/packets_received/unrecognized", "Number of ICMPv6 packets received that the transport layer does not know how to parse."),
+				Invalid:                        mustCreateMetric("/netstack/icmp/v6/packets_received/invalid", "Number of ICMPv6 packets received that the transport layer could not parse."),
+				RouterOnlyPacketsDroppedByHost: mustCreateMetric("/netstack/icmp/v6/packets_received/router_only_packets_dropped_by_host", "Number of ICMPv6 packets dropped due to being router-specific packets."),
+			},
 		},
-		V6PacketsSent: tcpip.ICMPv6SentPacketStats{
-			ICMPv6PacketStats: tcpip.ICMPv6PacketStats{
-				EchoRequest:     mustCreateMetric("/netstack/icmp/v6/packets_sent/echo_request", "Total number of ICMPv6 echo request packets sent by netstack."),
-				EchoReply:       mustCreateMetric("/netstack/icmp/v6/packets_sent/echo_reply", "Total number of ICMPv6 echo reply packets sent by netstack."),
-				DstUnreachable:  mustCreateMetric("/netstack/icmp/v6/packets_sent/dst_unreachable", "Total number of ICMPv6 destination unreachable packets sent by netstack."),
-				PacketTooBig:    mustCreateMetric("/netstack/icmp/v6/packets_sent/packet_too_big", "Total number of ICMPv6 packet too big packets sent by netstack."),
-				TimeExceeded:    mustCreateMetric("/netstack/icmp/v6/packets_sent/time_exceeded", "Total number of ICMPv6 time exceeded packets sent by netstack."),
-				ParamProblem:    mustCreateMetric("/netstack/icmp/v6/packets_sent/param_problem", "Total number of ICMPv6 parameter problem packets sent by netstack."),
-				RouterSolicit:   mustCreateMetric("/netstack/icmp/v6/packets_sent/router_solicit", "Total number of ICMPv6 router solicit packets sent by netstack."),
-				RouterAdvert:    mustCreateMetric("/netstack/icmp/v6/packets_sent/router_advert", "Total number of ICMPv6 router advert packets sent by netstack."),
-				NeighborSolicit: mustCreateMetric("/netstack/icmp/v6/packets_sent/neighbor_solicit", "Total number of ICMPv6 neighbor solicit packets sent by netstack."),
-				NeighborAdvert:  mustCreateMetric("/netstack/icmp/v6/packets_sent/neighbor_advert", "Total number of ICMPv6 neighbor advert packets sent by netstack."),
-				RedirectMsg:     mustCreateMetric("/netstack/icmp/v6/packets_sent/redirect_msg", "Total number of ICMPv6 redirect message packets sent by netstack."),
+	},
+	IGMP: tcpip.IGMPStats{
+		PacketsSent: tcpip.IGMPSentPacketStats{
+			IGMPPacketStats: tcpip.IGMPPacketStats{
+				MembershipQuery:    mustCreateMetric("/netstack/igmp/packets_sent/membership_query", "Number of IGMP Membership Query messages sent by netstack."),
+				V1MembershipReport: mustCreateMetric("/netstack/igmp/packets_sent/v1_membership_report", "Number of IGMPv1 Membership Report messages sent by netstack."),
+				V2MembershipReport: mustCreateMetric("/netstack/igmp/packets_sent/v2_membership_report", "Number of IGMPv2 Membership Report messages sent by netstack."),
+				LeaveGroup:         mustCreateMetric("/netstack/igmp/packets_sent/leave_group", "Number of IGMP Leave Group messages sent by netstack."),
 			},
-			Dropped: mustCreateMetric("/netstack/icmp/v6/packets_sent/dropped", "Total number of ICMPv6 packets dropped by netstack due to link layer errors."),
+			Dropped: mustCreateMetric("/netstack/igmp/packets_sent/dropped", "Number of IGMP packets dropped by netstack due to link layer errors."),
 		},
-		V6PacketsReceived: tcpip.ICMPv6ReceivedPacketStats{
-			ICMPv6PacketStats: tcpip.ICMPv6PacketStats{
-				EchoRequest:     mustCreateMetric("/netstack/icmp/v6/packets_received/echo_request", "Total number of ICMPv6 echo request packets received by netstack."),
-				EchoReply:       mustCreateMetric("/netstack/icmp/v6/packets_received/echo_reply", "Total number of ICMPv6 echo reply packets received by netstack."),
-				DstUnreachable:  mustCreateMetric("/netstack/icmp/v6/packets_received/dst_unreachable", "Total number of ICMPv6 destination unreachable packets received by netstack."),
-				PacketTooBig:    mustCreateMetric("/netstack/icmp/v6/packets_received/packet_too_big", "Total number of ICMPv6 packet too big packets received by netstack."),
-				TimeExceeded:    mustCreateMetric("/netstack/icmp/v6/packets_received/time_exceeded", "Total number of ICMPv6 time exceeded packets received by netstack."),
-				ParamProblem:    mustCreateMetric("/netstack/icmp/v6/packets_received/param_problem", "Total number of ICMPv6 parameter problem packets received by netstack."),
-				RouterSolicit:   mustCreateMetric("/netstack/icmp/v6/packets_received/router_solicit", "Total number of ICMPv6 router solicit packets received by netstack."),
-				RouterAdvert:    mustCreateMetric("/netstack/icmp/v6/packets_received/router_advert", "Total number of ICMPv6 router advert packets received by netstack."),
-				NeighborSolicit: mustCreateMetric("/netstack/icmp/v6/packets_received/neighbor_solicit", "Total number of ICMPv6 neighbor solicit packets received by netstack."),
-				NeighborAdvert:  mustCreateMetric("/netstack/icmp/v6/packets_received/neighbor_advert", "Total number of ICMPv6 neighbor advert packets received by netstack."),
-				RedirectMsg:     mustCreateMetric("/netstack/icmp/v6/packets_received/redirect_msg", "Total number of ICMPv6 redirect message packets received by netstack."),
+		PacketsReceived: tcpip.IGMPReceivedPacketStats{
+			IGMPPacketStats: tcpip.IGMPPacketStats{
+				MembershipQuery:    mustCreateMetric("/netstack/igmp/packets_received/membership_query", "Number of IGMP Membership Query messages received by netstack."),
+				V1MembershipReport: mustCreateMetric("/netstack/igmp/packets_received/v1_membership_report", "Number of IGMPv1 Membership Report messages received by netstack."),
+				V2MembershipReport: mustCreateMetric("/netstack/igmp/packets_received/v2_membership_report", "Number of IGMPv2 Membership Report messages received by netstack."),
+				LeaveGroup:         mustCreateMetric("/netstack/igmp/packets_received/leave_group", "Number of IGMP Leave Group messages received by netstack."),
 			},
-			Invalid: mustCreateMetric("/netstack/icmp/v6/packets_received/invalid", "Total number of ICMPv6 packets received that the transport layer could not parse."),
+			Invalid:        mustCreateMetric("/netstack/igmp/packets_received/invalid", "Number of IGMP packets received by netstack that could not be parsed."),
+			ChecksumErrors: mustCreateMetric("/netstack/igmp/packets_received/checksum_errors", "Number of received IGMP packets with bad checksums."),
+			Unrecognized:   mustCreateMetric("/netstack/igmp/packets_received/unrecognized", "Number of unrecognized IGMP packets received by netstack."),
 		},
 	},
 	IP: tcpip.IPStats{
-		PacketsReceived:                     mustCreateMetric("/netstack/ip/packets_received", "Total number of IP packets received from the link layer in nic.DeliverNetworkPacket."),
-		InvalidDestinationAddressesReceived: mustCreateMetric("/netstack/ip/invalid_addresses_received", "Total number of IP packets received with an unknown or invalid destination address."),
-		InvalidSourceAddressesReceived:      mustCreateMetric("/netstack/ip/invalid_source_addresses_received", "Total number of IP packets received with an unknown or invalid source address."),
-		PacketsDelivered:                    mustCreateMetric("/netstack/ip/packets_delivered", "Total number of incoming IP packets that are successfully delivered to the transport layer via HandlePacket."),
-		PacketsSent:                         mustCreateMetric("/netstack/ip/packets_sent", "Total number of IP packets sent via WritePacket."),
-		OutgoingPacketErrors:                mustCreateMetric("/netstack/ip/outgoing_packet_errors", "Total number of IP packets which failed to write to a link-layer endpoint."),
-		MalformedPacketsReceived:            mustCreateMetric("/netstack/ip/malformed_packets_received", "Total number of IP packets which failed IP header validation checks."),
-		MalformedFragmentsReceived:          mustCreateMetric("/netstack/ip/malformed_fragments_received", "Total number of IP fragments which failed IP fragment validation checks."),
-		IPTablesPreroutingDropped:           mustCreateMetric("/netstack/ip/iptables/prerouting_dropped", "Total number of IP packets dropped in the Prerouting chain."),
-		IPTablesInputDropped:                mustCreateMetric("/netstack/ip/iptables/input_dropped", "Total number of IP packets dropped in the Input chain."),
-		IPTablesOutputDropped:               mustCreateMetric("/netstack/ip/iptables/output_dropped", "Total number of IP packets dropped in the Output chain."),
+		PacketsReceived:                     mustCreateMetric("/netstack/ip/packets_received", "Number of IP packets received from the link layer in nic.DeliverNetworkPacket."),
+		DisabledPacketsReceived:             mustCreateMetric("/netstack/ip/disabled_packets_received", "Number of IP packets received from the link layer when the IP layer is disabled."),
+		InvalidDestinationAddressesReceived: mustCreateMetric("/netstack/ip/invalid_addresses_received", "Number of IP packets received with an unknown or invalid destination address."),
+		InvalidSourceAddressesReceived:      mustCreateMetric("/netstack/ip/invalid_source_addresses_received", "Number of IP packets received with an unknown or invalid source address."),
+		PacketsDelivered:                    mustCreateMetric("/netstack/ip/packets_delivered", "Number of incoming IP packets that are successfully delivered to the transport layer via HandlePacket."),
+		PacketsSent:                         mustCreateMetric("/netstack/ip/packets_sent", "Number of IP packets sent via WritePacket."),
+		OutgoingPacketErrors:                mustCreateMetric("/netstack/ip/outgoing_packet_errors", "Number of IP packets which failed to write to a link-layer endpoint."),
+		MalformedPacketsReceived:            mustCreateMetric("/netstack/ip/malformed_packets_received", "Number of IP packets which failed IP header validation checks."),
+		MalformedFragmentsReceived:          mustCreateMetric("/netstack/ip/malformed_fragments_received", "Number of IP fragments which failed IP fragment validation checks."),
+		IPTablesPreroutingDropped:           mustCreateMetric("/netstack/ip/iptables/prerouting_dropped", "Number of IP packets dropped in the Prerouting chain."),
+		IPTablesInputDropped:                mustCreateMetric("/netstack/ip/iptables/input_dropped", "Number of IP packets dropped in the Input chain."),
+		IPTablesOutputDropped:               mustCreateMetric("/netstack/ip/iptables/output_dropped", "Number of IP packets dropped in the Output chain."),
+		OptionTimestampReceived:             mustCreateMetric("/netstack/ip/options/timestamp_received", "Number of timestamp options found in received IP packets."),
+		OptionRecordRouteReceived:           mustCreateMetric("/netstack/ip/options/record_route_received", "Number of record route options found in received IP packets."),
+		OptionRouterAlertReceived:           mustCreateMetric("/netstack/ip/options/router_alert_received", "Number of router alert options found in received IP packets."),
+		OptionUnknownReceived:               mustCreateMetric("/netstack/ip/options/unknown_received", "Number of unknown options found in received IP packets."),
+	},
+	ARP: tcpip.ARPStats{
+		PacketsReceived:                                 mustCreateMetric("/netstack/arp/packets_received", "Number of ARP packets received from the link layer."),
+		DisabledPacketsReceived:                         mustCreateMetric("/netstack/arp/disabled_packets_received", "Number of ARP packets received from the link layer when the ARP layer is disabled."),
+		MalformedPacketsReceived:                        mustCreateMetric("/netstack/arp/malformed_packets_received", "Number of ARP packets which failed ARP header validation checks."),
+		RequestsReceived:                                mustCreateMetric("/netstack/arp/requests_received", "Number of ARP requests received."),
+		RequestsReceivedUnknownTargetAddress:            mustCreateMetric("/netstack/arp/requests_received_unknown_addr", "Number of ARP requests received with an unknown target address."),
+		OutgoingRequestInterfaceHasNoLocalAddressErrors: mustCreateMetric("/netstack/arp/outgoing_requests_iface_has_no_addr", "Number of failed attempts to send an ARP request with an interface that has no network address."),
+		OutgoingRequestBadLocalAddressErrors:            mustCreateMetric("/netstack/arp/outgoing_requests_invalid_local_addr", "Number of failed attempts to send an ARP request with a provided local address that is invalid."),
+		OutgoingRequestsDropped:                         mustCreateMetric("/netstack/arp/outgoing_requests_dropped", "Number of ARP requests which failed to write to a link-layer endpoint."),
+		OutgoingRequestsSent:                            mustCreateMetric("/netstack/arp/outgoing_requests_sent", "Number of ARP requests sent."),
+		RepliesReceived:                                 mustCreateMetric("/netstack/arp/replies_received", "Number of ARP replies received."),
+		OutgoingRepliesDropped:                          mustCreateMetric("/netstack/arp/outgoing_replies_dropped", "Number of ARP replies which failed to write to a link-layer endpoint."),
+		OutgoingRepliesSent:                             mustCreateMetric("/netstack/arp/outgoing_replies_sent", "Number of ARP replies sent."),
 	},
 	TCP: tcpip.TCPStats{
 		ActiveConnectionOpenings:           mustCreateMetric("/netstack/tcp/active_connection_openings", "Number of connections opened successfully via Connect."),
@@ -185,6 +236,7 @@ var Metrics = tcpip.Stats{
 		Retransmits:                        mustCreateMetric("/netstack/tcp/retransmits", "Number of TCP segments retransmitted."),
 		FastRecovery:                       mustCreateMetric("/netstack/tcp/fast_recovery", "Number of times fast recovery was used to recover from packet loss."),
 		SACKRecovery:                       mustCreateMetric("/netstack/tcp/sack_recovery", "Number of times SACK recovery was used to recover from packet loss."),
+		TLPRecovery:                        mustCreateMetric("/netstack/tcp/tlp_recovery", "Number of times tail loss probe triggers recovery from tail loss."),
 		SlowStartRetransmits:               mustCreateMetric("/netstack/tcp/slow_start_retransmits", "Number of segments retransmitted in slow start mode."),
 		FastRetransmit:                     mustCreateMetric("/netstack/tcp/fast_retransmit", "Number of TCP segments which were fast retransmitted."),
 		Timeouts:                           mustCreateMetric("/netstack/tcp/timeouts", "Number of times RTO expired."),
@@ -209,28 +261,16 @@ const sizeOfInt32 int = 4
 
 var errStackType = syserr.New("expected but did not receive a netstack.Stack", linux.EINVAL)
 
-// ntohs converts a 16-bit number from network byte order to host byte order. It
-// assumes that the host is little endian.
-func ntohs(v uint16) uint16 {
-	return v<<8 | v>>8
-}
-
-// htons converts a 16-bit number from host byte order to network byte order. It
-// assumes that the host is little endian.
-func htons(v uint16) uint16 {
-	return ntohs(v)
-}
-
 // commonEndpoint represents the intersection of a tcpip.Endpoint and a
 // transport.Endpoint.
 type commonEndpoint interface {
 	// GetLocalAddress implements tcpip.Endpoint.GetLocalAddress and
 	// transport.Endpoint.GetLocalAddress.
-	GetLocalAddress() (tcpip.FullAddress, *tcpip.Error)
+	GetLocalAddress() (tcpip.FullAddress, tcpip.Error)
 
 	// GetRemoteAddress implements tcpip.Endpoint.GetRemoteAddress and
 	// transport.Endpoint.GetRemoteAddress.
-	GetRemoteAddress() (tcpip.FullAddress, *tcpip.Error)
+	GetRemoteAddress() (tcpip.FullAddress, tcpip.Error)
 
 	// Readiness implements tcpip.Endpoint.Readiness and
 	// transport.Endpoint.Readiness.
@@ -238,32 +278,30 @@ type commonEndpoint interface {
 
 	// SetSockOpt implements tcpip.Endpoint.SetSockOpt and
 	// transport.Endpoint.SetSockOpt.
-	SetSockOpt(tcpip.SettableSocketOption) *tcpip.Error
-
-	// SetSockOptBool implements tcpip.Endpoint.SetSockOptBool and
-	// transport.Endpoint.SetSockOptBool.
-	SetSockOptBool(opt tcpip.SockOptBool, v bool) *tcpip.Error
+	SetSockOpt(tcpip.SettableSocketOption) tcpip.Error
 
 	// SetSockOptInt implements tcpip.Endpoint.SetSockOptInt and
 	// transport.Endpoint.SetSockOptInt.
-	SetSockOptInt(opt tcpip.SockOptInt, v int) *tcpip.Error
+	SetSockOptInt(opt tcpip.SockOptInt, v int) tcpip.Error
 
 	// GetSockOpt implements tcpip.Endpoint.GetSockOpt and
 	// transport.Endpoint.GetSockOpt.
-	GetSockOpt(tcpip.GettableSocketOption) *tcpip.Error
-
-	// GetSockOptBool implements tcpip.Endpoint.GetSockOptBool and
-	// transport.Endpoint.GetSockOpt.
-	GetSockOptBool(opt tcpip.SockOptBool) (bool, *tcpip.Error)
+	GetSockOpt(tcpip.GettableSocketOption) tcpip.Error
 
 	// GetSockOptInt implements tcpip.Endpoint.GetSockOptInt and
 	// transport.Endpoint.GetSockOpt.
-	GetSockOptInt(opt tcpip.SockOptInt) (int, *tcpip.Error)
+	GetSockOptInt(opt tcpip.SockOptInt) (int, tcpip.Error)
 
-	// LastError implements tcpip.Endpoint.LastError.
-	LastError() *tcpip.Error
+	// State returns a socket's lifecycle state. The returned value is
+	// protocol-specific and is primarily used for diagnostics.
+	State() uint32
 
-	// SocketOptions implements tcpip.Endpoint.SocketOptions.
+	// LastError implements tcpip.Endpoint.LastError and
+	// transport.Endpoint.LastError.
+	LastError() tcpip.Error
+
+	// SocketOptions implements tcpip.Endpoint.SocketOptions and
+	// transport.Endpoint.SocketOptions.
 	SocketOptions() *tcpip.SocketOptions
 }
 
@@ -296,21 +334,8 @@ type socketOpsCommon struct {
 	skType   linux.SockType
 	protocol int
 
-	// readViewHasData is 1 iff readView has data to be read, 0 otherwise.
-	// Must be accessed using atomic operations. It must only be written
-	// with readMu held but can be read without holding readMu. The latter
-	// is required to avoid deadlocks in epoll Readiness checks.
-	readViewHasData uint32
-
 	// readMu protects access to the below fields.
 	readMu sync.Mutex `state:"nosave"`
-	// readView contains the remaining payload from the last packet.
-	readView buffer.View
-	// readCM holds control message information for the last packet read
-	// from Endpoint.
-	readCM         tcpip.ControlMessages
-	sender         tcpip.FullAddress
-	linkPacketInfo tcpip.LinkPacketInfo
 
 	// sockOptTimestamp corresponds to SO_TIMESTAMP. When true, timestamps
 	// of returned messages can be returned via control messages. When
@@ -324,17 +349,15 @@ type socketOpsCommon struct {
 	// valid when timestampValid is true. It is protected by readMu.
 	timestampNS int64
 
-	// sockOptInq corresponds to TCP_INQ. It is implemented at this level
-	// because it takes into account data from readView.
+	// TODO(b/153685824): Move this to SocketOptions.
+	// sockOptInq corresponds to TCP_INQ.
 	sockOptInq bool
 }
 
 // New creates a new endpoint socket.
 func New(t *kernel.Task, family int, skType linux.SockType, protocol int, queue *waiter.Queue, endpoint tcpip.Endpoint) (*fs.File, *syserr.Error) {
 	if skType == linux.SOCK_STREAM {
-		if err := endpoint.SetSockOptBool(tcpip.DelayOption, true); err != nil {
-			return nil, syserr.TranslateNetstackError(err)
-		}
+		endpoint.SocketOptions().SetDelayOption(true)
 	}
 
 	dirent := socket.NewDirent(t, netstackDevice)
@@ -363,127 +386,8 @@ func bytesToIPAddress(addr []byte) tcpip.Address {
 	return tcpip.Address(addr)
 }
 
-// AddressAndFamily reads an sockaddr struct from the given address and
-// converts it to the FullAddress format. It supports AF_UNIX, AF_INET,
-// AF_INET6, and AF_PACKET addresses.
-//
-// AddressAndFamily returns an address and its family.
-func AddressAndFamily(addr []byte) (tcpip.FullAddress, uint16, *syserr.Error) {
-	// Make sure we have at least 2 bytes for the address family.
-	if len(addr) < 2 {
-		return tcpip.FullAddress{}, 0, syserr.ErrInvalidArgument
-	}
-
-	// Get the rest of the fields based on the address family.
-	switch family := usermem.ByteOrder.Uint16(addr); family {
-	case linux.AF_UNIX:
-		path := addr[2:]
-		if len(path) > linux.UnixPathMax {
-			return tcpip.FullAddress{}, family, syserr.ErrInvalidArgument
-		}
-		// Drop the terminating NUL (if one exists) and everything after
-		// it for filesystem (non-abstract) addresses.
-		if len(path) > 0 && path[0] != 0 {
-			if n := bytes.IndexByte(path[1:], 0); n >= 0 {
-				path = path[:n+1]
-			}
-		}
-		return tcpip.FullAddress{
-			Addr: tcpip.Address(path),
-		}, family, nil
-
-	case linux.AF_INET:
-		var a linux.SockAddrInet
-		if len(addr) < sockAddrInetSize {
-			return tcpip.FullAddress{}, family, syserr.ErrInvalidArgument
-		}
-		binary.Unmarshal(addr[:sockAddrInetSize], usermem.ByteOrder, &a)
-
-		out := tcpip.FullAddress{
-			Addr: bytesToIPAddress(a.Addr[:]),
-			Port: ntohs(a.Port),
-		}
-		return out, family, nil
-
-	case linux.AF_INET6:
-		var a linux.SockAddrInet6
-		if len(addr) < sockAddrInet6Size {
-			return tcpip.FullAddress{}, family, syserr.ErrInvalidArgument
-		}
-		binary.Unmarshal(addr[:sockAddrInet6Size], usermem.ByteOrder, &a)
-
-		out := tcpip.FullAddress{
-			Addr: bytesToIPAddress(a.Addr[:]),
-			Port: ntohs(a.Port),
-		}
-		if isLinkLocal(out.Addr) {
-			out.NIC = tcpip.NICID(a.Scope_id)
-		}
-		return out, family, nil
-
-	case linux.AF_PACKET:
-		var a linux.SockAddrLink
-		if len(addr) < sockAddrLinkSize {
-			return tcpip.FullAddress{}, family, syserr.ErrInvalidArgument
-		}
-		binary.Unmarshal(addr[:sockAddrLinkSize], usermem.ByteOrder, &a)
-		if a.Family != linux.AF_PACKET || a.HardwareAddrLen != header.EthernetAddressSize {
-			return tcpip.FullAddress{}, family, syserr.ErrInvalidArgument
-		}
-
-		// TODO(gvisor.dev/issue/173): Return protocol too.
-		return tcpip.FullAddress{
-			NIC:  tcpip.NICID(a.InterfaceIndex),
-			Addr: tcpip.Address(a.HardwareAddr[:header.EthernetAddressSize]),
-		}, family, nil
-
-	case linux.AF_UNSPEC:
-		return tcpip.FullAddress{}, family, nil
-
-	default:
-		return tcpip.FullAddress{}, 0, syserr.ErrAddressFamilyNotSupported
-	}
-}
-
 func (s *socketOpsCommon) isPacketBased() bool {
 	return s.skType == linux.SOCK_DGRAM || s.skType == linux.SOCK_SEQPACKET || s.skType == linux.SOCK_RDM || s.skType == linux.SOCK_RAW
-}
-
-// fetchReadView updates the readView field of the socket if it's currently
-// empty. It assumes that the socket is locked.
-//
-// Precondition: s.readMu must be held.
-func (s *socketOpsCommon) fetchReadView() *syserr.Error {
-	if len(s.readView) > 0 {
-		return nil
-	}
-	s.readView = nil
-	s.sender = tcpip.FullAddress{}
-	s.linkPacketInfo = tcpip.LinkPacketInfo{}
-
-	var v buffer.View
-	var cms tcpip.ControlMessages
-	var err *tcpip.Error
-
-	switch e := s.Endpoint.(type) {
-	// The ordering of these interfaces matters. The most specific
-	// interfaces must be specified before the more generic Endpoint
-	// interface.
-	case tcpip.PacketEndpoint:
-		v, cms, err = e.ReadPacket(&s.sender, &s.linkPacketInfo)
-	case tcpip.Endpoint:
-		v, cms, err = e.Read(&s.sender)
-	}
-	if err != nil {
-		atomic.StoreUint32(&s.readViewHasData, 0)
-		return syserr.TranslateNetstackError(err)
-	}
-
-	s.readView = v
-	s.readCM = cms
-	atomic.StoreUint32(&s.readViewHasData, 1)
-
-	return nil
 }
 
 // Release implements fs.FileOperations.Release.
@@ -500,11 +404,7 @@ func (s *socketOpsCommon) Release(ctx context.Context) {
 		return
 	}
 
-	var v tcpip.LingerOption
-	if err := s.Endpoint.GetSockOpt(&v); err != nil {
-		return
-	}
-
+	v := s.Endpoint.SocketOptions().GetLinger()
 	// The case for zero timeout is handled in tcp endpoint close function.
 	// Close is blocked until either:
 	// 1. The endpoint state is not in any of the states: FIN-WAIT1,
@@ -536,184 +436,80 @@ func (s *SocketOperations) Read(ctx context.Context, _ *fs.File, dst usermem.IOS
 // WriteTo implements fs.FileOperations.WriteTo.
 func (s *SocketOperations) WriteTo(ctx context.Context, _ *fs.File, dst io.Writer, count int64, dup bool) (int64, error) {
 	s.readMu.Lock()
+	defer s.readMu.Unlock()
 
-	// Copy as much data as possible.
-	done := int64(0)
-	for count > 0 {
-		// This may return a blocking error.
-		if err := s.fetchReadView(); err != nil {
-			s.readMu.Unlock()
-			return done, err.ToError()
-		}
-
-		// Write to the underlying file.
-		n, err := dst.Write(s.readView)
-		done += int64(n)
-		count -= int64(n)
-		if dup {
-			// That's all we support for dup. This is generally
-			// supported by any Linux system calls, but the
-			// expectation is that now a caller will call read to
-			// actually remove these bytes from the socket.
-			break
-		}
-
-		// Drop that part of the view.
-		s.readView.TrimFront(n)
-		if err != nil {
-			s.readMu.Unlock()
-			return done, err
-		}
+	w := tcpip.LimitedWriter{
+		W: dst,
+		N: count,
 	}
 
-	s.readMu.Unlock()
-	return done, nil
-}
-
-// ioSequencePayload implements tcpip.Payload.
-//
-// t copies user memory bytes on demand based on the requested size.
-type ioSequencePayload struct {
-	ctx context.Context
-	src usermem.IOSequence
-}
-
-// FullPayload implements tcpip.Payloader.FullPayload
-func (i *ioSequencePayload) FullPayload() ([]byte, *tcpip.Error) {
-	return i.Payload(int(i.src.NumBytes()))
-}
-
-// Payload implements tcpip.Payloader.Payload.
-func (i *ioSequencePayload) Payload(size int) ([]byte, *tcpip.Error) {
-	if max := int(i.src.NumBytes()); size > max {
-		size = max
+	// This may return a blocking error.
+	res, err := s.Endpoint.Read(&w, tcpip.ReadOptions{
+		Peek: dup,
+	})
+	if err != nil {
+		return 0, syserr.TranslateNetstackError(err).ToError()
 	}
-	v := buffer.NewView(size)
-	if _, err := i.src.CopyIn(i.ctx, v); err != nil {
-		// EOF can be returned only if src is a file and this means it
-		// is in a splice syscall and the error has to be ignored.
-		if err == io.EOF {
-			return v, nil
-		}
-		return nil, tcpip.ErrBadAddress
-	}
-	return v, nil
-}
-
-// DropFirst drops the first n bytes from underlying src.
-func (i *ioSequencePayload) DropFirst(n int) {
-	i.src = i.src.DropFirst(int(n))
+	return int64(res.Count), nil
 }
 
 // Write implements fs.FileOperations.Write.
 func (s *SocketOperations) Write(ctx context.Context, _ *fs.File, src usermem.IOSequence, _ int64) (int64, error) {
-	f := &ioSequencePayload{ctx: ctx, src: src}
-	n, resCh, err := s.Endpoint.Write(f, tcpip.WriteOptions{})
-	if err == tcpip.ErrWouldBlock {
+	r := src.Reader(ctx)
+	n, err := s.Endpoint.Write(r, tcpip.WriteOptions{})
+	if _, ok := err.(*tcpip.ErrWouldBlock); ok {
 		return 0, syserror.ErrWouldBlock
 	}
-
-	if resCh != nil {
-		if err := amutex.Block(ctx, resCh); err != nil {
-			return 0, err
-		}
-		n, _, err = s.Endpoint.Write(f, tcpip.WriteOptions{})
-	}
-
 	if err != nil {
 		return 0, syserr.TranslateNetstackError(err).ToError()
 	}
 
-	if int64(n) < src.NumBytes() {
-		return int64(n), syserror.ErrWouldBlock
+	if n < src.NumBytes() {
+		return n, syserror.ErrWouldBlock
 	}
 
-	return int64(n), nil
+	return n, nil
 }
 
-// readerPayload implements tcpip.Payloader.
-//
-// It allocates a view and reads from a reader on-demand, based on available
-// capacity in the endpoint.
-type readerPayload struct {
-	ctx   context.Context
-	r     io.Reader
-	count int64
+var _ tcpip.Payloader = (*limitedPayloader)(nil)
+
+type limitedPayloader struct {
+	inner io.LimitedReader
 	err   error
 }
 
-// FullPayload implements tcpip.Payloader.FullPayload.
-func (r *readerPayload) FullPayload() ([]byte, *tcpip.Error) {
-	return r.Payload(int(r.count))
+func (l *limitedPayloader) Read(p []byte) (int, error) {
+	n, err := l.inner.Read(p)
+	l.err = err
+	return n, err
 }
 
-// Payload implements tcpip.Payloader.Payload.
-func (r *readerPayload) Payload(size int) ([]byte, *tcpip.Error) {
-	if size > int(r.count) {
-		size = int(r.count)
-	}
-	v := buffer.NewView(size)
-	n, err := r.r.Read(v)
-	if n > 0 {
-		// We ignore the error here. It may re-occur on subsequent
-		// reads, but for now we can enqueue some amount of data.
-		r.count -= int64(n)
-		return v[:n], nil
-	}
-	if err == syserror.ErrWouldBlock {
-		return nil, tcpip.ErrWouldBlock
-	} else if err != nil {
-		r.err = err // Save for propation.
-		return nil, tcpip.ErrBadAddress
-	}
-
-	// There is no data and no error. Return an error, which will propagate
-	// r.err, which will be nil. This is the desired result: (0, nil).
-	return nil, tcpip.ErrBadAddress
+func (l *limitedPayloader) Len() int {
+	return int(l.inner.N)
 }
 
 // ReadFrom implements fs.FileOperations.ReadFrom.
 func (s *SocketOperations) ReadFrom(ctx context.Context, _ *fs.File, r io.Reader, count int64) (int64, error) {
-	f := &readerPayload{ctx: ctx, r: r, count: count}
-	n, resCh, err := s.Endpoint.Write(f, tcpip.WriteOptions{
+	f := limitedPayloader{
+		inner: io.LimitedReader{
+			R: r,
+			N: count,
+		},
+	}
+	n, err := s.Endpoint.Write(&f, tcpip.WriteOptions{
 		// Reads may be destructive but should be very fast,
 		// so we can't release the lock while copying data.
 		Atomic: true,
 	})
-	if err == tcpip.ErrWouldBlock {
-		return 0, syserror.ErrWouldBlock
+	if _, ok := err.(*tcpip.ErrBadBuffer); ok {
+		return n, f.err
 	}
-
-	if resCh != nil {
-		if err := amutex.Block(ctx, resCh); err != nil {
-			return 0, err
-		}
-		n, _, err = s.Endpoint.Write(f, tcpip.WriteOptions{
-			Atomic: true, // See above.
-		})
-	}
-	if err == tcpip.ErrWouldBlock {
-		return n, syserror.ErrWouldBlock
-	} else if err != nil {
-		return int64(n), f.err // Propagate error.
-	}
-
-	return int64(n), nil
+	return n, syserr.TranslateNetstackError(err).ToError()
 }
 
 // Readiness returns a mask of ready events for socket s.
 func (s *socketOpsCommon) Readiness(mask waiter.EventMask) waiter.EventMask {
-	r := s.Endpoint.Readiness(mask)
-
-	// Check our cached value iff the caller asked for readability and the
-	// endpoint itself is currently not readable.
-	if (mask & ^r & waiter.EventIn) != 0 {
-		if atomic.LoadUint32(&s.readViewHasData) == 1 {
-			r |= waiter.EventIn
-		}
-	}
-
-	return r
+	return s.Endpoint.Readiness(mask)
 }
 
 func (s *socketOpsCommon) checkFamily(family uint16, exact bool) *syserr.Error {
@@ -721,11 +517,7 @@ func (s *socketOpsCommon) checkFamily(family uint16, exact bool) *syserr.Error {
 		return nil
 	}
 	if !exact && family == linux.AF_INET && s.family == linux.AF_INET6 {
-		v, err := s.Endpoint.GetSockOptBool(tcpip.V6OnlyOption)
-		if err != nil {
-			return syserr.TranslateNetstackError(err)
-		}
-		if !v {
+		if !s.Endpoint.SocketOptions().GetV6Only() {
 			return nil
 		}
 	}
@@ -749,14 +541,14 @@ func (s *socketOpsCommon) mapFamily(addr tcpip.FullAddress, family uint16) tcpip
 // Connect implements the linux syscall connect(2) for sockets backed by
 // tpcip.Endpoint.
 func (s *socketOpsCommon) Connect(t *kernel.Task, sockaddr []byte, blocking bool) *syserr.Error {
-	addr, family, err := AddressAndFamily(sockaddr)
+	addr, family, err := socket.AddressAndFamily(sockaddr)
 	if err != nil {
 		return err
 	}
 
 	if family == linux.AF_UNSPEC {
 		err := s.Endpoint.Disconnect()
-		if err == tcpip.ErrNotSupported {
+		if _, ok := err.(*tcpip.ErrNotSupported); ok {
 			return syserr.ErrAddressFamilyNotSupported
 		}
 		return syserr.TranslateNetstackError(err)
@@ -775,18 +567,19 @@ func (s *socketOpsCommon) Connect(t *kernel.Task, sockaddr []byte, blocking bool
 	// Register for notification when the endpoint becomes writable, then
 	// initiate the connection.
 	e, ch := waiter.NewChannelEntry(nil)
-	s.EventRegister(&e, waiter.EventOut)
+	s.EventRegister(&e, waiter.WritableEvents)
 	defer s.EventUnregister(&e)
 
-	if err := s.Endpoint.Connect(addr); err != tcpip.ErrConnectStarted && err != tcpip.ErrAlreadyConnecting {
+	switch err := s.Endpoint.Connect(addr); err.(type) {
+	case *tcpip.ErrConnectStarted, *tcpip.ErrAlreadyConnecting:
+	case *tcpip.ErrNoPortAvailable:
 		if (s.family == unix.AF_INET || s.family == unix.AF_INET6) && s.skType == linux.SOCK_STREAM {
 			// TCP unlike UDP returns EADDRNOTAVAIL when it can't
 			// find an available local ephemeral port.
-			if err == tcpip.ErrNoPortAvailable {
-				return syserr.ErrAddressNotAvailable
-			}
+			return syserr.ErrAddressNotAvailable
 		}
-
+		return syserr.TranslateNetstackError(err)
+	default:
 		return syserr.TranslateNetstackError(err)
 	}
 
@@ -830,7 +623,7 @@ func (s *socketOpsCommon) Bind(t *kernel.Task, sockaddr []byte) *syserr.Error {
 		}
 	} else {
 		var err *syserr.Error
-		addr, family, err = AddressAndFamily(sockaddr)
+		addr, family, err = socket.AddressAndFamily(sockaddr)
 		if err != nil {
 			return err
 		}
@@ -844,16 +637,16 @@ func (s *socketOpsCommon) Bind(t *kernel.Task, sockaddr []byte) *syserr.Error {
 
 	// Issue the bind request to the endpoint.
 	err := s.Endpoint.Bind(addr)
-	if err == tcpip.ErrNoPortAvailable {
+	if _, ok := err.(*tcpip.ErrNoPortAvailable); ok {
 		// Bind always returns EADDRINUSE irrespective of if the specified port was
 		// already bound or if an ephemeral port was requested but none were
 		// available.
 		//
-		// tcpip.ErrNoPortAvailable is mapped to EAGAIN in syserr package because
+		// *tcpip.ErrNoPortAvailable is mapped to EAGAIN in syserr package because
 		// UDP connect returns EAGAIN on ephemeral port exhaustion.
 		//
 		// TCP connect returns EADDRNOTAVAIL on ephemeral port exhaustion.
-		err = tcpip.ErrPortInUse
+		err = &tcpip.ErrPortInUse{}
 	}
 
 	return syserr.TranslateNetstackError(err)
@@ -870,13 +663,14 @@ func (s *socketOpsCommon) Listen(t *kernel.Task, backlog int) *syserr.Error {
 func (s *socketOpsCommon) blockingAccept(t *kernel.Task, peerAddr *tcpip.FullAddress) (tcpip.Endpoint, *waiter.Queue, *syserr.Error) {
 	// Register for notifications.
 	e, ch := waiter.NewChannelEntry(nil)
-	s.EventRegister(&e, waiter.EventIn)
+	s.EventRegister(&e, waiter.ReadableEvents)
 	defer s.EventUnregister(&e)
 
 	// Try to accept the connection again; if it fails, then wait until we
 	// get a notification.
 	for {
-		if ep, wq, err := s.Endpoint.Accept(peerAddr); err != tcpip.ErrWouldBlock {
+		ep, wq, err := s.Endpoint.Accept(peerAddr)
+		if _, ok := err.(*tcpip.ErrWouldBlock); !ok {
 			return ep, wq, syserr.TranslateNetstackError(err)
 		}
 
@@ -895,7 +689,7 @@ func (s *SocketOperations) Accept(t *kernel.Task, peerRequested bool, flags int,
 	}
 	ep, wq, terr := s.Endpoint.Accept(peerAddr)
 	if terr != nil {
-		if terr != tcpip.ErrWouldBlock || !blocking {
+		if _, ok := terr.(*tcpip.ErrWouldBlock); !ok || !blocking {
 			return 0, nil, 0, syserr.TranslateNetstackError(terr)
 		}
 
@@ -921,7 +715,7 @@ func (s *SocketOperations) Accept(t *kernel.Task, peerRequested bool, flags int,
 	var addr linux.SockAddr
 	var addrLen uint32
 	if peerAddr != nil {
-		addr, addrLen = ConvertAddress(s.family, *peerAddr)
+		addr, addrLen = socket.ConvertAddress(s.family, *peerAddr)
 	}
 
 	fd, e := t.NewFDFrom(0, ns, kernel.FDFlags{
@@ -1005,7 +799,7 @@ func GetSockOpt(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, family in
 		return getSockOptSocket(t, s, ep, family, skType, name, outLen)
 
 	case linux.SOL_TCP:
-		return getSockOptTCP(t, ep, name, outLen)
+		return getSockOptTCP(t, s, ep, name, outLen)
 
 	case linux.SOL_IPV6:
 		return getSockOptIPv6(t, s, ep, name, outPtr, outLen)
@@ -1041,7 +835,7 @@ func getSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, fam
 		}
 
 		// Get the last error and convert it.
-		err := ep.LastError()
+		err := ep.SocketOptions().GetLastError()
 		if err == nil {
 			optP := primitive.Int32(0)
 			return &optP, nil
@@ -1051,7 +845,7 @@ func getSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, fam
 		return &optP, nil
 
 	case linux.SO_PEERCRED:
-		if family != linux.AF_UNIX || outLen < syscall.SizeofUcred {
+		if family != linux.AF_UNIX || outLen < unix.SizeofUcred {
 			return nil, syserr.ErrInvalidArgument
 		}
 
@@ -1068,23 +862,15 @@ func getSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, fam
 			return nil, syserr.ErrInvalidArgument
 		}
 
-		v, err := ep.GetSockOptBool(tcpip.PasscredOption)
-		if err != nil {
-			return nil, syserr.TranslateNetstackError(err)
-		}
-
-		vP := primitive.Int32(boolToInt32(v))
-		return &vP, nil
+		v := primitive.Int32(boolToInt32(ep.SocketOptions().GetPassCred()))
+		return &v, nil
 
 	case linux.SO_SNDBUF:
 		if outLen < sizeOfInt32 {
 			return nil, syserr.ErrInvalidArgument
 		}
 
-		size, err := ep.GetSockOptInt(tcpip.SendBufferSizeOption)
-		if err != nil {
-			return nil, syserr.TranslateNetstackError(err)
-		}
+		size := ep.SocketOptions().GetSendBufferSize()
 
 		if size > math.MaxInt32 {
 			size = math.MaxInt32
@@ -1115,31 +901,19 @@ func getSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, fam
 			return nil, syserr.ErrInvalidArgument
 		}
 
-		v, err := ep.GetSockOptBool(tcpip.ReuseAddressOption)
-		if err != nil {
-			return nil, syserr.TranslateNetstackError(err)
-		}
-		vP := primitive.Int32(boolToInt32(v))
-		return &vP, nil
+		v := primitive.Int32(boolToInt32(ep.SocketOptions().GetReuseAddress()))
+		return &v, nil
 
 	case linux.SO_REUSEPORT:
 		if outLen < sizeOfInt32 {
 			return nil, syserr.ErrInvalidArgument
 		}
 
-		v, err := ep.GetSockOptBool(tcpip.ReusePortOption)
-		if err != nil {
-			return nil, syserr.TranslateNetstackError(err)
-		}
-
-		vP := primitive.Int32(boolToInt32(v))
-		return &vP, nil
+		v := primitive.Int32(boolToInt32(ep.SocketOptions().GetReusePort()))
+		return &v, nil
 
 	case linux.SO_BINDTODEVICE:
-		var v tcpip.BindToDeviceOption
-		if err := ep.GetSockOpt(&v); err != nil {
-			return nil, syserr.TranslateNetstackError(err)
-		}
+		v := ep.SocketOptions().GetBindToDevice()
 		if v == 0 {
 			var b primitive.ByteSlice
 			return &b, nil
@@ -1174,24 +948,16 @@ func getSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, fam
 			return nil, syserr.ErrInvalidArgument
 		}
 
-		v, err := ep.GetSockOptBool(tcpip.KeepaliveEnabledOption)
-		if err != nil {
-			return nil, syserr.TranslateNetstackError(err)
-		}
-
-		vP := primitive.Int32(boolToInt32(v))
-		return &vP, nil
+		v := primitive.Int32(boolToInt32(ep.SocketOptions().GetKeepAlive()))
+		return &v, nil
 
 	case linux.SO_LINGER:
 		if outLen < linux.SizeOfLinger {
 			return nil, syserr.ErrInvalidArgument
 		}
 
-		var v tcpip.LingerOption
 		var linger linux.Linger
-		if err := ep.GetSockOpt(&v); err != nil {
-			return nil, syserr.TranslateNetstackError(err)
-		}
+		v := ep.SocketOptions().GetLinger()
 
 		if v.Enabled {
 			linger.OnOff = 1
@@ -1222,34 +988,26 @@ func getSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, fam
 			return nil, syserr.ErrInvalidArgument
 		}
 
-		var v tcpip.OutOfBandInlineOption
-		if err := ep.GetSockOpt(&v); err != nil {
-			return nil, syserr.TranslateNetstackError(err)
-		}
-
-		vP := primitive.Int32(v)
-		return &vP, nil
+		v := primitive.Int32(boolToInt32(ep.SocketOptions().GetOutOfBandInline()))
+		return &v, nil
 
 	case linux.SO_NO_CHECK:
 		if outLen < sizeOfInt32 {
 			return nil, syserr.ErrInvalidArgument
 		}
 
-		v, err := ep.GetSockOptBool(tcpip.NoChecksumOption)
-		if err != nil {
-			return nil, syserr.TranslateNetstackError(err)
-		}
-		vP := primitive.Int32(boolToInt32(v))
-		return &vP, nil
+		v := primitive.Int32(boolToInt32(ep.SocketOptions().GetNoChecksum()))
+		return &v, nil
 
 	case linux.SO_ACCEPTCONN:
 		if outLen < sizeOfInt32 {
 			return nil, syserr.ErrInvalidArgument
 		}
 
-		v, err := ep.GetSockOptBool(tcpip.AcceptConnOption)
-		if err != nil {
-			return nil, syserr.TranslateNetstackError(err)
+		// This option is only viable for TCP endpoints.
+		var v bool
+		if _, skType, skProto := s.Type(); isTCPSocket(skType, skProto) {
+			v = tcp.EndpointState(ep.State()) == tcp.StateListen
 		}
 		vP := primitive.Int32(boolToInt32(v))
 		return &vP, nil
@@ -1261,46 +1019,36 @@ func getSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, fam
 }
 
 // getSockOptTCP implements GetSockOpt when level is SOL_TCP.
-func getSockOptTCP(t *kernel.Task, ep commonEndpoint, name, outLen int) (marshal.Marshallable, *syserr.Error) {
+func getSockOptTCP(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name, outLen int) (marshal.Marshallable, *syserr.Error) {
+	if _, skType, skProto := s.Type(); !isTCPSocket(skType, skProto) {
+		log.Warningf("SOL_TCP options are only supported on TCP sockets: skType, skProto = %v, %d", skType, skProto)
+		return nil, syserr.ErrUnknownProtocolOption
+	}
+
 	switch name {
 	case linux.TCP_NODELAY:
 		if outLen < sizeOfInt32 {
 			return nil, syserr.ErrInvalidArgument
 		}
 
-		v, err := ep.GetSockOptBool(tcpip.DelayOption)
-		if err != nil {
-			return nil, syserr.TranslateNetstackError(err)
-		}
-
-		vP := primitive.Int32(boolToInt32(!v))
-		return &vP, nil
+		v := primitive.Int32(boolToInt32(!ep.SocketOptions().GetDelayOption()))
+		return &v, nil
 
 	case linux.TCP_CORK:
 		if outLen < sizeOfInt32 {
 			return nil, syserr.ErrInvalidArgument
 		}
 
-		v, err := ep.GetSockOptBool(tcpip.CorkOption)
-		if err != nil {
-			return nil, syserr.TranslateNetstackError(err)
-		}
-
-		vP := primitive.Int32(boolToInt32(v))
-		return &vP, nil
+		v := primitive.Int32(boolToInt32(ep.SocketOptions().GetCorkOption()))
+		return &v, nil
 
 	case linux.TCP_QUICKACK:
 		if outLen < sizeOfInt32 {
 			return nil, syserr.ErrInvalidArgument
 		}
 
-		v, err := ep.GetSockOptBool(tcpip.QuickAckOption)
-		if err != nil {
-			return nil, syserr.TranslateNetstackError(err)
-		}
-
-		vP := primitive.Int32(boolToInt32(v))
-		return &vP, nil
+		v := primitive.Int32(boolToInt32(ep.SocketOptions().GetQuickAck()))
+		return &v, nil
 
 	case linux.TCP_MAXSEG:
 		if outLen < sizeOfInt32 {
@@ -1371,6 +1119,29 @@ func getSockOptTCP(t *kernel.Task, ep commonEndpoint, name, outLen int) (marshal
 		// TODO(b/64800844): Translate fields once they are added to
 		// tcpip.TCPInfoOption.
 		info := linux.TCPInfo{}
+		switch v.CcState {
+		case tcpip.RTORecovery:
+			info.CaState = linux.TCP_CA_Loss
+		case tcpip.FastRecovery, tcpip.SACKRecovery:
+			info.CaState = linux.TCP_CA_Recovery
+		case tcpip.Disorder:
+			info.CaState = linux.TCP_CA_Disorder
+		case tcpip.Open:
+			info.CaState = linux.TCP_CA_Open
+		}
+		info.RTO = uint32(v.RTO / time.Microsecond)
+		info.RTT = uint32(v.RTT / time.Microsecond)
+		info.RTTVar = uint32(v.RTTVar / time.Microsecond)
+		info.SndSsthresh = v.SndSsthresh
+		info.SndCwnd = v.SndCwnd
+
+		// In netstack reorderSeen is updated only when RACK is enabled.
+		// We only track whether the reordering is seen, which is
+		// different than Linux where reorderSeen is not specific to
+		// RACK and is incremented when a reordering event is seen.
+		if v.ReorderSeen {
+			info.ReordSeen = 1
+		}
 
 		// Linux truncates the output binary to outLen.
 		buf := t.CopyScratchBuffer(info.SizeBytes())
@@ -1474,19 +1245,24 @@ func getSockOptTCP(t *kernel.Task, ep commonEndpoint, name, outLen int) (marshal
 
 // getSockOptIPv6 implements GetSockOpt when level is SOL_IPV6.
 func getSockOptIPv6(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name int, outPtr usermem.Addr, outLen int) (marshal.Marshallable, *syserr.Error) {
+	if _, ok := ep.(tcpip.Endpoint); !ok {
+		log.Warningf("SOL_IPV6 options not supported on endpoints other than tcpip.Endpoint: option = %d", name)
+		return nil, syserr.ErrUnknownProtocolOption
+	}
+
+	family, skType, _ := s.Type()
+	if family != linux.AF_INET6 {
+		return nil, syserr.ErrUnknownProtocolOption
+	}
+
 	switch name {
 	case linux.IPV6_V6ONLY:
 		if outLen < sizeOfInt32 {
 			return nil, syserr.ErrInvalidArgument
 		}
 
-		v, err := ep.GetSockOptBool(tcpip.V6OnlyOption)
-		if err != nil {
-			return nil, syserr.TranslateNetstackError(err)
-		}
-
-		vP := primitive.Int32(boolToInt32(v))
-		return &vP, nil
+		v := primitive.Int32(boolToInt32(ep.SocketOptions().GetV6Only()))
+		return &v, nil
 
 	case linux.IPV6_PATHMTU:
 		t.Kernel().EmitUnimplementedEvent(t)
@@ -1518,13 +1294,23 @@ func getSockOptIPv6(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name 
 			return nil, syserr.ErrInvalidArgument
 		}
 
-		v, err := ep.GetSockOptBool(tcpip.ReceiveTClassOption)
-		if err != nil {
-			return nil, syserr.TranslateNetstackError(err)
+		v := primitive.Int32(boolToInt32(ep.SocketOptions().GetReceiveTClass()))
+		return &v, nil
+	case linux.IPV6_RECVERR:
+		if outLen < sizeOfInt32 {
+			return nil, syserr.ErrInvalidArgument
 		}
 
-		vP := primitive.Int32(boolToInt32(v))
-		return &vP, nil
+		v := primitive.Int32(boolToInt32(ep.SocketOptions().GetRecvError()))
+		return &v, nil
+
+	case linux.IPV6_RECVORIGDSTADDR:
+		if outLen < sizeOfInt32 {
+			return nil, syserr.ErrInvalidArgument
+		}
+
+		v := primitive.Int32(boolToInt32(ep.SocketOptions().GetReceiveOriginalDstAddress()))
+		return &v, nil
 
 	case linux.IP6T_ORIGINAL_DST:
 		if outLen < int(binary.Size(linux.SockAddrInet6{})) {
@@ -1536,7 +1322,7 @@ func getSockOptIPv6(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name 
 			return nil, syserr.TranslateNetstackError(err)
 		}
 
-		a, _ := ConvertAddress(linux.AF_INET6, tcpip.FullAddress(v))
+		a, _ := socket.ConvertAddress(linux.AF_INET6, tcpip.FullAddress(v))
 		return a.(*linux.SockAddrInet6), nil
 
 	case linux.IP6T_SO_GET_INFO:
@@ -1545,7 +1331,7 @@ func getSockOptIPv6(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name 
 		}
 
 		// Only valid for raw IPv6 sockets.
-		if family, skType, _ := s.Type(); family != linux.AF_INET6 || skType != linux.SOCK_RAW {
+		if skType != linux.SOCK_RAW {
 			return nil, syserr.ErrProtocolNotAvailable
 		}
 
@@ -1565,7 +1351,7 @@ func getSockOptIPv6(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name 
 			return nil, syserr.ErrInvalidArgument
 		}
 		// Only valid for raw IPv6 sockets.
-		if family, skType, _ := s.Type(); family != linux.AF_INET6 || skType != linux.SOCK_RAW {
+		if skType != linux.SOCK_RAW {
 			return nil, syserr.ErrProtocolNotAvailable
 		}
 
@@ -1585,7 +1371,7 @@ func getSockOptIPv6(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name 
 		}
 
 		// Only valid for raw IPv6 sockets.
-		if family, skType, _ := s.Type(); family != linux.AF_INET6 || skType != linux.SOCK_RAW {
+		if skType != linux.SOCK_RAW {
 			return nil, syserr.ErrProtocolNotAvailable
 		}
 
@@ -1607,6 +1393,11 @@ func getSockOptIPv6(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name 
 
 // getSockOptIP implements GetSockOpt when level is SOL_IP.
 func getSockOptIP(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name int, outPtr usermem.Addr, outLen int, family int) (marshal.Marshallable, *syserr.Error) {
+	if _, ok := ep.(tcpip.Endpoint); !ok {
+		log.Warningf("SOL_IP options not supported on endpoints other than tcpip.Endpoint: option = %d", name)
+		return nil, syserr.ErrUnknownProtocolOption
+	}
+
 	switch name {
 	case linux.IP_TTL:
 		if outLen < sizeOfInt32 {
@@ -1649,7 +1440,7 @@ func getSockOptIP(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name in
 			return nil, syserr.TranslateNetstackError(err)
 		}
 
-		a, _ := ConvertAddress(linux.AF_INET, tcpip.FullAddress{Addr: v.InterfaceAddr})
+		a, _ := socket.ConvertAddress(linux.AF_INET, tcpip.FullAddress{Addr: v.InterfaceAddr})
 
 		return &a.(*linux.SockAddrInet).Addr, nil
 
@@ -1658,13 +1449,8 @@ func getSockOptIP(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name in
 			return nil, syserr.ErrInvalidArgument
 		}
 
-		v, err := ep.GetSockOptBool(tcpip.MulticastLoopOption)
-		if err != nil {
-			return nil, syserr.TranslateNetstackError(err)
-		}
-
-		vP := primitive.Int32(boolToInt32(v))
-		return &vP, nil
+		v := primitive.Int32(boolToInt32(ep.SocketOptions().GetMulticastLoop()))
+		return &v, nil
 
 	case linux.IP_TOS:
 		// Length handling for parity with Linux.
@@ -1688,26 +1474,40 @@ func getSockOptIP(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name in
 			return nil, syserr.ErrInvalidArgument
 		}
 
-		v, err := ep.GetSockOptBool(tcpip.ReceiveTOSOption)
-		if err != nil {
-			return nil, syserr.TranslateNetstackError(err)
+		v := primitive.Int32(boolToInt32(ep.SocketOptions().GetReceiveTOS()))
+		return &v, nil
+
+	case linux.IP_RECVERR:
+		if outLen < sizeOfInt32 {
+			return nil, syserr.ErrInvalidArgument
 		}
 
-		vP := primitive.Int32(boolToInt32(v))
-		return &vP, nil
+		v := primitive.Int32(boolToInt32(ep.SocketOptions().GetRecvError()))
+		return &v, nil
 
 	case linux.IP_PKTINFO:
 		if outLen < sizeOfInt32 {
 			return nil, syserr.ErrInvalidArgument
 		}
 
-		v, err := ep.GetSockOptBool(tcpip.ReceiveIPPacketInfoOption)
-		if err != nil {
-			return nil, syserr.TranslateNetstackError(err)
+		v := primitive.Int32(boolToInt32(ep.SocketOptions().GetReceivePacketInfo()))
+		return &v, nil
+
+	case linux.IP_HDRINCL:
+		if outLen < sizeOfInt32 {
+			return nil, syserr.ErrInvalidArgument
 		}
 
-		vP := primitive.Int32(boolToInt32(v))
-		return &vP, nil
+		v := primitive.Int32(boolToInt32(ep.SocketOptions().GetHeaderIncluded()))
+		return &v, nil
+
+	case linux.IP_RECVORIGDSTADDR:
+		if outLen < sizeOfInt32 {
+			return nil, syserr.ErrInvalidArgument
+		}
+
+		v := primitive.Int32(boolToInt32(ep.SocketOptions().GetReceiveOriginalDstAddress()))
+		return &v, nil
 
 	case linux.SO_ORIGINAL_DST:
 		if outLen < int(binary.Size(linux.SockAddrInet{})) {
@@ -1719,7 +1519,7 @@ func getSockOptIP(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name in
 			return nil, syserr.TranslateNetstackError(err)
 		}
 
-		a, _ := ConvertAddress(linux.AF_INET, tcpip.FullAddress(v))
+		a, _ := socket.ConvertAddress(linux.AF_INET, tcpip.FullAddress(v))
 		return a.(*linux.SockAddrInet), nil
 
 	case linux.IPT_SO_GET_INFO:
@@ -1826,7 +1626,7 @@ func SetSockOpt(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, level int
 		return setSockOptSocket(t, s, ep, name, optVal)
 
 	case linux.SOL_TCP:
-		return setSockOptTCP(t, ep, name, optVal)
+		return setSockOptTCP(t, s, ep, name, optVal)
 
 	case linux.SOL_IPV6:
 		return setSockOptIPv6(t, s, ep, name, optVal)
@@ -1860,7 +1660,8 @@ func setSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, nam
 		}
 
 		v := usermem.ByteOrder.Uint32(optVal)
-		return syserr.TranslateNetstackError(ep.SetSockOptInt(tcpip.SendBufferSizeOption, int(v)))
+		ep.SocketOptions().SetSendBufferSize(int64(v), true)
+		return nil
 
 	case linux.SO_RCVBUF:
 		if len(optVal) < sizeOfInt32 {
@@ -1876,7 +1677,8 @@ func setSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, nam
 		}
 
 		v := usermem.ByteOrder.Uint32(optVal)
-		return syserr.TranslateNetstackError(ep.SetSockOptBool(tcpip.ReuseAddressOption, v != 0))
+		ep.SocketOptions().SetReuseAddress(v != 0)
+		return nil
 
 	case linux.SO_REUSEPORT:
 		if len(optVal) < sizeOfInt32 {
@@ -1884,7 +1686,8 @@ func setSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, nam
 		}
 
 		v := usermem.ByteOrder.Uint32(optVal)
-		return syserr.TranslateNetstackError(ep.SetSockOptBool(tcpip.ReusePortOption, v != 0))
+		ep.SocketOptions().SetReusePort(v != 0)
+		return nil
 
 	case linux.SO_BINDTODEVICE:
 		n := bytes.IndexByte(optVal, 0)
@@ -1893,8 +1696,7 @@ func setSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, nam
 		}
 		name := string(optVal[:n])
 		if name == "" {
-			v := tcpip.BindToDeviceOption(0)
-			return syserr.TranslateNetstackError(ep.SetSockOpt(&v))
+			return syserr.TranslateNetstackError(ep.SocketOptions().SetBindToDevice(0))
 		}
 		s := t.NetworkContext()
 		if s == nil {
@@ -1902,8 +1704,7 @@ func setSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, nam
 		}
 		for nicID, nic := range s.Interfaces() {
 			if nic.Name == name {
-				v := tcpip.BindToDeviceOption(nicID)
-				return syserr.TranslateNetstackError(ep.SetSockOpt(&v))
+				return syserr.TranslateNetstackError(ep.SocketOptions().SetBindToDevice(nicID))
 			}
 		}
 		return syserr.ErrUnknownDevice
@@ -1923,7 +1724,8 @@ func setSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, nam
 		}
 
 		v := usermem.ByteOrder.Uint32(optVal)
-		return syserr.TranslateNetstackError(ep.SetSockOptBool(tcpip.PasscredOption, v != 0))
+		ep.SocketOptions().SetPassCred(v != 0)
+		return nil
 
 	case linux.SO_KEEPALIVE:
 		if len(optVal) < sizeOfInt32 {
@@ -1931,7 +1733,8 @@ func setSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, nam
 		}
 
 		v := usermem.ByteOrder.Uint32(optVal)
-		return syserr.TranslateNetstackError(ep.SetSockOptBool(tcpip.KeepaliveEnabledOption, v != 0))
+		ep.SocketOptions().SetKeepAlive(v != 0)
+		return nil
 
 	case linux.SO_SNDTIMEO:
 		if len(optVal) < linux.SizeOfTimeval {
@@ -1970,8 +1773,8 @@ func setSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, nam
 			socket.SetSockOptEmitUnimplementedEvent(t, name)
 		}
 
-		opt := tcpip.OutOfBandInlineOption(v)
-		return syserr.TranslateNetstackError(ep.SetSockOpt(&opt))
+		ep.SocketOptions().SetOutOfBandInline(v != 0)
+		return nil
 
 	case linux.SO_NO_CHECK:
 		if len(optVal) < sizeOfInt32 {
@@ -1979,7 +1782,8 @@ func setSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, nam
 		}
 
 		v := usermem.ByteOrder.Uint32(optVal)
-		return syserr.TranslateNetstackError(ep.SetSockOptBool(tcpip.NoChecksumOption, v != 0))
+		ep.SocketOptions().SetNoChecksum(v != 0)
+		return nil
 
 	case linux.SO_LINGER:
 		if len(optVal) < linux.SizeOfLinger {
@@ -1989,14 +1793,11 @@ func setSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, nam
 		var v linux.Linger
 		binary.Unmarshal(optVal[:linux.SizeOfLinger], usermem.ByteOrder, &v)
 
-		if v != (linux.Linger{}) {
-			socket.SetSockOptEmitUnimplementedEvent(t, name)
-		}
-
-		return syserr.TranslateNetstackError(
-			ep.SetSockOpt(&tcpip.LingerOption{
-				Enabled: v.OnOff != 0,
-				Timeout: time.Second * time.Duration(v.Linger)}))
+		ep.SocketOptions().SetLinger(tcpip.LingerOption{
+			Enabled: v.OnOff != 0,
+			Timeout: time.Second * time.Duration(v.Linger),
+		})
+		return nil
 
 	case linux.SO_DETACH_FILTER:
 		// optval is ignored.
@@ -2011,7 +1812,12 @@ func setSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, nam
 }
 
 // setSockOptTCP implements SetSockOpt when level is SOL_TCP.
-func setSockOptTCP(t *kernel.Task, ep commonEndpoint, name int, optVal []byte) *syserr.Error {
+func setSockOptTCP(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name int, optVal []byte) *syserr.Error {
+	if _, skType, skProto := s.Type(); !isTCPSocket(skType, skProto) {
+		log.Warningf("SOL_TCP options are only supported on TCP sockets: skType, skProto = %v, %d", skType, skProto)
+		return syserr.ErrUnknownProtocolOption
+	}
+
 	switch name {
 	case linux.TCP_NODELAY:
 		if len(optVal) < sizeOfInt32 {
@@ -2019,7 +1825,8 @@ func setSockOptTCP(t *kernel.Task, ep commonEndpoint, name int, optVal []byte) *
 		}
 
 		v := usermem.ByteOrder.Uint32(optVal)
-		return syserr.TranslateNetstackError(ep.SetSockOptBool(tcpip.DelayOption, v == 0))
+		ep.SocketOptions().SetDelayOption(v == 0)
+		return nil
 
 	case linux.TCP_CORK:
 		if len(optVal) < sizeOfInt32 {
@@ -2027,7 +1834,8 @@ func setSockOptTCP(t *kernel.Task, ep commonEndpoint, name int, optVal []byte) *
 		}
 
 		v := usermem.ByteOrder.Uint32(optVal)
-		return syserr.TranslateNetstackError(ep.SetSockOptBool(tcpip.CorkOption, v != 0))
+		ep.SocketOptions().SetCorkOption(v != 0)
+		return nil
 
 	case linux.TCP_QUICKACK:
 		if len(optVal) < sizeOfInt32 {
@@ -2035,7 +1843,8 @@ func setSockOptTCP(t *kernel.Task, ep commonEndpoint, name int, optVal []byte) *
 		}
 
 		v := usermem.ByteOrder.Uint32(optVal)
-		return syserr.TranslateNetstackError(ep.SetSockOptBool(tcpip.QuickAckOption, v != 0))
+		ep.SocketOptions().SetQuickAck(v != 0)
+		return nil
 
 	case linux.TCP_MAXSEG:
 		if len(optVal) < sizeOfInt32 {
@@ -2147,18 +1956,55 @@ func setSockOptTCP(t *kernel.Task, ep commonEndpoint, name int, optVal []byte) *
 
 // setSockOptIPv6 implements SetSockOpt when level is SOL_IPV6.
 func setSockOptIPv6(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name int, optVal []byte) *syserr.Error {
+	if _, ok := ep.(tcpip.Endpoint); !ok {
+		log.Warningf("SOL_IPV6 options not supported on endpoints other than tcpip.Endpoint: option = %d", name)
+		return syserr.ErrUnknownProtocolOption
+	}
+
+	family, skType, skProto := s.Type()
+	if family != linux.AF_INET6 {
+		return syserr.ErrUnknownProtocolOption
+	}
+
 	switch name {
 	case linux.IPV6_V6ONLY:
 		if len(optVal) < sizeOfInt32 {
 			return syserr.ErrInvalidArgument
 		}
 
-		v := usermem.ByteOrder.Uint32(optVal)
-		return syserr.TranslateNetstackError(ep.SetSockOptBool(tcpip.V6OnlyOption, v != 0))
+		if isTCPSocket(skType, skProto) && tcp.EndpointState(ep.State()) != tcp.StateInitial {
+			return syserr.ErrInvalidEndpointState
+		} else if isUDPSocket(skType, skProto) && udp.EndpointState(ep.State()) != udp.StateInitial {
+			return syserr.ErrInvalidEndpointState
+		}
 
-	case linux.IPV6_ADD_MEMBERSHIP,
-		linux.IPV6_DROP_MEMBERSHIP,
-		linux.IPV6_IPSEC_POLICY,
+		v := usermem.ByteOrder.Uint32(optVal)
+		ep.SocketOptions().SetV6Only(v != 0)
+		return nil
+
+	case linux.IPV6_ADD_MEMBERSHIP:
+		req, err := copyInMulticastV6Request(optVal)
+		if err != nil {
+			return err
+		}
+
+		return syserr.TranslateNetstackError(ep.SetSockOpt(&tcpip.AddMembershipOption{
+			NIC:           tcpip.NICID(req.InterfaceIndex),
+			MulticastAddr: tcpip.Address(req.MulticastAddr[:]),
+		}))
+
+	case linux.IPV6_DROP_MEMBERSHIP:
+		req, err := copyInMulticastV6Request(optVal)
+		if err != nil {
+			return err
+		}
+
+		return syserr.TranslateNetstackError(ep.SetSockOpt(&tcpip.RemoveMembershipOption{
+			NIC:           tcpip.NICID(req.InterfaceIndex),
+			MulticastAddr: tcpip.Address(req.MulticastAddr[:]),
+		}))
+
+	case linux.IPV6_IPSEC_POLICY,
 		linux.IPV6_JOIN_ANYCAST,
 		linux.IPV6_LEAVE_ANYCAST,
 		// TODO(b/148887420): Add support for IPV6_PKTINFO.
@@ -2173,6 +2019,15 @@ func setSockOptIPv6(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name 
 		linux.MCAST_UNBLOCK_SOURCE:
 
 		t.Kernel().EmitUnimplementedEvent(t)
+
+	case linux.IPV6_RECVORIGDSTADDR:
+		if len(optVal) < sizeOfInt32 {
+			return syserr.ErrInvalidArgument
+		}
+		v := int32(usermem.ByteOrder.Uint32(optVal))
+
+		ep.SocketOptions().SetReceiveOriginalDstAddress(v != 0)
+		return nil
 
 	case linux.IPV6_TCLASS:
 		if len(optVal) < sizeOfInt32 {
@@ -2193,7 +2048,18 @@ func setSockOptIPv6(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name 
 			return err
 		}
 
-		return syserr.TranslateNetstackError(ep.SetSockOptBool(tcpip.ReceiveTClassOption, v != 0))
+		ep.SocketOptions().SetReceiveTClass(v != 0)
+		return nil
+	case linux.IPV6_RECVERR:
+		if len(optVal) == 0 {
+			return nil
+		}
+		v, err := parseIntOrChar(optVal)
+		if err != nil {
+			return err
+		}
+		ep.SocketOptions().SetRecvError(v != 0)
+		return nil
 
 	case linux.IP6T_SO_SET_REPLACE:
 		if len(optVal) < linux.SizeOfIP6TReplace {
@@ -2201,7 +2067,7 @@ func setSockOptIPv6(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name 
 		}
 
 		// Only valid for raw IPv6 sockets.
-		if family, skType, _ := s.Type(); family != linux.AF_INET6 || skType != linux.SOCK_RAW {
+		if skType != linux.SOCK_RAW {
 			return syserr.ErrProtocolNotAvailable
 		}
 
@@ -2226,6 +2092,7 @@ func setSockOptIPv6(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name 
 var (
 	inetMulticastRequestSize        = int(binary.Size(linux.InetMulticastRequest{}))
 	inetMulticastRequestWithNICSize = int(binary.Size(linux.InetMulticastRequestWithNIC{}))
+	inet6MulticastRequestSize       = int(binary.Size(linux.Inet6MulticastRequest{}))
 )
 
 // copyInMulticastRequest copies in a variable-size multicast request. The
@@ -2259,6 +2126,16 @@ func copyInMulticastRequest(optVal []byte, allowAddr bool) (linux.InetMulticastR
 	return req, nil
 }
 
+func copyInMulticastV6Request(optVal []byte) (linux.Inet6MulticastRequest, *syserr.Error) {
+	if len(optVal) < inet6MulticastRequestSize {
+		return linux.Inet6MulticastRequest{}, syserr.ErrInvalidArgument
+	}
+
+	var req linux.Inet6MulticastRequest
+	binary.Unmarshal(optVal[:inet6MulticastRequestSize], usermem.ByteOrder, &req)
+	return req, nil
+}
+
 // parseIntOrChar copies either a 32-bit int or an 8-bit uint out of buf.
 //
 // net/ipv4/ip_sockglue.c:do_ip_setsockopt does this for its socket options.
@@ -2276,6 +2153,11 @@ func parseIntOrChar(buf []byte) (int32, *syserr.Error) {
 
 // setSockOptIP implements SetSockOpt when level is SOL_IP.
 func setSockOptIP(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name int, optVal []byte) *syserr.Error {
+	if _, ok := ep.(tcpip.Endpoint); !ok {
+		log.Warningf("SOL_IP options not supported on endpoints other than tcpip.Endpoint: option = %d", name)
+		return syserr.ErrUnknownProtocolOption
+	}
+
 	switch name {
 	case linux.IP_MULTICAST_TTL:
 		v, err := parseIntOrChar(optVal)
@@ -2328,7 +2210,7 @@ func setSockOptIP(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name in
 
 		return syserr.TranslateNetstackError(ep.SetSockOpt(&tcpip.MulticastInterfaceOption{
 			NIC:           tcpip.NICID(req.InterfaceIndex),
-			InterfaceAddr: bytesToIPAddress(req.InterfaceAddr[:]),
+			InterfaceAddr: socket.BytesToIPAddress(req.InterfaceAddr[:]),
 		}))
 
 	case linux.IP_MULTICAST_LOOP:
@@ -2337,7 +2219,8 @@ func setSockOptIP(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name in
 			return err
 		}
 
-		return syserr.TranslateNetstackError(ep.SetSockOptBool(tcpip.MulticastLoopOption, v != 0))
+		ep.SocketOptions().SetMulticastLoop(v != 0)
+		return nil
 
 	case linux.MCAST_JOIN_GROUP:
 		// FIXME(b/124219304): Implement MCAST_JOIN_GROUP.
@@ -2373,7 +2256,19 @@ func setSockOptIP(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name in
 		if err != nil {
 			return err
 		}
-		return syserr.TranslateNetstackError(ep.SetSockOptBool(tcpip.ReceiveTOSOption, v != 0))
+		ep.SocketOptions().SetReceiveTOS(v != 0)
+		return nil
+
+	case linux.IP_RECVERR:
+		if len(optVal) == 0 {
+			return nil
+		}
+		v, err := parseIntOrChar(optVal)
+		if err != nil {
+			return err
+		}
+		ep.SocketOptions().SetRecvError(v != 0)
+		return nil
 
 	case linux.IP_PKTINFO:
 		if len(optVal) == 0 {
@@ -2383,7 +2278,8 @@ func setSockOptIP(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name in
 		if err != nil {
 			return err
 		}
-		return syserr.TranslateNetstackError(ep.SetSockOptBool(tcpip.ReceiveIPPacketInfoOption, v != 0))
+		ep.SocketOptions().SetReceivePacketInfo(v != 0)
+		return nil
 
 	case linux.IP_HDRINCL:
 		if len(optVal) == 0 {
@@ -2393,7 +2289,20 @@ func setSockOptIP(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name in
 		if err != nil {
 			return err
 		}
-		return syserr.TranslateNetstackError(ep.SetSockOptBool(tcpip.IPHdrIncludedOption, v != 0))
+		ep.SocketOptions().SetHeaderIncluded(v != 0)
+		return nil
+
+	case linux.IP_RECVORIGDSTADDR:
+		if len(optVal) == 0 {
+			return nil
+		}
+		v, err := parseIntOrChar(optVal)
+		if err != nil {
+			return err
+		}
+
+		ep.SocketOptions().SetReceiveOriginalDstAddress(v != 0)
+		return nil
 
 	case linux.IPT_SO_SET_REPLACE:
 		if len(optVal) < linux.SizeOfIPTReplace {
@@ -2430,10 +2339,8 @@ func setSockOptIP(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name in
 		linux.IP_NODEFRAG,
 		linux.IP_OPTIONS,
 		linux.IP_PASSSEC,
-		linux.IP_RECVERR,
 		linux.IP_RECVFRAGSIZE,
 		linux.IP_RECVOPTS,
-		linux.IP_RECVORIGDSTADDR,
 		linux.IP_RECVTTL,
 		linux.IP_RETOPTS,
 		linux.IP_TRANSPARENT,
@@ -2507,11 +2414,9 @@ func emitUnimplementedEventIPv6(t *kernel.Task, name int) {
 		linux.IPV6_MULTICAST_IF,
 		linux.IPV6_MULTICAST_LOOP,
 		linux.IPV6_RECVDSTOPTS,
-		linux.IPV6_RECVERR,
 		linux.IPV6_RECVFRAGSIZE,
 		linux.IPV6_RECVHOPLIMIT,
 		linux.IPV6_RECVHOPOPTS,
-		linux.IPV6_RECVORIGDSTADDR,
 		linux.IPV6_RECVPATHMTU,
 		linux.IPV6_RECVPKTINFO,
 		linux.IPV6_RECVRTHDR,
@@ -2535,7 +2440,6 @@ func emitUnimplementedEventIP(t *kernel.Task, name int) {
 	switch name {
 	case linux.IP_TOS,
 		linux.IP_TTL,
-		linux.IP_HDRINCL,
 		linux.IP_OPTIONS,
 		linux.IP_ROUTER_ALERT,
 		linux.IP_RECVOPTS,
@@ -2543,7 +2447,6 @@ func emitUnimplementedEventIP(t *kernel.Task, name int) {
 		linux.IP_PKTINFO,
 		linux.IP_PKTOPTIONS,
 		linux.IP_MTU_DISCOVER,
-		linux.IP_RECVERR,
 		linux.IP_RECVTTL,
 		linux.IP_RECVTOS,
 		linux.IP_MTU,
@@ -2582,72 +2485,6 @@ func emitUnimplementedEventIP(t *kernel.Task, name int) {
 	}
 }
 
-// isLinkLocal determines if the given IPv6 address is link-local. This is the
-// case when it has the fe80::/10 prefix. This check is used to determine when
-// the NICID is relevant for a given IPv6 address.
-func isLinkLocal(addr tcpip.Address) bool {
-	return len(addr) >= 2 && addr[0] == 0xfe && addr[1]&0xc0 == 0x80
-}
-
-// ConvertAddress converts the given address to a native format.
-func ConvertAddress(family int, addr tcpip.FullAddress) (linux.SockAddr, uint32) {
-	switch family {
-	case linux.AF_UNIX:
-		var out linux.SockAddrUnix
-		out.Family = linux.AF_UNIX
-		l := len([]byte(addr.Addr))
-		for i := 0; i < l; i++ {
-			out.Path[i] = int8(addr.Addr[i])
-		}
-
-		// Linux returns the used length of the address struct (including the
-		// null terminator) for filesystem paths. The Family field is 2 bytes.
-		// It is sometimes allowed to exclude the null terminator if the
-		// address length is the max. Abstract and empty paths always return
-		// the full exact length.
-		if l == 0 || out.Path[0] == 0 || l == len(out.Path) {
-			return &out, uint32(2 + l)
-		}
-		return &out, uint32(3 + l)
-
-	case linux.AF_INET:
-		var out linux.SockAddrInet
-		copy(out.Addr[:], addr.Addr)
-		out.Family = linux.AF_INET
-		out.Port = htons(addr.Port)
-		return &out, uint32(sockAddrInetSize)
-
-	case linux.AF_INET6:
-		var out linux.SockAddrInet6
-		if len(addr.Addr) == header.IPv4AddressSize {
-			// Copy address in v4-mapped format.
-			copy(out.Addr[12:], addr.Addr)
-			out.Addr[10] = 0xff
-			out.Addr[11] = 0xff
-		} else {
-			copy(out.Addr[:], addr.Addr)
-		}
-		out.Family = linux.AF_INET6
-		out.Port = htons(addr.Port)
-		if isLinkLocal(addr.Addr) {
-			out.Scope_id = uint32(addr.NIC)
-		}
-		return &out, uint32(sockAddrInet6Size)
-
-	case linux.AF_PACKET:
-		// TODO(gvisor.dev/issue/173): Return protocol too.
-		var out linux.SockAddrLink
-		out.Family = linux.AF_PACKET
-		out.InterfaceIndex = int32(addr.NIC)
-		out.HardwareAddrLen = header.EthernetAddressSize
-		copy(out.HardwareAddr[:], addr.Addr)
-		return &out, uint32(sockAddrLinkSize)
-
-	default:
-		return nil, 0
-	}
-}
-
 // GetSockName implements the linux syscall getsockname(2) for sockets backed by
 // tcpip.Endpoint.
 func (s *socketOpsCommon) GetSockName(t *kernel.Task) (linux.SockAddr, uint32, *syserr.Error) {
@@ -2656,7 +2493,7 @@ func (s *socketOpsCommon) GetSockName(t *kernel.Task) (linux.SockAddr, uint32, *
 		return nil, 0, syserr.TranslateNetstackError(err)
 	}
 
-	a, l := ConvertAddress(s.family, addr)
+	a, l := socket.ConvertAddress(s.family, addr)
 	return a, l, nil
 }
 
@@ -2668,65 +2505,8 @@ func (s *socketOpsCommon) GetPeerName(t *kernel.Task) (linux.SockAddr, uint32, *
 		return nil, 0, syserr.TranslateNetstackError(err)
 	}
 
-	a, l := ConvertAddress(s.family, addr)
+	a, l := socket.ConvertAddress(s.family, addr)
 	return a, l, nil
-}
-
-// coalescingRead is the fast path for non-blocking, non-peek, stream-based
-// case. It coalesces as many packets as possible before returning to the
-// caller.
-//
-// Precondition: s.readMu must be locked.
-func (s *socketOpsCommon) coalescingRead(ctx context.Context, dst usermem.IOSequence, discard bool) (int, *syserr.Error) {
-	var err *syserr.Error
-	var copied int
-
-	// Copy as many views as possible into the user-provided buffer.
-	for {
-		// Always do at least one fetchReadView, even if the number of bytes to
-		// read is 0.
-		err = s.fetchReadView()
-		if err != nil {
-			break
-		}
-		if dst.NumBytes() == 0 {
-			break
-		}
-
-		var n int
-		var e error
-		if discard {
-			n = len(s.readView)
-			if int64(n) > dst.NumBytes() {
-				n = int(dst.NumBytes())
-			}
-		} else {
-			n, e = dst.CopyOut(ctx, s.readView)
-			// Set the control message, even if 0 bytes were read.
-			if e == nil {
-				s.updateTimestamp()
-			}
-		}
-		copied += n
-		s.readView.TrimFront(n)
-		if len(s.readView) == 0 {
-			atomic.StoreUint32(&s.readViewHasData, 0)
-		}
-
-		dst = dst.DropFirst(n)
-		if e != nil {
-			err = syserr.FromError(e)
-			break
-		}
-	}
-
-	// If we managed to copy something, we must deliver it.
-	if copied > 0 {
-		s.Endpoint.ModerateRecvBuf(copied)
-		return copied, nil
-	}
-
-	return 0, err
 }
 
 func (s *socketOpsCommon) fillCmsgInq(cmsg *socket.ControlMessages) {
@@ -2738,7 +2518,7 @@ func (s *socketOpsCommon) fillCmsgInq(cmsg *socket.ControlMessages) {
 		return
 	}
 	cmsg.IP.HasInq = true
-	cmsg.IP.Inq = int32(len(s.readView) + rcvBufUsed)
+	cmsg.IP.Inq = int32(rcvBufUsed)
 }
 
 func toLinuxPacketType(pktType tcpip.PacketType) uint8 {
@@ -2764,128 +2544,108 @@ func toLinuxPacketType(pktType tcpip.PacketType) uint8 {
 func (s *socketOpsCommon) nonBlockingRead(ctx context.Context, dst usermem.IOSequence, peek, trunc, senderRequested bool) (int, int, linux.SockAddr, uint32, socket.ControlMessages, *syserr.Error) {
 	isPacket := s.isPacketBased()
 
-	// Fast path for regular reads from stream (e.g., TCP) endpoints. Note
-	// that senderRequested is ignored for stream sockets.
-	if !peek && !isPacket {
-		// TCP sockets discard the data if MSG_TRUNC is set.
-		//
-		// This behavior is documented in man 7 tcp:
-		// Since version 2.4, Linux supports the use of MSG_TRUNC in the flags
-		// argument of recv(2) (and recvmsg(2)). This flag causes the received
-		// bytes of data to be discarded, rather than passed back in a
-		// caller-supplied  buffer.
-		s.readMu.Lock()
-		n, err := s.coalescingRead(ctx, dst, trunc)
-		cmsg := s.controlMessages()
-		s.fillCmsgInq(&cmsg)
-		s.readMu.Unlock()
-		return n, 0, nil, 0, cmsg, err
+	readOptions := tcpip.ReadOptions{
+		Peek:               peek,
+		NeedRemoteAddr:     senderRequested,
+		NeedLinkPacketInfo: isPacket,
+	}
+
+	// TCP sockets discard the data if MSG_TRUNC is set.
+	//
+	// This behavior is documented in man 7 tcp:
+	// Since version 2.4, Linux supports the use of MSG_TRUNC in the flags
+	// argument of recv(2) (and recvmsg(2)). This flag causes the received
+	// bytes of data to be discarded, rather than passed back in a
+	// caller-supplied  buffer.
+	var w io.Writer
+	if !isPacket && trunc {
+		w = &tcpip.LimitedWriter{
+			W: ioutil.Discard,
+			N: dst.NumBytes(),
+		}
+	} else {
+		w = dst.Writer(ctx)
 	}
 
 	s.readMu.Lock()
 	defer s.readMu.Unlock()
 
-	if err := s.fetchReadView(); err != nil {
-		return 0, 0, nil, 0, socket.ControlMessages{}, err
+	res, err := s.Endpoint.Read(w, readOptions)
+	if _, ok := err.(*tcpip.ErrBadBuffer); ok && dst.NumBytes() == 0 {
+		err = nil
 	}
-
-	if !isPacket && peek && trunc {
-		// MSG_TRUNC with MSG_PEEK on a TCP socket returns the
-		// amount that could be read.
-		rql, err := s.Endpoint.GetSockOptInt(tcpip.ReceiveQueueSizeOption)
-		if err != nil {
-			return 0, 0, nil, 0, socket.ControlMessages{}, syserr.TranslateNetstackError(err)
-		}
-		available := len(s.readView) + int(rql)
-		bufLen := int(dst.NumBytes())
-		if available < bufLen {
-			return available, 0, nil, 0, socket.ControlMessages{}, nil
-		}
-		return bufLen, 0, nil, 0, socket.ControlMessages{}, nil
+	if err != nil {
+		return 0, 0, nil, 0, socket.ControlMessages{}, syserr.TranslateNetstackError(err)
 	}
-
-	n, err := dst.CopyOut(ctx, s.readView)
 	// Set the control message, even if 0 bytes were read.
-	if err == nil {
-		s.updateTimestamp()
-	}
-	var addr linux.SockAddr
-	var addrLen uint32
-	if isPacket && senderRequested {
-		addr, addrLen = ConvertAddress(s.family, s.sender)
-		switch v := addr.(type) {
-		case *linux.SockAddrLink:
-			v.Protocol = htons(uint16(s.linkPacketInfo.Protocol))
-			v.PacketType = toLinuxPacketType(s.linkPacketInfo.PktType)
+	s.updateTimestamp(res.ControlMessages)
+
+	if isPacket {
+		var addr linux.SockAddr
+		var addrLen uint32
+		if senderRequested {
+			addr, addrLen = socket.ConvertAddress(s.family, res.RemoteAddr)
+			switch v := addr.(type) {
+			case *linux.SockAddrLink:
+				v.Protocol = socket.Htons(uint16(res.LinkPacketInfo.Protocol))
+				v.PacketType = toLinuxPacketType(res.LinkPacketInfo.PktType)
+			}
 		}
+
+		msgLen := res.Count
+		if trunc {
+			msgLen = res.Total
+		}
+
+		var flags int
+		if res.Total > res.Count {
+			flags |= linux.MSG_TRUNC
+		}
+
+		return msgLen, flags, addr, addrLen, s.controlMessages(res.ControlMessages), nil
 	}
 
 	if peek {
-		if l := len(s.readView); trunc && l > n {
-			// isPacket must be true.
-			return l, linux.MSG_TRUNC, addr, addrLen, s.controlMessages(), syserr.FromError(err)
-		}
-
-		if isPacket || err != nil {
-			return n, 0, addr, addrLen, s.controlMessages(), syserr.FromError(err)
-		}
-
-		// We need to peek beyond the first message.
-		dst = dst.DropFirst(n)
-		num, err := dst.CopyOutFrom(ctx, safemem.FromVecReaderFunc{func(dsts [][]byte) (int64, error) {
-			n, _, err := s.Endpoint.Peek(dsts)
-			// TODO(b/78348848): Handle peek timestamp.
+		// MSG_TRUNC with MSG_PEEK on a TCP socket returns the
+		// amount that could be read, and does not write to buffer.
+		if trunc {
+			// TCP endpoint does not return the total bytes in buffer as numTotal.
+			// We need to query it from socket option.
+			rql, err := s.Endpoint.GetSockOptInt(tcpip.ReceiveQueueSizeOption)
 			if err != nil {
-				return int64(n), syserr.TranslateNetstackError(err).ToError()
+				return 0, 0, nil, 0, socket.ControlMessages{}, syserr.TranslateNetstackError(err)
 			}
-			return int64(n), nil
-		}})
-		n += int(num)
-		if err == syserror.ErrWouldBlock && n > 0 {
-			// We got some data, so no need to return an error.
-			err = nil
+			msgLen := int(dst.NumBytes())
+			if msgLen > rql {
+				msgLen = rql
+			}
+			return msgLen, 0, nil, 0, socket.ControlMessages{}, nil
 		}
-		return n, 0, nil, 0, s.controlMessages(), syserr.FromError(err)
+	} else if n := res.Count; n != 0 {
+		s.Endpoint.ModerateRecvBuf(n)
 	}
 
-	var msgLen int
-	if isPacket {
-		msgLen = len(s.readView)
-		s.readView = nil
-	} else {
-		msgLen = int(n)
-		s.readView.TrimFront(int(n))
-	}
-
-	if len(s.readView) == 0 {
-		atomic.StoreUint32(&s.readViewHasData, 0)
-	}
-
-	var flags int
-	if msgLen > int(n) {
-		flags |= linux.MSG_TRUNC
-	}
-
-	if trunc {
-		n = msgLen
-	}
-
-	cmsg := s.controlMessages()
+	cmsg := s.controlMessages(res.ControlMessages)
 	s.fillCmsgInq(&cmsg)
-	return n, flags, addr, addrLen, cmsg, syserr.FromError(err)
+	return res.Count, 0, nil, 0, cmsg, syserr.TranslateNetstackError(err)
 }
 
-func (s *socketOpsCommon) controlMessages() socket.ControlMessages {
+func (s *socketOpsCommon) controlMessages(cm tcpip.ControlMessages) socket.ControlMessages {
+	readCM := socket.NewIPControlMessages(s.family, cm)
 	return socket.ControlMessages{
-		IP: tcpip.ControlMessages{
-			HasTimestamp:    s.readCM.HasTimestamp && s.sockOptTimestamp,
-			Timestamp:       s.readCM.Timestamp,
-			HasTOS:          s.readCM.HasTOS,
-			TOS:             s.readCM.TOS,
-			HasTClass:       s.readCM.HasTClass,
-			TClass:          s.readCM.TClass,
-			HasIPPacketInfo: s.readCM.HasIPPacketInfo,
-			PacketInfo:      s.readCM.PacketInfo,
+		IP: socket.IPControlMessages{
+			HasTimestamp:       readCM.HasTimestamp && s.sockOptTimestamp,
+			Timestamp:          readCM.Timestamp,
+			HasInq:             readCM.HasInq,
+			Inq:                readCM.Inq,
+			HasTOS:             readCM.HasTOS,
+			TOS:                readCM.TOS,
+			HasTClass:          readCM.HasTClass,
+			TClass:             readCM.TClass,
+			HasIPPacketInfo:    readCM.HasIPPacketInfo,
+			PacketInfo:         readCM.PacketInfo,
+			OriginalDstAddress: readCM.OriginalDstAddress,
+			SockErr:            readCM.SockErr,
 		},
 	}
 }
@@ -2894,17 +2654,74 @@ func (s *socketOpsCommon) controlMessages() socket.ControlMessages {
 // successfully writing packet data out to userspace.
 //
 // Precondition: s.readMu must be locked.
-func (s *socketOpsCommon) updateTimestamp() {
+func (s *socketOpsCommon) updateTimestamp(cm tcpip.ControlMessages) {
 	// Save the SIOCGSTAMP timestamp only if SO_TIMESTAMP is disabled.
 	if !s.sockOptTimestamp {
 		s.timestampValid = true
-		s.timestampNS = s.readCM.Timestamp
+		s.timestampNS = cm.Timestamp
 	}
+}
+
+// dequeueErr is analogous to net/core/skbuff.c:sock_dequeue_err_skb().
+func (s *socketOpsCommon) dequeueErr() *tcpip.SockError {
+	so := s.Endpoint.SocketOptions()
+	err := so.DequeueErr()
+	if err == nil {
+		return nil
+	}
+
+	// Update socket error to reflect ICMP errors in queue.
+	if nextErr := so.PeekErr(); nextErr != nil && nextErr.Cause.Origin().IsICMPErr() {
+		so.SetLastError(nextErr.Err)
+	} else if err.Cause.Origin().IsICMPErr() {
+		so.SetLastError(nil)
+	}
+	return err
+}
+
+// addrFamilyFromNetProto returns the address family identifier for the given
+// network protocol.
+func addrFamilyFromNetProto(net tcpip.NetworkProtocolNumber) int {
+	switch net {
+	case header.IPv4ProtocolNumber:
+		return linux.AF_INET
+	case header.IPv6ProtocolNumber:
+		return linux.AF_INET6
+	default:
+		panic(fmt.Sprintf("invalid net proto for addr family inference: %d", net))
+	}
+}
+
+// recvErr handles MSG_ERRQUEUE for recvmsg(2).
+// This is analogous to net/ipv4/ip_sockglue.c:ip_recv_error().
+func (s *socketOpsCommon) recvErr(t *kernel.Task, dst usermem.IOSequence) (int, int, linux.SockAddr, uint32, socket.ControlMessages, *syserr.Error) {
+	sockErr := s.dequeueErr()
+	if sockErr == nil {
+		return 0, 0, nil, 0, socket.ControlMessages{}, syserr.ErrTryAgain
+	}
+
+	// The payload of the original packet that caused the error is passed as
+	// normal data via msg_iovec.  -- recvmsg(2)
+	msgFlags := linux.MSG_ERRQUEUE
+	if int(dst.NumBytes()) < len(sockErr.Payload) {
+		msgFlags |= linux.MSG_TRUNC
+	}
+	n, err := dst.CopyOut(t, sockErr.Payload)
+
+	// The original destination address of the datagram that caused the error is
+	// supplied via msg_name.  -- recvmsg(2)
+	dstAddr, dstAddrLen := socket.ConvertAddress(addrFamilyFromNetProto(sockErr.NetProto), sockErr.Dst)
+	cmgs := socket.ControlMessages{IP: socket.NewIPControlMessages(s.family, tcpip.ControlMessages{SockErr: sockErr})}
+	return n, msgFlags, dstAddr, dstAddrLen, cmgs, syserr.FromError(err)
 }
 
 // RecvMsg implements the linux syscall recvmsg(2) for sockets backed by
 // tcpip.Endpoint.
 func (s *socketOpsCommon) RecvMsg(t *kernel.Task, dst usermem.IOSequence, flags int, haveDeadline bool, deadline ktime.Time, senderRequested bool, controlDataLen uint64) (n int, msgFlags int, senderAddr linux.SockAddr, senderAddrLen uint32, controlMessages socket.ControlMessages, err *syserr.Error) {
+	if flags&linux.MSG_ERRQUEUE != 0 {
+		return s.recvErr(t, dst)
+	}
+
 	trunc := flags&linux.MSG_TRUNC != 0
 	peek := flags&linux.MSG_PEEK != 0
 	dontWait := flags&linux.MSG_DONTWAIT != 0
@@ -2936,7 +2753,7 @@ func (s *socketOpsCommon) RecvMsg(t *kernel.Task, dst usermem.IOSequence, flags 
 	// We'll have to block. Register for notifications and keep trying to
 	// send all the data.
 	e, ch := waiter.NewChannelEntry(nil)
-	s.EventRegister(&e, waiter.EventIn)
+	s.EventRegister(&e, waiter.ReadableEvents)
 	defer s.EventUnregister(&e)
 
 	for {
@@ -2980,7 +2797,7 @@ func (s *socketOpsCommon) SendMsg(t *kernel.Task, src usermem.IOSequence, to []b
 
 	var addr *tcpip.FullAddress
 	if len(to) > 0 {
-		addrBuf, family, err := AddressAndFamily(to)
+		addrBuf, family, err := socket.AddressAndFamily(to)
 		if err != nil {
 			return 0, err
 		}
@@ -2998,51 +2815,48 @@ func (s *socketOpsCommon) SendMsg(t *kernel.Task, src usermem.IOSequence, to []b
 		EndOfRecord: flags&linux.MSG_EOR != 0,
 	}
 
-	v := &ioSequencePayload{t, src}
-	n, resCh, err := s.Endpoint.Write(v, opts)
-	if resCh != nil {
-		if err := t.Block(resCh); err != nil {
-			return 0, syserr.FromError(err)
-		}
-		n, _, err = s.Endpoint.Write(v, opts)
-	}
-	dontWait := flags&linux.MSG_DONTWAIT != 0
-	if err == nil && (n >= v.src.NumBytes() || dontWait) {
-		// Complete write.
-		return int(n), nil
-	}
-	if err != nil && (err != tcpip.ErrWouldBlock || dontWait) {
-		return int(n), syserr.TranslateNetstackError(err)
-	}
-
-	// We'll have to block. Register for notification and keep trying to
-	// send all the data.
-	e, ch := waiter.NewChannelEntry(nil)
-	s.EventRegister(&e, waiter.EventOut)
-	defer s.EventUnregister(&e)
-
-	v.DropFirst(int(n))
-	total := n
+	r := src.Reader(t)
+	var (
+		total int64
+		entry waiter.Entry
+		ch    <-chan struct{}
+	)
 	for {
-		n, _, err = s.Endpoint.Write(v, opts)
-		v.DropFirst(int(n))
+		n, err := s.Endpoint.Write(r, opts)
 		total += n
-
-		if err != nil && err != tcpip.ErrWouldBlock && total == 0 {
-			return 0, syserr.TranslateNetstackError(err)
+		if flags&linux.MSG_DONTWAIT != 0 {
+			return int(total), syserr.TranslateNetstackError(err)
 		}
-
-		if err == nil && v.src.NumBytes() == 0 || err != nil && err != tcpip.ErrWouldBlock {
-			return int(total), nil
+		block := true
+		switch err.(type) {
+		case nil:
+			block = total != src.NumBytes()
+		case *tcpip.ErrWouldBlock:
+		default:
+			block = false
 		}
-
-		if err := t.BlockWithDeadline(ch, haveDeadline, deadline); err != nil {
-			if err == syserror.ETIMEDOUT {
-				return int(total), syserr.ErrTryAgain
+		if block {
+			if ch == nil {
+				// We'll have to block. Register for notification and keep trying to
+				// send all the data.
+				entry, ch = waiter.NewChannelEntry(nil)
+				s.EventRegister(&entry, waiter.WritableEvents)
+				defer s.EventUnregister(&entry)
+			} else {
+				// Don't wait immediately after registration in case more data
+				// became available between when we last checked and when we setup
+				// the notification.
+				if err := t.BlockWithDeadline(ch, haveDeadline, deadline); err != nil {
+					if err == syserror.ETIMEDOUT {
+						return int(total), syserr.ErrTryAgain
+					}
+					// handleIOError will consume errors from t.Block if needed.
+					return int(total), syserr.FromError(err)
+				}
 			}
-			// handleIOError will consume errors from t.Block if needed.
-			return int(total), syserr.FromError(err)
+			continue
 		}
+		return int(total), syserr.TranslateNetstackError(err)
 	}
 }
 
@@ -3077,11 +2891,6 @@ func (s *socketOpsCommon) ioctl(ctx context.Context, io usermem.IO, args arch.Sy
 		if terr != nil {
 			return 0, syserr.TranslateNetstackError(terr).ToError()
 		}
-
-		// Add bytes removed from the endpoint but not yet sent to the caller.
-		s.readMu.Lock()
-		v += len(s.readView)
-		s.readMu.Unlock()
 
 		if v > math.MaxInt32 {
 			v = math.MaxInt32
@@ -3399,6 +3208,18 @@ func nicStateFlagsToLinux(f stack.NICStateFlags) uint32 {
 	return rv
 }
 
+func isTCPSocket(skType linux.SockType, skProto int) bool {
+	return skType == linux.SOCK_STREAM && (skProto == 0 || skProto == unix.IPPROTO_TCP)
+}
+
+func isUDPSocket(skType linux.SockType, skProto int) bool {
+	return skType == linux.SOCK_DGRAM && (skProto == 0 || skProto == unix.IPPROTO_UDP)
+}
+
+func isICMPSocket(skType linux.SockType, skProto int) bool {
+	return skType == linux.SOCK_DGRAM && (skProto == unix.IPPROTO_ICMP || skProto == unix.IPPROTO_ICMPV6)
+}
+
 // State implements socket.Socket.State. State translates the internal state
 // returned by netstack to values defined by Linux.
 func (s *socketOpsCommon) State() uint32 {
@@ -3408,7 +3229,7 @@ func (s *socketOpsCommon) State() uint32 {
 	}
 
 	switch {
-	case s.skType == linux.SOCK_STREAM && s.protocol == 0 || s.protocol == syscall.IPPROTO_TCP:
+	case isTCPSocket(s.skType, s.protocol):
 		// TCP socket.
 		switch tcp.EndpointState(s.Endpoint.State()) {
 		case tcp.StateEstablished:
@@ -3437,7 +3258,7 @@ func (s *socketOpsCommon) State() uint32 {
 			// Internal or unknown state.
 			return 0
 		}
-	case s.skType == linux.SOCK_DGRAM && s.protocol == 0 || s.protocol == syscall.IPPROTO_UDP:
+	case isUDPSocket(s.skType, s.protocol):
 		// UDP socket.
 		switch udp.EndpointState(s.Endpoint.State()) {
 		case udp.StateInitial, udp.StateBound, udp.StateClosed:
@@ -3447,7 +3268,7 @@ func (s *socketOpsCommon) State() uint32 {
 		default:
 			return 0
 		}
-	case s.skType == linux.SOCK_DGRAM && s.protocol == syscall.IPPROTO_ICMP || s.protocol == syscall.IPPROTO_ICMPV6:
+	case isICMPSocket(s.skType, s.protocol):
 		// TODO(b/112063468): Export states for ICMP sockets.
 	case s.skType == linux.SOCK_RAW:
 		// TODO(b/112063468): Export states for raw sockets.

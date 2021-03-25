@@ -20,7 +20,6 @@ import (
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/marshal"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
-	fslock "gvisor.dev/gvisor/pkg/sentry/fs/lock"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/sockfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/socket"
@@ -96,8 +95,7 @@ func NewFileDescription(ep transport.Endpoint, stype linux.SockType, flags uint3
 // DecRef implements RefCounter.DecRef.
 func (s *SocketVFS2) DecRef(ctx context.Context) {
 	s.socketVFS2Refs.DecRef(func() {
-		t := kernel.TaskFromContext(ctx)
-		t.Kernel().DeleteSocketVFS2(&s.vfsfd)
+		kernel.KernelFromContext(ctx).DeleteSocketVFS2(&s.vfsfd)
 		s.ep.Close(ctx)
 		if s.abstractNamespace != nil {
 			s.abstractNamespace.Remove(s.abstractName, s)
@@ -123,7 +121,7 @@ func (s *SocketVFS2) GetSockOpt(t *kernel.Task, level, name int, outPtr usermem.
 func (s *SocketVFS2) blockingAccept(t *kernel.Task, peerAddr *tcpip.FullAddress) (transport.Endpoint, *syserr.Error) {
 	// Register for notifications.
 	e, ch := waiter.NewChannelEntry(nil)
-	s.socketOpsCommon.EventRegister(&e, waiter.EventIn)
+	s.socketOpsCommon.EventRegister(&e, waiter.ReadableEvents)
 	defer s.socketOpsCommon.EventUnregister(&e)
 
 	// Try to accept the connection; if it fails, then wait until we get a
@@ -172,7 +170,7 @@ func (s *SocketVFS2) Accept(t *kernel.Task, peerRequested bool, flags int, block
 	var addr linux.SockAddr
 	var addrLen uint32
 	if peerAddr != nil {
-		addr, addrLen = netstack.ConvertAddress(linux.AF_UNIX, *peerAddr)
+		addr, addrLen = socket.ConvertAddress(linux.AF_UNIX, *peerAddr)
 	}
 
 	fd, e := t.NewFDFromVFS2(0, ns, kernel.FDFlags{
@@ -329,16 +327,6 @@ func (s *SocketVFS2) EventUnregister(e *waiter.Entry) {
 // a transport.Endpoint.
 func (s *SocketVFS2) SetSockOpt(t *kernel.Task, level int, name int, optVal []byte) *syserr.Error {
 	return netstack.SetSockOpt(t, s, s.ep, level, name, optVal)
-}
-
-// LockPOSIX implements vfs.FileDescriptionImpl.LockPOSIX.
-func (s *SocketVFS2) LockPOSIX(ctx context.Context, uid fslock.UniqueID, t fslock.LockType, start, length uint64, whence int16, block fslock.Blocker) error {
-	return s.Locks().LockPOSIX(ctx, &s.vfsfd, uid, t, start, length, whence, block)
-}
-
-// UnlockPOSIX implements vfs.FileDescriptionImpl.UnlockPOSIX.
-func (s *SocketVFS2) UnlockPOSIX(ctx context.Context, uid fslock.UniqueID, start, length uint64, whence int16) error {
-	return s.Locks().UnlockPOSIX(ctx, &s.vfsfd, uid, start, length, whence)
 }
 
 // providerVFS2 is a unix domain socket provider for VFS2.

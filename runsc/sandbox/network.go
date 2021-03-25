@@ -21,7 +21,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
-	"syscall"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/vishvananda/netlink"
@@ -102,11 +101,11 @@ func joinNetNS(nsPath string) (func(), error) {
 // isRootNS determines whether we are running in the root net namespace.
 // /proc/sys/net/core/rmem_default only exists in root network namespace.
 func isRootNS() (bool, error) {
-	err := syscall.Access("/proc/sys/net/core/rmem_default", syscall.F_OK)
+	err := unix.Access("/proc/sys/net/core/rmem_default", unix.F_OK)
 	switch err {
 	case nil:
 		return true, nil
-	case syscall.ENOENT:
+	case unix.ENOENT:
 		return false, nil
 	default:
 		return false, fmt.Errorf("failed to access /proc/sys/net/core/rmem_default: %v", err)
@@ -127,7 +126,7 @@ func createInterfacesAndRoutesFromNS(conn *urpc.Client, nsPath string, hardwareG
 	// Get all interfaces in the namespace.
 	ifaces, err := net.Interfaces()
 	if err != nil {
-		return fmt.Errorf("querying interfaces: %v", err)
+		return fmt.Errorf("querying interfaces: %w", err)
 	}
 
 	isRoot, err := isRootNS()
@@ -148,14 +147,14 @@ func createInterfacesAndRoutesFromNS(conn *urpc.Client, nsPath string, hardwareG
 
 		allAddrs, err := iface.Addrs()
 		if err != nil {
-			return fmt.Errorf("fetching interface addresses for %q: %v", iface.Name, err)
+			return fmt.Errorf("fetching interface addresses for %q: %w", iface.Name, err)
 		}
 
 		// We build our own loopback device.
 		if iface.Flags&net.FlagLoopback != 0 {
 			link, err := loopbackLink(iface, allAddrs)
 			if err != nil {
-				return fmt.Errorf("getting loopback link for iface %q: %v", iface.Name, err)
+				return fmt.Errorf("getting loopback link for iface %q: %w", iface.Name, err)
 			}
 			args.LoopbackLinks = append(args.LoopbackLinks, link)
 			continue
@@ -209,7 +208,7 @@ func createInterfacesAndRoutesFromNS(conn *urpc.Client, nsPath string, hardwareG
 		// Get the link for the interface.
 		ifaceLink, err := netlink.LinkByName(iface.Name)
 		if err != nil {
-			return fmt.Errorf("getting link for interface %q: %v", iface.Name, err)
+			return fmt.Errorf("getting link for interface %q: %w", iface.Name, err)
 		}
 		link.LinkAddress = ifaceLink.Attrs().HardwareAddr
 
@@ -219,7 +218,7 @@ func createInterfacesAndRoutesFromNS(conn *urpc.Client, nsPath string, hardwareG
 			log.Debugf("Creating Channel %d", i)
 			socketEntry, err := createSocket(iface, ifaceLink, hardwareGSO)
 			if err != nil {
-				return fmt.Errorf("failed to createSocket for %s : %v", iface.Name, err)
+				return fmt.Errorf("failed to createSocket for %s : %w", iface.Name, err)
 			}
 			if i == 0 {
 				link.GSOMaxSize = socketEntry.gsoMaxSize
@@ -241,11 +240,12 @@ func createInterfacesAndRoutesFromNS(conn *urpc.Client, nsPath string, hardwareG
 		// Collect the addresses for the interface, enable forwarding,
 		// and remove them from the host.
 		for _, addr := range ipAddrs {
-			link.Addresses = append(link.Addresses, addr.IP)
+			prefix, _ := addr.Mask.Size()
+			link.Addresses = append(link.Addresses, boot.IPWithPrefix{Address: addr.IP, PrefixLen: prefix})
 
 			// Steal IP address from NIC.
 			if err := removeAddress(ifaceLink, addr.String()); err != nil {
-				return fmt.Errorf("removing address %v from device %q: %v", iface.Name, addr, err)
+				return fmt.Errorf("removing address %v from device %q: %w", addr, iface.Name, err)
 			}
 		}
 
@@ -254,7 +254,7 @@ func createInterfacesAndRoutesFromNS(conn *urpc.Client, nsPath string, hardwareG
 
 	log.Debugf("Setting up network, config: %+v", args)
 	if err := conn.Call(boot.NetworkCreateLinksAndRoutes, &args, nil); err != nil {
-		return fmt.Errorf("creating links and routes: %v", err)
+		return fmt.Errorf("creating links and routes: %w", err)
 	}
 	return nil
 }
@@ -269,19 +269,17 @@ type socketEntry struct {
 func createSocket(iface net.Interface, ifaceLink netlink.Link, enableGSO bool) (*socketEntry, error) {
 	// Create the socket.
 	const protocol = 0x0300 // htons(ETH_P_ALL)
-	fd, err := syscall.Socket(syscall.AF_PACKET, syscall.SOCK_RAW, protocol)
+	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, protocol)
 	if err != nil {
 		return nil, fmt.Errorf("unable to create raw socket: %v", err)
 	}
 	deviceFile := os.NewFile(uintptr(fd), "raw-device-fd")
 	// Bind to the appropriate device.
-	ll := syscall.SockaddrLinklayer{
+	ll := unix.SockaddrLinklayer{
 		Protocol: protocol,
 		Ifindex:  iface.Index,
-		Hatype:   0, // No ARP type.
-		Pkttype:  syscall.PACKET_OTHERHOST,
 	}
-	if err := syscall.Bind(fd, &ll); err != nil {
+	if err := unix.Bind(fd, &ll); err != nil {
 		return nil, fmt.Errorf("unable to bind to %q: %v", iface.Name, err)
 	}
 
@@ -292,7 +290,7 @@ func createSocket(iface net.Interface, ifaceLink netlink.Link, enableGSO bool) (
 			return nil, fmt.Errorf("getting GSO for interface %q: %v", iface.Name, err)
 		}
 		if gso {
-			if err := syscall.SetsockoptInt(fd, syscall.SOL_PACKET, unix.PACKET_VNET_HDR, 1); err != nil {
+			if err := unix.SetsockoptInt(fd, unix.SOL_PACKET, unix.PACKET_VNET_HDR, 1); err != nil {
 				return nil, fmt.Errorf("unable to enable the PACKET_VNET_HDR option: %v", err)
 			}
 			gsoMaxSize = ifaceLink.Attrs().GSOMaxSize
@@ -308,18 +306,18 @@ func createSocket(iface net.Interface, ifaceLink netlink.Link, enableGSO bool) (
 	// incurring packet drops.
 	const bufSize = 4 << 20 // 4MB.
 
-	if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_RCVBUFFORCE, bufSize); err != nil {
-		syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, bufSize)
-		sz, _ := syscall.GetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_RCVBUF)
+	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_RCVBUFFORCE, bufSize); err != nil {
+		unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_RCVBUF, bufSize)
+		sz, _ := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_RCVBUF)
 
 		if sz < bufSize {
 			log.Warningf("Failed to increase rcv buffer to %d on SOCK_RAW on %s. Current buffer %d: %v", bufSize, iface.Name, sz, err)
 		}
 	}
 
-	if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_SNDBUFFORCE, bufSize); err != nil {
-		syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, bufSize)
-		sz, _ := syscall.GetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_SNDBUF)
+	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_SNDBUFFORCE, bufSize); err != nil {
+		unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_SNDBUF, bufSize)
+		sz, _ := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_SNDBUF)
 		if sz < bufSize {
 			log.Warningf("Failed to increase snd buffer to %d on SOCK_RAW on %s. Curent buffer %d: %v", bufSize, iface.Name, sz, err)
 		}
@@ -339,9 +337,15 @@ func loopbackLink(iface net.Interface, addrs []net.Addr) (boot.LoopbackLink, err
 		if !ok {
 			return boot.LoopbackLink{}, fmt.Errorf("address is not IPNet: %+v", addr)
 		}
+
+		prefix, _ := ipNet.Mask.Size()
+		link.Addresses = append(link.Addresses, boot.IPWithPrefix{
+			Address:   ipNet.IP,
+			PrefixLen: prefix,
+		})
+
 		dst := *ipNet
 		dst.IP = dst.IP.Mask(dst.Mask)
-		link.Addresses = append(link.Addresses, ipNet.IP)
 		link.Routes = append(link.Routes, boot.Route{
 			Destination: dst,
 		})

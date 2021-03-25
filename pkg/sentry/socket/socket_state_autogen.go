@@ -6,6 +6,64 @@ import (
 	"gvisor.dev/gvisor/pkg/state"
 )
 
+func (i *IPControlMessages) StateTypeName() string {
+	return "pkg/sentry/socket.IPControlMessages"
+}
+
+func (i *IPControlMessages) StateFields() []string {
+	return []string{
+		"HasTimestamp",
+		"Timestamp",
+		"HasInq",
+		"Inq",
+		"HasTOS",
+		"TOS",
+		"HasTClass",
+		"TClass",
+		"HasIPPacketInfo",
+		"PacketInfo",
+		"OriginalDstAddress",
+		"SockErr",
+	}
+}
+
+func (i *IPControlMessages) beforeSave() {}
+
+// +checklocksignore
+func (i *IPControlMessages) StateSave(stateSinkObject state.Sink) {
+	i.beforeSave()
+	stateSinkObject.Save(0, &i.HasTimestamp)
+	stateSinkObject.Save(1, &i.Timestamp)
+	stateSinkObject.Save(2, &i.HasInq)
+	stateSinkObject.Save(3, &i.Inq)
+	stateSinkObject.Save(4, &i.HasTOS)
+	stateSinkObject.Save(5, &i.TOS)
+	stateSinkObject.Save(6, &i.HasTClass)
+	stateSinkObject.Save(7, &i.TClass)
+	stateSinkObject.Save(8, &i.HasIPPacketInfo)
+	stateSinkObject.Save(9, &i.PacketInfo)
+	stateSinkObject.Save(10, &i.OriginalDstAddress)
+	stateSinkObject.Save(11, &i.SockErr)
+}
+
+func (i *IPControlMessages) afterLoad() {}
+
+// +checklocksignore
+func (i *IPControlMessages) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &i.HasTimestamp)
+	stateSourceObject.Load(1, &i.Timestamp)
+	stateSourceObject.Load(2, &i.HasInq)
+	stateSourceObject.Load(3, &i.Inq)
+	stateSourceObject.Load(4, &i.HasTOS)
+	stateSourceObject.Load(5, &i.TOS)
+	stateSourceObject.Load(6, &i.HasTClass)
+	stateSourceObject.Load(7, &i.TClass)
+	stateSourceObject.Load(8, &i.HasIPPacketInfo)
+	stateSourceObject.Load(9, &i.PacketInfo)
+	stateSourceObject.Load(10, &i.OriginalDstAddress)
+	stateSourceObject.Load(11, &i.SockErr)
+}
+
 func (to *SendReceiveTimeout) StateTypeName() string {
 	return "pkg/sentry/socket.SendReceiveTimeout"
 }
@@ -19,6 +77,7 @@ func (to *SendReceiveTimeout) StateFields() []string {
 
 func (to *SendReceiveTimeout) beforeSave() {}
 
+// +checklocksignore
 func (to *SendReceiveTimeout) StateSave(stateSinkObject state.Sink) {
 	to.beforeSave()
 	stateSinkObject.Save(0, &to.send)
@@ -27,11 +86,13 @@ func (to *SendReceiveTimeout) StateSave(stateSinkObject state.Sink) {
 
 func (to *SendReceiveTimeout) afterLoad() {}
 
+// +checklocksignore
 func (to *SendReceiveTimeout) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &to.send)
 	stateSourceObject.Load(1, &to.recv)
 }
 
 func init() {
+	state.Register((*IPControlMessages)(nil))
 	state.Register((*SendReceiveTimeout)(nil))
 }

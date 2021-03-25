@@ -30,6 +30,7 @@ import (
 	"github.com/cenkalti/backoff"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/syndtr/gocapability/capability"
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/control/client"
 	"gvisor.dev/gvisor/pkg/control/server"
@@ -83,7 +84,7 @@ type Sandbox struct {
 	// child==true and the sandbox was waited on. This field allows for multiple
 	// threads to wait on sandbox and get the exit code, since Linux will return
 	// WaitStatus to one of the waiters only.
-	status syscall.WaitStatus
+	status unix.WaitStatus
 }
 
 // Args is used to configure a new sandbox.
@@ -173,7 +174,7 @@ func New(conf *config.Config, args *Args) (*Sandbox, error) {
 }
 
 // CreateContainer creates a non-root container inside the sandbox.
-func (s *Sandbox) CreateContainer(cid string) error {
+func (s *Sandbox) CreateContainer(cid string, tty *os.File) error {
 	log.Debugf("Create non-root container %q in sandbox %q, PID: %d", cid, s.ID, s.Pid)
 	sandboxConn, err := s.sandboxConnect()
 	if err != nil {
@@ -181,7 +182,16 @@ func (s *Sandbox) CreateContainer(cid string) error {
 	}
 	defer sandboxConn.Close()
 
-	if err := sandboxConn.Call(boot.ContainerCreate, &cid, nil); err != nil {
+	var files []*os.File
+	if tty != nil {
+		files = []*os.File{tty}
+	}
+
+	args := boot.CreateArgs{
+		CID:         cid,
+		FilePayload: urpc.FilePayload{Files: files},
+	}
+	if err := sandboxConn.Call(boot.ContainerCreate, &args, nil); err != nil {
 		return fmt.Errorf("creating non-root container %q: %v", cid, err)
 	}
 	return nil
@@ -211,11 +221,7 @@ func (s *Sandbox) StartRoot(spec *specs.Spec, conf *config.Config) error {
 }
 
 // StartContainer starts running a non-root container inside the sandbox.
-func (s *Sandbox) StartContainer(spec *specs.Spec, conf *config.Config, cid string, goferFiles []*os.File) error {
-	for _, f := range goferFiles {
-		defer f.Close()
-	}
-
+func (s *Sandbox) StartContainer(spec *specs.Spec, conf *config.Config, cid string, stdios, goferFiles []*os.File) error {
 	log.Debugf("Start non-root container %q in sandbox %q, PID: %d", cid, s.ID, s.Pid)
 	sandboxConn, err := s.sandboxConnect()
 	if err != nil {
@@ -223,15 +229,18 @@ func (s *Sandbox) StartContainer(spec *specs.Spec, conf *config.Config, cid stri
 	}
 	defer sandboxConn.Close()
 
-	// The payload must container stdin/stdout/stderr followed by gofer
-	// files.
-	files := append([]*os.File{os.Stdin, os.Stdout, os.Stderr}, goferFiles...)
+	// The payload must contain stdin/stdout/stderr (which may be empty if using
+	// TTY) followed by gofer files.
+	payload := urpc.FilePayload{}
+	payload.Files = append(payload.Files, stdios...)
+	payload.Files = append(payload.Files, goferFiles...)
+
 	// Start running the container.
 	args := boot.StartArgs{
 		Spec:        spec,
 		Conf:        conf,
 		CID:         cid,
-		FilePayload: urpc.FilePayload{Files: files},
+		FilePayload: payload,
 	}
 	if err := sandboxConn.Call(boot.ContainerStart, &args, nil); err != nil {
 		return fmt.Errorf("starting non-root container %v: %v", spec.Process.Args, err)
@@ -300,6 +309,22 @@ func (s *Sandbox) Processes(cid string) ([]*control.Process, error) {
 	return pl, nil
 }
 
+// FindCgroup returns the sandbox's Cgroup, or an error if it does not have one.
+func (s *Sandbox) FindCgroup() (*cgroup.Cgroup, error) {
+	paths, err := cgroup.LoadPaths(strconv.Itoa(s.Pid))
+	if err != nil {
+		return nil, err
+	}
+	// runsc places sandboxes in the same cgroup for each controller, so we
+	// pick an arbitrary controller here to get the cgroup path.
+	const controller = "cpuacct"
+	controllerPath, ok := paths[controller]
+	if !ok {
+		return nil, fmt.Errorf("no %q controller found", controller)
+	}
+	return cgroup.NewFromPath(controllerPath)
+}
+
 // Execute runs the specified command in the container. It returns the PID of
 // the newly created process.
 func (s *Sandbox) Execute(args *control.ExecArgs) (int32, error) {
@@ -319,7 +344,7 @@ func (s *Sandbox) Execute(args *control.ExecArgs) (int32, error) {
 }
 
 // Event retrieves stats about the sandbox such as memory and CPU utilization.
-func (s *Sandbox) Event(cid string) (*boot.Event, error) {
+func (s *Sandbox) Event(cid string) (*boot.EventOut, error) {
 	log.Debugf("Getting events for container %q in sandbox %q", cid, s.ID)
 	conn, err := s.sandboxConnect()
 	if err != nil {
@@ -327,13 +352,13 @@ func (s *Sandbox) Event(cid string) (*boot.Event, error) {
 	}
 	defer conn.Close()
 
-	var e boot.Event
+	var e boot.EventOut
 	// TODO(b/129292330): Pass in the container id (cid) here. The sandbox
 	// should return events only for that container.
 	if err := conn.Call(boot.ContainerEvent, nil, &e); err != nil {
 		return nil, fmt.Errorf("retrieving event data from sandbox: %v", err)
 	}
-	e.ID = cid
+	e.Event.ID = cid
 	return &e, nil
 }
 
@@ -359,7 +384,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 
 	binPath := specutils.ExePath
 	cmd := exec.Command(binPath, conf.ToFlags()...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{}
+	cmd.SysProcAttr = &unix.SysProcAttr{}
 
 	// Open the log files to pass to the sandbox as FDs.
 	//
@@ -711,9 +736,11 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 		nextFD++
 	}
 
+	_ = nextFD // All FD assignment is finished.
+
 	if args.Attached {
 		// Kill sandbox if parent process exits in attached mode.
-		cmd.SysProcAttr.Pdeathsig = syscall.SIGKILL
+		cmd.SysProcAttr.Pdeathsig = unix.SIGKILL
 		// Tells boot that any process it creates must have pdeathsig set.
 		cmd.Args = append(cmd.Args, "--attached")
 	}
@@ -736,7 +763,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 		//
 		// NOTE: The error message is checked because error types are lost over
 		// rpc calls.
-		if strings.Contains(err.Error(), syscall.EACCES.Error()) {
+		if strings.Contains(err.Error(), unix.EACCES.Error()) {
 			if permsErr := checkBinaryPermissions(conf); permsErr != nil {
 				return fmt.Errorf("%v: %v", err, permsErr)
 			}
@@ -756,7 +783,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 }
 
 // Wait waits for the containerized process to exit, and returns its WaitStatus.
-func (s *Sandbox) Wait(cid string) (syscall.WaitStatus, error) {
+func (s *Sandbox) Wait(cid string) (unix.WaitStatus, error) {
 	log.Debugf("Waiting for container %q in sandbox %q", cid, s.ID)
 
 	if conn, err := s.sandboxConnect(); err != nil {
@@ -764,14 +791,14 @@ func (s *Sandbox) Wait(cid string) (syscall.WaitStatus, error) {
 		// There is nothing we can do for subcontainers. For the init container, we
 		// can try to get the sandbox exit code.
 		if !s.IsRootContainer(cid) {
-			return syscall.WaitStatus(0), err
+			return unix.WaitStatus(0), err
 		}
 		log.Warningf("Wait on container %q failed: %v. Will try waiting on the sandbox process instead.", cid, err)
 	} else {
 		defer conn.Close()
 
 		// Try the Wait RPC to the sandbox.
-		var ws syscall.WaitStatus
+		var ws unix.WaitStatus
 		err = conn.Call(boot.ContainerWait, &cid, &ws)
 		if err == nil {
 			// It worked!
@@ -779,7 +806,7 @@ func (s *Sandbox) Wait(cid string) (syscall.WaitStatus, error) {
 		}
 		// See comment above.
 		if !s.IsRootContainer(cid) {
-			return syscall.WaitStatus(0), err
+			return unix.WaitStatus(0), err
 		}
 
 		// The sandbox may have exited after we connected, but before
@@ -791,10 +818,10 @@ func (s *Sandbox) Wait(cid string) (syscall.WaitStatus, error) {
 	// The best we can do is ask Linux what the sandbox exit status was, since in
 	// most cases that will be the same as the container exit status.
 	if err := s.waitForStopped(); err != nil {
-		return syscall.WaitStatus(0), err
+		return unix.WaitStatus(0), err
 	}
 	if !s.child {
-		return syscall.WaitStatus(0), fmt.Errorf("sandbox no longer running and its exit status is unavailable")
+		return unix.WaitStatus(0), fmt.Errorf("sandbox no longer running and its exit status is unavailable")
 	}
 
 	s.statusMu.Lock()
@@ -804,9 +831,9 @@ func (s *Sandbox) Wait(cid string) (syscall.WaitStatus, error) {
 
 // WaitPID waits for process 'pid' in the container's sandbox and returns its
 // WaitStatus.
-func (s *Sandbox) WaitPID(cid string, pid int32) (syscall.WaitStatus, error) {
+func (s *Sandbox) WaitPID(cid string, pid int32) (unix.WaitStatus, error) {
 	log.Debugf("Waiting for PID %d in sandbox %q", pid, s.ID)
-	var ws syscall.WaitStatus
+	var ws unix.WaitStatus
 	conn, err := s.sandboxConnect()
 	if err != nil {
 		return ws, err
@@ -835,7 +862,7 @@ func (s *Sandbox) destroy() error {
 	log.Debugf("Destroy sandbox %q", s.ID)
 	if s.Pid != 0 {
 		log.Debugf("Killing sandbox %q", s.ID)
-		if err := syscall.Kill(s.Pid, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
+		if err := unix.Kill(s.Pid, unix.SIGKILL); err != nil && err != unix.ESRCH {
 			return fmt.Errorf("killing sandbox %q PID %q: %v", s.ID, s.Pid, err)
 		}
 		if err := s.waitForStopped(); err != nil {
@@ -849,7 +876,7 @@ func (s *Sandbox) destroy() error {
 // SignalContainer sends the signal to a container in the sandbox. If all is
 // true and signal is SIGKILL, then waits for all processes to exit before
 // returning.
-func (s *Sandbox) SignalContainer(cid string, sig syscall.Signal, all bool) error {
+func (s *Sandbox) SignalContainer(cid string, sig unix.Signal, all bool) error {
 	log.Debugf("Signal sandbox %q", s.ID)
 	conn, err := s.sandboxConnect()
 	if err != nil {
@@ -877,7 +904,7 @@ func (s *Sandbox) SignalContainer(cid string, sig syscall.Signal, all bool) erro
 // fgProcess is true, then the signal is sent to the foreground process group
 // in the same session that PID belongs to. This is only valid if the process
 // is attached to a host TTY.
-func (s *Sandbox) SignalProcess(cid string, pid int32, sig syscall.Signal, fgProcess bool) error {
+func (s *Sandbox) SignalProcess(cid string, pid int32, sig unix.Signal, fgProcess bool) error {
 	log.Debugf("Signal sandbox %q", s.ID)
 	conn, err := s.sandboxConnect()
 	if err != nil {
@@ -958,7 +985,7 @@ func (s *Sandbox) Resume(cid string) error {
 func (s *Sandbox) IsRunning() bool {
 	if s.Pid != 0 {
 		// Send a signal 0 to the sandbox process.
-		if err := syscall.Kill(s.Pid, 0); err == nil {
+		if err := unix.Kill(s.Pid, 0); err == nil {
 			// Succeeded, process is running.
 			return true
 		}
@@ -983,7 +1010,7 @@ func (s *Sandbox) Stacks() (string, error) {
 }
 
 // HeapProfile writes a heap profile to the given file.
-func (s *Sandbox) HeapProfile(f *os.File) error {
+func (s *Sandbox) HeapProfile(f *os.File, delay time.Duration) error {
 	log.Debugf("Heap profile %q", s.ID)
 	conn, err := s.sandboxConnect()
 	if err != nil {
@@ -991,54 +1018,31 @@ func (s *Sandbox) HeapProfile(f *os.File) error {
 	}
 	defer conn.Close()
 
-	opts := control.ProfileOpts{
-		FilePayload: urpc.FilePayload{
-			Files: []*os.File{f},
-		},
+	opts := control.HeapProfileOpts{
+		FilePayload: urpc.FilePayload{Files: []*os.File{f}},
+		Delay:       delay,
 	}
-	if err := conn.Call(boot.HeapProfile, &opts, nil); err != nil {
-		return fmt.Errorf("getting sandbox %q heap profile: %v", s.ID, err)
-	}
-	return nil
+	return conn.Call(boot.HeapProfile, &opts, nil)
 }
 
-// StartCPUProfile start CPU profile writing to the given file.
-func (s *Sandbox) StartCPUProfile(f *os.File) error {
-	log.Debugf("CPU profile start %q", s.ID)
+// CPUProfile collects a CPU profile.
+func (s *Sandbox) CPUProfile(f *os.File, duration time.Duration) error {
+	log.Debugf("CPU profile %q", s.ID)
 	conn, err := s.sandboxConnect()
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
 
-	opts := control.ProfileOpts{
-		FilePayload: urpc.FilePayload{
-			Files: []*os.File{f},
-		},
+	opts := control.CPUProfileOpts{
+		FilePayload: urpc.FilePayload{Files: []*os.File{f}},
+		Duration:    duration,
 	}
-	if err := conn.Call(boot.StartCPUProfile, &opts, nil); err != nil {
-		return fmt.Errorf("starting sandbox %q CPU profile: %v", s.ID, err)
-	}
-	return nil
-}
-
-// StopCPUProfile stops a previously started CPU profile.
-func (s *Sandbox) StopCPUProfile() error {
-	log.Debugf("CPU profile stop %q", s.ID)
-	conn, err := s.sandboxConnect()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	if err := conn.Call(boot.StopCPUProfile, nil, nil); err != nil {
-		return fmt.Errorf("stopping sandbox %q CPU profile: %v", s.ID, err)
-	}
-	return nil
+	return conn.Call(boot.CPUProfile, &opts, nil)
 }
 
 // BlockProfile writes a block profile to the given file.
-func (s *Sandbox) BlockProfile(f *os.File) error {
+func (s *Sandbox) BlockProfile(f *os.File, duration time.Duration) error {
 	log.Debugf("Block profile %q", s.ID)
 	conn, err := s.sandboxConnect()
 	if err != nil {
@@ -1046,19 +1050,15 @@ func (s *Sandbox) BlockProfile(f *os.File) error {
 	}
 	defer conn.Close()
 
-	opts := control.ProfileOpts{
-		FilePayload: urpc.FilePayload{
-			Files: []*os.File{f},
-		},
+	opts := control.BlockProfileOpts{
+		FilePayload: urpc.FilePayload{Files: []*os.File{f}},
+		Duration:    duration,
 	}
-	if err := conn.Call(boot.BlockProfile, &opts, nil); err != nil {
-		return fmt.Errorf("getting sandbox %q block profile: %v", s.ID, err)
-	}
-	return nil
+	return conn.Call(boot.BlockProfile, &opts, nil)
 }
 
 // MutexProfile writes a mutex profile to the given file.
-func (s *Sandbox) MutexProfile(f *os.File) error {
+func (s *Sandbox) MutexProfile(f *os.File, duration time.Duration) error {
 	log.Debugf("Mutex profile %q", s.ID)
 	conn, err := s.sandboxConnect()
 	if err != nil {
@@ -1066,50 +1066,27 @@ func (s *Sandbox) MutexProfile(f *os.File) error {
 	}
 	defer conn.Close()
 
-	opts := control.ProfileOpts{
-		FilePayload: urpc.FilePayload{
-			Files: []*os.File{f},
-		},
+	opts := control.MutexProfileOpts{
+		FilePayload: urpc.FilePayload{Files: []*os.File{f}},
+		Duration:    duration,
 	}
-	if err := conn.Call(boot.MutexProfile, &opts, nil); err != nil {
-		return fmt.Errorf("getting sandbox %q mutex profile: %v", s.ID, err)
-	}
-	return nil
+	return conn.Call(boot.MutexProfile, &opts, nil)
 }
 
-// StartTrace start trace  writing to the given file.
-func (s *Sandbox) StartTrace(f *os.File) error {
-	log.Debugf("Trace start %q", s.ID)
+// Trace collects an execution trace.
+func (s *Sandbox) Trace(f *os.File, duration time.Duration) error {
+	log.Debugf("Trace %q", s.ID)
 	conn, err := s.sandboxConnect()
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
 
-	opts := control.ProfileOpts{
-		FilePayload: urpc.FilePayload{
-			Files: []*os.File{f},
-		},
+	opts := control.TraceProfileOpts{
+		FilePayload: urpc.FilePayload{Files: []*os.File{f}},
+		Duration:    duration,
 	}
-	if err := conn.Call(boot.StartTrace, &opts, nil); err != nil {
-		return fmt.Errorf("starting sandbox %q trace: %v", s.ID, err)
-	}
-	return nil
-}
-
-// StopTrace stops a previously started trace.
-func (s *Sandbox) StopTrace() error {
-	log.Debugf("Trace stop %q", s.ID)
-	conn, err := s.sandboxConnect()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	if err := conn.Call(boot.StopTrace, nil, nil); err != nil {
-		return fmt.Errorf("stopping sandbox %q trace: %v", s.ID, err)
-	}
-	return nil
+	return conn.Call(boot.Trace, &opts, nil)
 }
 
 // ChangeLogging changes logging options.
@@ -1171,7 +1148,7 @@ func (s *Sandbox) waitForStopped() error {
 			}
 			// The sandbox process is a child of the current process,
 			// so we can wait it and collect its zombie.
-			wpid, err := syscall.Wait4(int(s.Pid), &s.status, syscall.WNOHANG, nil)
+			wpid, err := unix.Wait4(int(s.Pid), &s.status, unix.WNOHANG, nil)
 			if err != nil {
 				return fmt.Errorf("error waiting the sandbox process: %v", err)
 			}

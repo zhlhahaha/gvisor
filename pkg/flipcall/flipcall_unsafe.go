@@ -41,11 +41,11 @@ const (
 )
 
 func (ep *Endpoint) connState() *uint32 {
-	return (*uint32)((unsafe.Pointer)(ep.packet))
+	return (*uint32)(unsafe.Pointer(ep.packet))
 }
 
 func (ep *Endpoint) dataLen() *uint32 {
-	return (*uint32)((unsafe.Pointer)(ep.packet + 4))
+	return (*uint32)(unsafe.Pointer(ep.packet + 4))
 }
 
 // Data returns the datagram part of ep's packet window as a byte slice.
@@ -61,13 +61,12 @@ func (ep *Endpoint) dataLen() *uint32 {
 // - Writers must not assume that they will read back the same data that they
 // have written. In other words, writers should avoid reading from Data() at
 // all.
-func (ep *Endpoint) Data() []byte {
-	var bs []byte
-	bsReflect := (*reflect.SliceHeader)((unsafe.Pointer)(&bs))
-	bsReflect.Data = ep.packet + PacketHeaderBytes
-	bsReflect.Len = int(ep.dataCap)
-	bsReflect.Cap = int(ep.dataCap)
-	return bs
+func (ep *Endpoint) Data() (bs []byte) {
+	bshdr := (*reflect.SliceHeader)(unsafe.Pointer(&bs))
+	bshdr.Data = ep.packet + PacketHeaderBytes
+	bshdr.Len = int(ep.dataCap)
+	bshdr.Cap = int(ep.dataCap)
+	return
 }
 
 // ioSync is a dummy variable used to indicate synchronization to the Go race
@@ -76,12 +75,12 @@ var ioSync int64
 
 func raceBecomeActive() {
 	if sync.RaceEnabled {
-		sync.RaceAcquire((unsafe.Pointer)(&ioSync))
+		sync.RaceAcquire(unsafe.Pointer(&ioSync))
 	}
 }
 
 func raceBecomeInactive() {
 	if sync.RaceEnabled {
-		sync.RaceReleaseMerge((unsafe.Pointer)(&ioSync))
+		sync.RaceReleaseMerge(unsafe.Pointer(&ioSync))
 	}
 }

@@ -24,8 +24,8 @@ package sharedmem
 
 import (
 	"sync/atomic"
-	"syscall"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -118,7 +118,7 @@ func (e *endpoint) Close() {
 	// Tell dispatch goroutine to stop, then write to the eventfd so that
 	// it wakes up in case it's sleeping.
 	atomic.StoreUint32(&e.stopRequested, 1)
-	syscall.Write(e.rx.eventFD, []byte{1, 0, 0, 0, 0, 0, 0, 0})
+	unix.Write(e.rx.eventFD, []byte{1, 0, 0, 0, 0, 0, 0, 0})
 
 	// Cleanup the queues inline if the worker hasn't started yet; we also
 	// know it won't start from now on because stopRequested is set to 1.
@@ -203,7 +203,7 @@ func (e *endpoint) AddHeader(local, remote tcpip.LinkAddress, protocol tcpip.Net
 
 // WritePacket writes outbound packets to the file descriptor. If it is not
 // currently writable, the packet is dropped.
-func (e *endpoint) WritePacket(r *stack.Route, _ *stack.GSO, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) *tcpip.Error {
+func (e *endpoint) WritePacket(r stack.RouteInfo, _ *stack.GSO, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) tcpip.Error {
 	e.AddHeader(r.LocalLinkAddress, r.RemoteLinkAddress, protocol, pkt)
 
 	views := pkt.Views()
@@ -213,30 +213,15 @@ func (e *endpoint) WritePacket(r *stack.Route, _ *stack.GSO, protocol tcpip.Netw
 	e.mu.Unlock()
 
 	if !ok {
-		return tcpip.ErrWouldBlock
+		return &tcpip.ErrWouldBlock{}
 	}
 
 	return nil
 }
 
 // WritePackets implements stack.LinkEndpoint.WritePackets.
-func (e *endpoint) WritePackets(r *stack.Route, _ *stack.GSO, pkts stack.PacketBufferList, protocol tcpip.NetworkProtocolNumber) (int, *tcpip.Error) {
+func (*endpoint) WritePackets(stack.RouteInfo, *stack.GSO, stack.PacketBufferList, tcpip.NetworkProtocolNumber) (int, tcpip.Error) {
 	panic("not implemented")
-}
-
-// WriteRawPacket implements stack.LinkEndpoint.WriteRawPacket.
-func (e *endpoint) WriteRawPacket(vv buffer.VectorisedView) *tcpip.Error {
-	views := vv.Views()
-	// Transmit the packet.
-	e.mu.Lock()
-	ok := e.tx.transmit(views...)
-	e.mu.Unlock()
-
-	if !ok {
-		return tcpip.ErrWouldBlock
-	}
-
-	return nil
 }
 
 // dispatchLoop reads packets from the rx queue in a loop and dispatches them

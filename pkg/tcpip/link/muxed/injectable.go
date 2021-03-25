@@ -17,7 +17,6 @@ package muxed
 
 import (
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
@@ -88,10 +87,10 @@ func (m *InjectableEndpoint) InjectInbound(protocol tcpip.NetworkProtocolNumber,
 // WritePackets writes outbound packets to the appropriate
 // LinkInjectableEndpoint based on the RemoteAddress. HandleLocal only works if
 // r.RemoteAddress has a route registered in this endpoint.
-func (m *InjectableEndpoint) WritePackets(r *stack.Route, gso *stack.GSO, pkts stack.PacketBufferList, protocol tcpip.NetworkProtocolNumber) (int, *tcpip.Error) {
+func (m *InjectableEndpoint) WritePackets(r stack.RouteInfo, gso *stack.GSO, pkts stack.PacketBufferList, protocol tcpip.NetworkProtocolNumber) (int, tcpip.Error) {
 	endpoint, ok := m.routes[r.RemoteAddress]
 	if !ok {
-		return 0, tcpip.ErrNoRoute
+		return 0, &tcpip.ErrNoRoute{}
 	}
 	return endpoint.WritePackets(r, gso, pkts, protocol)
 }
@@ -99,26 +98,19 @@ func (m *InjectableEndpoint) WritePackets(r *stack.Route, gso *stack.GSO, pkts s
 // WritePacket writes outbound packets to the appropriate LinkInjectableEndpoint
 // based on the RemoteAddress. HandleLocal only works if r.RemoteAddress has a
 // route registered in this endpoint.
-func (m *InjectableEndpoint) WritePacket(r *stack.Route, gso *stack.GSO, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) *tcpip.Error {
+func (m *InjectableEndpoint) WritePacket(r stack.RouteInfo, gso *stack.GSO, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) tcpip.Error {
 	if endpoint, ok := m.routes[r.RemoteAddress]; ok {
 		return endpoint.WritePacket(r, gso, protocol, pkt)
 	}
-	return tcpip.ErrNoRoute
-}
-
-// WriteRawPacket implements stack.LinkEndpoint.WriteRawPacket.
-func (m *InjectableEndpoint) WriteRawPacket(buffer.VectorisedView) *tcpip.Error {
-	// WriteRawPacket doesn't get a route or network address, so there's
-	// nowhere to write this.
-	return tcpip.ErrNoRoute
+	return &tcpip.ErrNoRoute{}
 }
 
 // InjectOutbound writes outbound packets to the appropriate
 // LinkInjectableEndpoint based on the dest address.
-func (m *InjectableEndpoint) InjectOutbound(dest tcpip.Address, packet []byte) *tcpip.Error {
+func (m *InjectableEndpoint) InjectOutbound(dest tcpip.Address, packet []byte) tcpip.Error {
 	endpoint, ok := m.routes[dest]
 	if !ok {
-		return tcpip.ErrNoRoute
+		return &tcpip.ErrNoRoute{}
 	}
 	return endpoint.InjectOutbound(dest, packet)
 }

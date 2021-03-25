@@ -39,7 +39,7 @@ func (udpMarshaler) name() string {
 }
 
 // marshal implements matchMaker.marshal.
-func (udpMarshaler) marshal(mr stack.Matcher) []byte {
+func (udpMarshaler) marshal(mr matcher) []byte {
 	matcher := mr.(*UDPMatcher)
 	xtudp := linux.XTUDP{
 		SourcePortStart:      matcher.sourcePortStart,
@@ -87,13 +87,13 @@ type UDPMatcher struct {
 	destinationPortEnd   uint16
 }
 
-// Name implements Matcher.Name.
-func (*UDPMatcher) Name() string {
+// name implements Matcher.name.
+func (*UDPMatcher) name() string {
 	return matcherNameUDP
 }
 
 // Match implements Matcher.Match.
-func (um *UDPMatcher) Match(hook stack.Hook, pkt *stack.PacketBuffer, interfaceName string) (bool, bool) {
+func (um *UDPMatcher) Match(hook stack.Hook, pkt *stack.PacketBuffer, _, _ string) (bool, bool) {
 	// TODO(gvisor.dev/issue/170): Proto checks should ultimately be moved
 	// into the stack.Check codepath as matchers are added.
 	switch pkt.NetworkProtocolNumber {

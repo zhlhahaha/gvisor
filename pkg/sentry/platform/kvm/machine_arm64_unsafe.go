@@ -20,13 +20,14 @@ import (
 	"fmt"
 	"reflect"
 	"sync/atomic"
-	"syscall"
 	"unsafe"
 
+	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/ring0"
+	"gvisor.dev/gvisor/pkg/ring0/pagetables"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
+	"gvisor.dev/gvisor/pkg/sentry/arch/fpu"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
-	"gvisor.dev/gvisor/pkg/sentry/platform/ring0"
-	"gvisor.dev/gvisor/pkg/sentry/platform/ring0/pagetables"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
@@ -39,8 +40,8 @@ var vcpuInit kvmVcpuInit
 
 // initArchState initializes architecture-specific state.
 func (m *machine) initArchState() error {
-	if _, _, errno := syscall.RawSyscall(
-		syscall.SYS_IOCTL,
+	if _, _, errno := unix.RawSyscall(
+		unix.SYS_IOCTL,
 		uintptr(m.fd),
 		_KVM_ARM_PREFERRED_TARGET,
 		uintptr(unsafe.Pointer(&vcpuInit))); errno != 0 {
@@ -62,24 +63,16 @@ func (c *vCPU) initArchState() error {
 	regGet.addr = uint64(reflect.ValueOf(&dataGet).Pointer())
 
 	vcpuInit.features[0] |= (1 << _KVM_ARM_VCPU_PSCI_0_2)
-	if _, _, errno := syscall.RawSyscall(
-		syscall.SYS_IOCTL,
+	if _, _, errno := unix.RawSyscall(
+		unix.SYS_IOCTL,
 		uintptr(c.fd),
 		_KVM_ARM_VCPU_INIT,
 		uintptr(unsafe.Pointer(&vcpuInit))); errno != 0 {
 		panic(fmt.Sprintf("error setting KVM_ARM_VCPU_INIT failed: %v", errno))
 	}
 
-	// cpacr_el1
-	reg.id = _KVM_ARM64_REGS_CPACR_EL1
-	// It is off by default, and it is turned on only when in use.
-	data = 0 // Disable fpsimd.
-	if err := c.setOneRegister(&reg); err != nil {
-		return err
-	}
-
 	// tcr_el1
-	data = _TCR_TXSZ_VA48 | _TCR_CACHE_FLAGS | _TCR_SHARED | _TCR_TG_FLAGS | _TCR_ASID16 | _TCR_IPS_40BITS | _TCR_A1
+	data = _TCR_TXSZ_VA48 | _TCR_CACHE_FLAGS | _TCR_SHARED | _TCR_TG_FLAGS | _TCR_ASID16 | _TCR_IPS_40BITS
 	reg.id = _KVM_ARM64_REGS_TCR_EL1
 	if err := c.setOneRegister(&reg); err != nil {
 		return err
@@ -103,7 +96,7 @@ func (c *vCPU) initArchState() error {
 	c.SetTtbr0Kvm(uintptr(data))
 
 	// ttbr1_el1
-	data = c.machine.kernel.PageTables.TTBR1_EL1(false, 1)
+	data = c.machine.kernel.PageTables.TTBR1_EL1(false, 0)
 
 	reg.id = _KVM_ARM64_REGS_TTBR1_EL1
 	if err := c.setOneRegister(&reg); err != nil {
@@ -158,7 +151,7 @@ func (c *vCPU) initArchState() error {
 		c.PCIDs = pagetables.NewPCIDs(fixedKernelPCID+1, poolPCIDs)
 	}
 
-	c.floatingPointState = arch.NewFloatingPointData()
+	c.floatingPointState = fpu.NewState()
 
 	return c.setSystemTime()
 }
@@ -194,8 +187,8 @@ func (c *vCPU) loadSegments(tid uint64) {
 }
 
 func (c *vCPU) setOneRegister(reg *kvmOneReg) error {
-	if _, _, errno := syscall.RawSyscall(
-		syscall.SYS_IOCTL,
+	if _, _, errno := unix.RawSyscall(
+		unix.SYS_IOCTL,
 		uintptr(c.fd),
 		_KVM_SET_ONE_REG,
 		uintptr(unsafe.Pointer(reg))); errno != 0 {
@@ -205,8 +198,8 @@ func (c *vCPU) setOneRegister(reg *kvmOneReg) error {
 }
 
 func (c *vCPU) getOneRegister(reg *kvmOneReg) error {
-	if _, _, errno := syscall.RawSyscall(
-		syscall.SYS_IOCTL,
+	if _, _, errno := unix.RawSyscall(
+		unix.SYS_IOCTL,
 		uintptr(c.fd),
 		_KVM_GET_ONE_REG,
 		uintptr(unsafe.Pointer(reg))); errno != 0 {
@@ -219,9 +212,9 @@ func (c *vCPU) getOneRegister(reg *kvmOneReg) error {
 func (c *vCPU) SwitchToUser(switchOpts ring0.SwitchOpts, info *arch.SignalInfo) (usermem.AccessType, error) {
 	// Check for canonical addresses.
 	if regs := switchOpts.Registers; !ring0.IsCanonical(regs.Pc) {
-		return nonCanonical(regs.Pc, int32(syscall.SIGSEGV), info)
+		return nonCanonical(regs.Pc, int32(unix.SIGSEGV), info)
 	} else if !ring0.IsCanonical(regs.Sp) {
-		return nonCanonical(regs.Sp, int32(syscall.SIGSEGV), info)
+		return nonCanonical(regs.Sp, int32(unix.SIGSEGV), info)
 	}
 
 	// Assign PCIDs.
@@ -235,12 +228,12 @@ func (c *vCPU) SwitchToUser(switchOpts ring0.SwitchOpts, info *arch.SignalInfo) 
 	ttbr0App := switchOpts.PageTables.TTBR0_EL1(false, 0)
 	c.SetTtbr0App(uintptr(ttbr0App))
 
-	// TODO(gvisor.dev/issue/1238): full context-switch supporting for Arm64.
+	// Full context-switch supporting for Arm64.
 	// The Arm64 user-mode execution state consists of:
 	// x0-x30
 	// PC, SP, PSTATE
 	// V0-V31: 32 128-bit registers for floating point, and simd
-	// FPSR
+	// FPSR, FPCR
 	// TPIDR_EL0, used for TLS
 	appRegs := switchOpts.Registers
 	c.SetAppAddr(ring0.KernelStartAddress | uintptr(unsafe.Pointer(appRegs)))
@@ -254,22 +247,30 @@ func (c *vCPU) SwitchToUser(switchOpts ring0.SwitchOpts, info *arch.SignalInfo) 
 	case ring0.Syscall:
 		// Fast path: system call executed.
 		return usermem.NoAccess, nil
-
 	case ring0.PageFault:
-		return c.fault(int32(syscall.SIGSEGV), info)
+		return c.fault(int32(unix.SIGSEGV), info)
 	case ring0.El0ErrNMI:
-		return c.fault(int32(syscall.SIGBUS), info)
-	case ring0.Vector(bounce): // ring0.VirtualizationException
+		return c.fault(int32(unix.SIGBUS), info)
+	case ring0.Vector(bounce): // ring0.VirtualizationException.
 		return usermem.NoAccess, platform.ErrContextInterrupt
 	case ring0.El0SyncUndef:
-		return c.fault(int32(syscall.SIGILL), info)
-	case ring0.El1SyncUndef:
+		return c.fault(int32(unix.SIGILL), info)
+	case ring0.El0SyncDbg:
 		*info = arch.SignalInfo{
-			Signo: int32(syscall.SIGILL),
-			Code:  1, // ILL_ILLOPC (illegal opcode).
+			Signo: int32(unix.SIGTRAP),
+			Code:  1, // TRAP_BRKPT (breakpoint).
 		}
 		info.SetAddr(switchOpts.Registers.Pc) // Include address.
 		return usermem.AccessType{}, platform.ErrContextSignal
+	case ring0.El0SyncSpPc:
+		*info = arch.SignalInfo{
+			Signo: int32(unix.SIGBUS),
+			Code:  2, // BUS_ADRERR (physical address does not exist).
+		}
+		return usermem.NoAccess, platform.ErrContextSignal
+	case ring0.El0SyncSys,
+		ring0.El0SyncWfx:
+		return usermem.NoAccess, nil // skip for now.
 	default:
 		panic(fmt.Sprintf("unexpected vector: 0x%x", vector))
 	}

@@ -15,7 +15,9 @@
 package gofer
 
 import (
+	"fmt"
 	"math"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -24,6 +26,7 @@ import (
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/p9"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/host"
+	"gvisor.dev/gvisor/pkg/sentry/fsmetric"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/pipe"
@@ -35,16 +38,26 @@ import (
 // Sync implements vfs.FilesystemImpl.Sync.
 func (fs *filesystem) Sync(ctx context.Context) error {
 	// Snapshot current syncable dentries and special file FDs.
+	fs.renameMu.RLock()
 	fs.syncMu.Lock()
 	ds := make([]*dentry, 0, len(fs.syncableDentries))
 	for d := range fs.syncableDentries {
+		// It's safe to use IncRef here even though fs.syncableDentries doesn't
+		// hold references since we hold fs.renameMu. Note that we can't use
+		// TryIncRef since cached dentries at zero references should still be
+		// synced.
 		d.IncRef()
 		ds = append(ds, d)
 	}
+	fs.renameMu.RUnlock()
 	sffds := make([]*specialFileFD, 0, len(fs.specialFileFDs))
 	for sffd := range fs.specialFileFDs {
-		sffd.vfsfd.IncRef()
-		sffds = append(sffds, sffd)
+		// As above, fs.specialFileFDs doesn't hold references. However, unlike
+		// dentries, an FD that has reached zero references can't be
+		// resurrected, so we can use TryIncRef.
+		if sffd.vfsfd.TryIncRef() {
+			sffds = append(sffds, sffd)
+		}
 	}
 	fs.syncMu.Unlock()
 
@@ -406,33 +419,44 @@ func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, dir
 	if err != nil {
 		return err
 	}
-	if err := parent.checkPermissions(rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
+
+	// Order of checks is important. First check if parent directory can be
+	// executed, then check for existence, and lastly check if mount is writable.
+	if err := parent.checkPermissions(rp.Credentials(), vfs.MayExec); err != nil {
 		return err
 	}
 	name := rp.Component()
 	if name == "." || name == ".." {
 		return syserror.EEXIST
 	}
-	if len(name) > maxFilenameLen {
-		return syserror.ENAMETOOLONG
-	}
 	if parent.isDeleted() {
 		return syserror.ENOENT
 	}
+
+	parent.dirMu.Lock()
+	defer parent.dirMu.Unlock()
+
+	child, err := fs.getChildLocked(ctx, rp.VirtualFilesystem(), parent, name, &ds)
+	switch {
+	case err != nil && err != syserror.ENOENT:
+		return err
+	case child != nil:
+		return syserror.EEXIST
+	}
+
 	mnt := rp.Mount()
 	if err := mnt.CheckBeginWrite(); err != nil {
 		return err
 	}
 	defer mnt.EndWrite()
-	parent.dirMu.Lock()
-	defer parent.dirMu.Unlock()
+
+	if err := parent.checkPermissions(rp.Credentials(), vfs.MayWrite); err != nil {
+		return err
+	}
+	if !dir && rp.MustBeDir() {
+		return syserror.ENOENT
+	}
 	if parent.isSynthetic() {
-		if child := parent.children[name]; child != nil {
-			return syserror.EEXIST
-		}
-		if !dir && rp.MustBeDir() {
-			return syserror.ENOENT
-		}
 		if createInSyntheticDir == nil {
 			return syserror.EPERM
 		}
@@ -448,47 +472,20 @@ func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, dir
 		parent.watches.Notify(ctx, name, uint32(ev), 0, vfs.InodeEvent, false /* unlinked */)
 		return nil
 	}
-	if fs.opts.interop == InteropModeShared {
-		if child := parent.children[name]; child != nil && child.isSynthetic() {
-			return syserror.EEXIST
-		}
-		if !dir && rp.MustBeDir() {
-			return syserror.ENOENT
-		}
-		// The existence of a non-synthetic dentry at name would be inconclusive
-		// because the file it represents may have been deleted from the remote
-		// filesystem, so we would need to make an RPC to revalidate the dentry.
-		// Just attempt the file creation RPC instead. If a file does exist, the
-		// RPC will fail with EEXIST like we would have. If the RPC succeeds, and a
-		// stale dentry exists, the dentry will fail revalidation next time it's
-		// used.
-		if err := createInRemoteDir(parent, name, &ds); err != nil {
-			return err
-		}
-		ev := linux.IN_CREATE
-		if dir {
-			ev |= linux.IN_ISDIR
-		}
-		parent.watches.Notify(ctx, name, uint32(ev), 0, vfs.InodeEvent, false /* unlinked */)
-		return nil
-	}
-	if child := parent.children[name]; child != nil {
-		return syserror.EEXIST
-	}
-	if !dir && rp.MustBeDir() {
-		return syserror.ENOENT
-	}
-	// No cached dentry exists; however, there might still be an existing file
-	// at name. As above, we attempt the file creation RPC anyway.
+	// No cached dentry exists; however, in InteropModeShared there might still be
+	// an existing file at name. Just attempt the file creation RPC anyways. If a
+	// file does exist, the RPC will fail with EEXIST like we would have.
 	if err := createInRemoteDir(parent, name, &ds); err != nil {
 		return err
 	}
-	if child, ok := parent.children[name]; ok && child == nil {
-		// Delete the now-stale negative dentry.
-		delete(parent.children, name)
+	if fs.opts.interop != InteropModeShared {
+		if child, ok := parent.children[name]; ok && child == nil {
+			// Delete the now-stale negative dentry.
+			delete(parent.children, name)
+		}
+		parent.touchCMtime()
+		parent.dirents = nil
 	}
-	parent.touchCMtime()
-	parent.dirents = nil
 	ev := linux.IN_CREATE
 	if dir {
 		ev |= linux.IN_ISDIR
@@ -786,7 +783,15 @@ func (fs *filesystem) LinkAt(ctx context.Context, rp *vfs.ResolvingPath, vd vfs.
 func (fs *filesystem) MkdirAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.MkdirOptions) error {
 	creds := rp.Credentials()
 	return fs.doCreateAt(ctx, rp, true /* dir */, func(parent *dentry, name string, _ **[]*dentry) error {
-		if _, err := parent.file.mkdir(ctx, name, (p9.FileMode)(opts.Mode), (p9.UID)(creds.EffectiveKUID), (p9.GID)(creds.EffectiveKGID)); err != nil {
+		// If the parent is a setgid directory, use the parent's GID
+		// rather than the caller's and enable setgid.
+		kgid := creds.EffectiveKGID
+		mode := opts.Mode
+		if atomic.LoadUint32(&parent.mode)&linux.S_ISGID != 0 {
+			kgid = auth.KGID(atomic.LoadUint32(&parent.gid))
+			mode |= linux.S_ISGID
+		}
+		if _, err := parent.file.mkdir(ctx, name, p9.FileMode(mode), (p9.UID)(creds.EffectiveKUID), p9.GID(kgid)); err != nil {
 			if !opts.ForSyntheticMountpoint || err == syserror.EEXIST {
 				return err
 			}
@@ -985,14 +990,11 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 	switch d.fileType() {
 	case linux.S_IFREG:
 		if !d.fs.opts.regularFilesUseSpecialFileFD {
-			if err := d.ensureSharedHandle(ctx, ats&vfs.MayRead != 0, ats&vfs.MayWrite != 0, trunc); err != nil {
+			if err := d.ensureSharedHandle(ctx, ats.MayRead(), ats.MayWrite(), trunc); err != nil {
 				return nil, err
 			}
-			fd := &regularFileFD{}
-			fd.LockFD.Init(&d.locks)
-			if err := fd.vfsfd.Init(fd, opts.Flags, mnt, &d.vfsd, &vfs.FileDescriptionOptions{
-				AllowDirectIO: true,
-			}); err != nil {
+			fd, err := newRegularFileFD(mnt, d, opts.Flags)
+			if err != nil {
 				return nil, err
 			}
 			vfd = &fd.vfsfd
@@ -1018,6 +1020,11 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 		fd.LockFD.Init(&d.locks)
 		if err := fd.vfsfd.Init(fd, opts.Flags, mnt, &d.vfsd, &vfs.FileDescriptionOptions{}); err != nil {
 			return nil, err
+		}
+		if atomic.LoadInt32(&d.readFD) >= 0 {
+			fsmetric.GoferOpensHost.Increment()
+		} else {
+			fsmetric.GoferOpens9P.Increment()
 		}
 		return &fd.vfsfd, nil
 	case linux.S_IFLNK:
@@ -1110,7 +1117,7 @@ retry:
 			return nil, err
 		}
 	}
-	fd, err := newSpecialFileFD(h, mnt, d, &d.locks, opts.Flags)
+	fd, err := newSpecialFileFD(h, mnt, d, opts.Flags)
 	if err != nil {
 		h.close(ctx)
 		return nil, err
@@ -1146,7 +1153,15 @@ func (d *dentry) createAndOpenChildLocked(ctx context.Context, rp *vfs.Resolving
 	name := rp.Component()
 	// We only want the access mode for creating the file.
 	createFlags := p9.OpenFlags(opts.Flags) & p9.OpenFlagsModeMask
-	fdobj, openFile, createQID, _, err := dirfile.create(ctx, name, createFlags, (p9.FileMode)(opts.Mode), (p9.UID)(creds.EffectiveKUID), (p9.GID)(creds.EffectiveKGID))
+
+	// If the parent is a setgid directory, use the parent's GID rather
+	// than the caller's.
+	kgid := creds.EffectiveKGID
+	if atomic.LoadUint32(&d.mode)&linux.S_ISGID != 0 {
+		kgid = auth.KGID(atomic.LoadUint32(&d.gid))
+	}
+
+	fdobj, openFile, createQID, _, err := dirfile.create(ctx, name, createFlags, p9.FileMode(opts.Mode), (p9.UID)(creds.EffectiveKUID), p9.GID(kgid))
 	if err != nil {
 		dirfile.close(ctx)
 		return nil, err
@@ -1205,11 +1220,8 @@ func (d *dentry) createAndOpenChildLocked(ctx context.Context, rp *vfs.Resolving
 	// Finally, construct a file description representing the created file.
 	var childVFSFD *vfs.FileDescription
 	if useRegularFileFD {
-		fd := &regularFileFD{}
-		fd.LockFD.Init(&child.locks)
-		if err := fd.vfsfd.Init(fd, opts.Flags, mnt, &child.vfsd, &vfs.FileDescriptionOptions{
-			AllowDirectIO: true,
-		}); err != nil {
+		fd, err := newRegularFileFD(mnt, child, opts.Flags)
+		if err != nil {
 			return nil, err
 		}
 		childVFSFD = &fd.vfsfd
@@ -1221,7 +1233,7 @@ func (d *dentry) createAndOpenChildLocked(ctx context.Context, rp *vfs.Resolving
 		if fdobj != nil {
 			h.fd = int32(fdobj.Release())
 		}
-		fd, err := newSpecialFileFD(h, mnt, child, &d.locks, opts.Flags)
+		fd, err := newSpecialFileFD(h, mnt, child, opts.Flags)
 		if err != nil {
 			h.close(ctx)
 			return nil, err
@@ -1613,4 +1625,59 @@ func (fs *filesystem) PrependPath(ctx context.Context, vfsroot, vd vfs.VirtualDe
 	fs.renameMu.RLock()
 	defer fs.renameMu.RUnlock()
 	return genericPrependPath(vfsroot, vd.Mount(), vd.Dentry().Impl().(*dentry), b)
+}
+
+type mopt struct {
+	key   string
+	value interface{}
+}
+
+func (m mopt) String() string {
+	if m.value == nil {
+		return fmt.Sprintf("%s", m.key)
+	}
+	return fmt.Sprintf("%s=%v", m.key, m.value)
+}
+
+// MountOptions implements vfs.FilesystemImpl.MountOptions.
+func (fs *filesystem) MountOptions() string {
+	optsKV := []mopt{
+		{moptTransport, transportModeFD}, // Only valid value, currently.
+		{moptReadFD, fs.opts.fd},         // Currently, read and write FD are the same.
+		{moptWriteFD, fs.opts.fd},        // Currently, read and write FD are the same.
+		{moptAname, fs.opts.aname},
+		{moptDfltUID, fs.opts.dfltuid},
+		{moptDfltGID, fs.opts.dfltgid},
+		{moptMsize, fs.opts.msize},
+		{moptVersion, fs.opts.version},
+		{moptDentryCacheLimit, fs.opts.maxCachedDentries},
+	}
+
+	switch fs.opts.interop {
+	case InteropModeExclusive:
+		optsKV = append(optsKV, mopt{moptCache, cacheFSCache})
+	case InteropModeWritethrough:
+		optsKV = append(optsKV, mopt{moptCache, cacheFSCacheWritethrough})
+	case InteropModeShared:
+		if fs.opts.regularFilesUseSpecialFileFD {
+			optsKV = append(optsKV, mopt{moptCache, cacheNone})
+		} else {
+			optsKV = append(optsKV, mopt{moptCache, cacheRemoteRevalidating})
+		}
+	}
+	if fs.opts.forcePageCache {
+		optsKV = append(optsKV, mopt{moptForcePageCache, nil})
+	}
+	if fs.opts.limitHostFDTranslation {
+		optsKV = append(optsKV, mopt{moptLimitHostFDTranslation, nil})
+	}
+	if fs.opts.overlayfsStaleRead {
+		optsKV = append(optsKV, mopt{moptOverlayfsStaleRead, nil})
+	}
+
+	opts := make([]string, 0, len(optsKV))
+	for _, opt := range optsKV {
+		opts = append(opts, opt.String())
+	}
+	return strings.Join(opts, ",")
 }

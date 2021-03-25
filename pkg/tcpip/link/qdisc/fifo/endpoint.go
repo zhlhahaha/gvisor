@@ -21,7 +21,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sleep"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
@@ -92,9 +91,8 @@ func (q *queueDispatcher) dispatchLoop() {
 			}
 			// We pass a protocol of zero here because each packet carries its
 			// NetworkProtocol.
-			q.lower.WritePackets(nil /* route */, nil /* gso */, batch, 0 /* protocol */)
+			q.lower.WritePackets(stack.RouteInfo{}, nil /* gso */, batch, 0 /* protocol */)
 			for pkt := batch.Front(); pkt != nil; pkt = pkt.Next() {
-				pkt.EgressRoute.Release()
 				batch.Remove(pkt)
 			}
 			batch.Reset()
@@ -152,16 +150,15 @@ func (e *endpoint) GSOMaxSize() uint32 {
 }
 
 // WritePacket implements stack.LinkEndpoint.WritePacket.
-func (e *endpoint) WritePacket(r *stack.Route, gso *stack.GSO, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) *tcpip.Error {
+func (e *endpoint) WritePacket(r stack.RouteInfo, gso *stack.GSO, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) tcpip.Error {
 	// WritePacket caller's do not set the following fields in PacketBuffer
 	// so we populate them here.
-	newRoute := r.Clone()
-	pkt.EgressRoute = &newRoute
+	pkt.EgressRoute = r
 	pkt.GSOOptions = gso
 	pkt.NetworkProtocolNumber = protocol
 	d := e.dispatchers[int(pkt.Hash)%len(e.dispatchers)]
 	if !d.q.enqueue(pkt) {
-		return tcpip.ErrNoBufferSpace
+		return &tcpip.ErrNoBufferSpace{}
 	}
 	d.newPacketWaker.Assert()
 	return nil
@@ -169,39 +166,27 @@ func (e *endpoint) WritePacket(r *stack.Route, gso *stack.GSO, protocol tcpip.Ne
 
 // WritePackets implements stack.LinkEndpoint.WritePackets.
 //
-// Being a batch API, each packet in pkts should have the following fields
-// populated:
-//   - pkt.EgressRoute
-//   - pkt.GSOOptions
-//   - pkt.NetworkProtocolNumber
-func (e *endpoint) WritePackets(_ *stack.Route, _ *stack.GSO, pkts stack.PacketBufferList, _ tcpip.NetworkProtocolNumber) (int, *tcpip.Error) {
+// Being a batch API, each packet in pkts should have the following
+// fields populated:
+//  - pkt.EgressRoute
+//  - pkt.GSOOptions
+//  - pkt.NetworkProtocolNumber
+func (e *endpoint) WritePackets(r stack.RouteInfo, gso *stack.GSO, pkts stack.PacketBufferList, protocol tcpip.NetworkProtocolNumber) (int, tcpip.Error) {
 	enqueued := 0
 	for pkt := pkts.Front(); pkt != nil; {
 		d := e.dispatchers[int(pkt.Hash)%len(e.dispatchers)]
 		nxt := pkt.Next()
-		// Since qdisc can hold onto a packet for long we should Clone
-		// the route here to ensure it doesn't get released while the
-		// packet is still in our queue.
-		newRoute := pkt.EgressRoute.Clone()
-		pkt.EgressRoute = &newRoute
 		if !d.q.enqueue(pkt) {
 			if enqueued > 0 {
 				d.newPacketWaker.Assert()
 			}
-			return enqueued, tcpip.ErrNoBufferSpace
+			return enqueued, &tcpip.ErrNoBufferSpace{}
 		}
 		pkt = nxt
 		enqueued++
 		d.newPacketWaker.Assert()
 	}
 	return enqueued, nil
-}
-
-// WriteRawPacket implements stack.LinkEndpoint.WriteRawPacket.
-func (e *endpoint) WriteRawPacket(vv buffer.VectorisedView) *tcpip.Error {
-	// TODO(gvisor.dev/issue/3267): Queue these packets as well once
-	// WriteRawPacket takes PacketBuffer instead of VectorisedView.
-	return e.lower.WriteRawPacket(vv)
 }
 
 // Wait implements stack.LinkEndpoint.Wait.

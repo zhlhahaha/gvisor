@@ -118,7 +118,7 @@ var AMD64 = &kernel.SyscallTable{
 		63:  syscalls.Supported("uname", Uname),
 		64:  syscalls.Supported("semget", Semget),
 		65:  syscalls.PartiallySupported("semop", Semop, "Option SEM_UNDO not supported.", nil),
-		66:  syscalls.PartiallySupported("semctl", Semctl, "Options IPC_INFO, SEM_INFO, SEM_STAT, SEM_STAT_ANY not supported.", nil),
+		66:  syscalls.Supported("semctl", Semctl),
 		67:  syscalls.Supported("shmdt", Shmdt),
 		68:  syscalls.ErrorWithEvent("msgget", syserror.ENOSYS, "", []string{"gvisor.dev/issue/135"}), // TODO(b/29354921)
 		69:  syscalls.ErrorWithEvent("msgsnd", syserror.ENOSYS, "", []string{"gvisor.dev/issue/135"}), // TODO(b/29354921)
@@ -272,7 +272,7 @@ var AMD64 = &kernel.SyscallTable{
 		217: syscalls.Supported("getdents64", Getdents64),
 		218: syscalls.Supported("set_tid_address", SetTidAddress),
 		219: syscalls.Supported("restart_syscall", RestartSyscall),
-		220: syscalls.ErrorWithEvent("semtimedop", syserror.ENOSYS, "", []string{"gvisor.dev/issue/137"}),
+		220: syscalls.Supported("semtimedop", Semtimedop),
 		221: syscalls.PartiallySupported("fadvise64", Fadvise64, "Not all options are supported.", nil),
 		222: syscalls.Supported("timer_create", TimerCreate),
 		223: syscalls.Supported("timer_settime", TimerSettime),
@@ -503,8 +503,8 @@ var ARM64 = &kernel.SyscallTable{
 		72:  syscalls.Supported("pselect", Pselect),
 		73:  syscalls.Supported("ppoll", Ppoll),
 		74:  syscalls.PartiallySupported("signalfd4", Signalfd4, "Semantics are slightly different.", []string{"gvisor.dev/issue/139"}),
-		75:  syscalls.ErrorWithEvent("vmsplice", syserror.ENOSYS, "", []string{"gvisor.dev/issue/138"}),              // TODO(b/29354098)
-		76:  syscalls.PartiallySupported("splice", Splice, "Stub implementation.", []string{"gvisor.dev/issue/138"}), // TODO(b/29354098)
+		75:  syscalls.ErrorWithEvent("vmsplice", syserror.ENOSYS, "", []string{"gvisor.dev/issue/138"}), // TODO(b/29354098)
+		76:  syscalls.Supported("splice", Splice),
 		77:  syscalls.Supported("tee", Tee),
 		78:  syscalls.Supported("readlinkat", Readlinkat),
 		79:  syscalls.Supported("fstatat", Fstatat),
@@ -619,8 +619,8 @@ var ARM64 = &kernel.SyscallTable{
 		188: syscalls.ErrorWithEvent("msgrcv", syserror.ENOSYS, "", []string{"gvisor.dev/issue/135"}),          // TODO(b/29354921)
 		189: syscalls.ErrorWithEvent("msgsnd", syserror.ENOSYS, "", []string{"gvisor.dev/issue/135"}),          // TODO(b/29354921)
 		190: syscalls.Supported("semget", Semget),
-		191: syscalls.PartiallySupported("semctl", Semctl, "Options IPC_INFO, SEM_INFO, SEM_STAT, SEM_STAT_ANY not supported.", nil),
-		192: syscalls.ErrorWithEvent("semtimedop", syserror.ENOSYS, "", []string{"gvisor.dev/issue/137"}),
+		191: syscalls.Supported("semctl", Semctl),
+		192: syscalls.Supported("semtimedop", Semtimedop),
 		193: syscalls.PartiallySupported("semop", Semop, "Option SEM_UNDO not supported.", nil),
 		194: syscalls.PartiallySupported("shmget", Shmget, "Option SHM_HUGETLB is not supported.", nil),
 		195: syscalls.PartiallySupported("shmctl", Shmctl, "Options SHM_LOCK, SHM_UNLOCK are not supported.", nil),

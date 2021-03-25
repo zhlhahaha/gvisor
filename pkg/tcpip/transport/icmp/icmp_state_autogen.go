@@ -22,6 +22,7 @@ func (p *icmpPacket) StateFields() []string {
 
 func (p *icmpPacket) beforeSave() {}
 
+// +checklocksignore
 func (p *icmpPacket) StateSave(stateSinkObject state.Sink) {
 	p.beforeSave()
 	var dataValue buffer.VectorisedView = p.saveData()
@@ -33,6 +34,7 @@ func (p *icmpPacket) StateSave(stateSinkObject state.Sink) {
 
 func (p *icmpPacket) afterLoad() {}
 
+// +checklocksignore
 func (p *icmpPacket) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &p.icmpPacketEntry)
 	stateSourceObject.Load(1, &p.senderAddress)
@@ -47,6 +49,7 @@ func (e *endpoint) StateTypeName() string {
 func (e *endpoint) StateFields() []string {
 	return []string{
 		"TransportEndpointInfo",
+		"DefaultSocketOptionsHandler",
 		"waiterQueue",
 		"uniqueID",
 		"rcvReady",
@@ -54,52 +57,50 @@ func (e *endpoint) StateFields() []string {
 		"rcvBufSizeMax",
 		"rcvBufSize",
 		"rcvClosed",
-		"sndBufSize",
 		"shutdownFlags",
 		"state",
 		"ttl",
-		"linger",
 		"owner",
 		"ops",
 	}
 }
 
+// +checklocksignore
 func (e *endpoint) StateSave(stateSinkObject state.Sink) {
 	e.beforeSave()
 	var rcvBufSizeMaxValue int = e.saveRcvBufSizeMax()
-	stateSinkObject.SaveValue(5, rcvBufSizeMaxValue)
+	stateSinkObject.SaveValue(6, rcvBufSizeMaxValue)
 	stateSinkObject.Save(0, &e.TransportEndpointInfo)
-	stateSinkObject.Save(1, &e.waiterQueue)
-	stateSinkObject.Save(2, &e.uniqueID)
-	stateSinkObject.Save(3, &e.rcvReady)
-	stateSinkObject.Save(4, &e.rcvList)
-	stateSinkObject.Save(6, &e.rcvBufSize)
-	stateSinkObject.Save(7, &e.rcvClosed)
-	stateSinkObject.Save(8, &e.sndBufSize)
+	stateSinkObject.Save(1, &e.DefaultSocketOptionsHandler)
+	stateSinkObject.Save(2, &e.waiterQueue)
+	stateSinkObject.Save(3, &e.uniqueID)
+	stateSinkObject.Save(4, &e.rcvReady)
+	stateSinkObject.Save(5, &e.rcvList)
+	stateSinkObject.Save(7, &e.rcvBufSize)
+	stateSinkObject.Save(8, &e.rcvClosed)
 	stateSinkObject.Save(9, &e.shutdownFlags)
 	stateSinkObject.Save(10, &e.state)
 	stateSinkObject.Save(11, &e.ttl)
-	stateSinkObject.Save(12, &e.linger)
-	stateSinkObject.Save(13, &e.owner)
-	stateSinkObject.Save(14, &e.ops)
+	stateSinkObject.Save(12, &e.owner)
+	stateSinkObject.Save(13, &e.ops)
 }
 
+// +checklocksignore
 func (e *endpoint) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &e.TransportEndpointInfo)
-	stateSourceObject.Load(1, &e.waiterQueue)
-	stateSourceObject.Load(2, &e.uniqueID)
-	stateSourceObject.Load(3, &e.rcvReady)
-	stateSourceObject.Load(4, &e.rcvList)
-	stateSourceObject.Load(6, &e.rcvBufSize)
-	stateSourceObject.Load(7, &e.rcvClosed)
-	stateSourceObject.Load(8, &e.sndBufSize)
+	stateSourceObject.Load(1, &e.DefaultSocketOptionsHandler)
+	stateSourceObject.Load(2, &e.waiterQueue)
+	stateSourceObject.Load(3, &e.uniqueID)
+	stateSourceObject.Load(4, &e.rcvReady)
+	stateSourceObject.Load(5, &e.rcvList)
+	stateSourceObject.Load(7, &e.rcvBufSize)
+	stateSourceObject.Load(8, &e.rcvClosed)
 	stateSourceObject.Load(9, &e.shutdownFlags)
 	stateSourceObject.Load(10, &e.state)
 	stateSourceObject.Load(11, &e.ttl)
-	stateSourceObject.Load(12, &e.linger)
-	stateSourceObject.Load(13, &e.owner)
-	stateSourceObject.Load(14, &e.ops)
-	stateSourceObject.LoadValue(5, new(int), func(y interface{}) { e.loadRcvBufSizeMax(y.(int)) })
+	stateSourceObject.Load(12, &e.owner)
+	stateSourceObject.Load(13, &e.ops)
+	stateSourceObject.LoadValue(6, new(int), func(y interface{}) { e.loadRcvBufSizeMax(y.(int)) })
 	stateSourceObject.AfterLoad(e.afterLoad)
 }
 
@@ -116,6 +117,7 @@ func (l *icmpPacketList) StateFields() []string {
 
 func (l *icmpPacketList) beforeSave() {}
 
+// +checklocksignore
 func (l *icmpPacketList) StateSave(stateSinkObject state.Sink) {
 	l.beforeSave()
 	stateSinkObject.Save(0, &l.head)
@@ -124,6 +126,7 @@ func (l *icmpPacketList) StateSave(stateSinkObject state.Sink) {
 
 func (l *icmpPacketList) afterLoad() {}
 
+// +checklocksignore
 func (l *icmpPacketList) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &l.head)
 	stateSourceObject.Load(1, &l.tail)
@@ -142,6 +145,7 @@ func (e *icmpPacketEntry) StateFields() []string {
 
 func (e *icmpPacketEntry) beforeSave() {}
 
+// +checklocksignore
 func (e *icmpPacketEntry) StateSave(stateSinkObject state.Sink) {
 	e.beforeSave()
 	stateSinkObject.Save(0, &e.next)
@@ -150,6 +154,7 @@ func (e *icmpPacketEntry) StateSave(stateSinkObject state.Sink) {
 
 func (e *icmpPacketEntry) afterLoad() {}
 
+// +checklocksignore
 func (e *icmpPacketEntry) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &e.next)
 	stateSourceObject.Load(1, &e.prev)

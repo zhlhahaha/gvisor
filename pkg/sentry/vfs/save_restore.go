@@ -18,8 +18,10 @@ import (
 	"fmt"
 	"sync/atomic"
 
+	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/refsvfs2"
+	"gvisor.dev/gvisor/pkg/waiter"
 )
 
 // FilesystemImplSaveRestoreExtension is an optional extension to
@@ -99,6 +101,9 @@ func (vfs *VirtualFilesystem) saveMounts() []*Mount {
 	return mounts
 }
 
+// saveKey is called by stateify.
+func (mnt *Mount) saveKey() VirtualDentry { return mnt.getKey() }
+
 // loadMounts is called by stateify.
 func (vfs *VirtualFilesystem) loadMounts(mounts []*Mount) {
 	if mounts == nil {
@@ -110,6 +115,9 @@ func (vfs *VirtualFilesystem) loadMounts(mounts []*Mount) {
 	}
 }
 
+// loadKey is called by stateify.
+func (mnt *Mount) loadKey(vd VirtualDentry) { mnt.setKey(vd) }
+
 func (mnt *Mount) afterLoad() {
 	if atomic.LoadInt64(&mnt.refs) != 0 {
 		refsvfs2.Register(mnt)
@@ -120,5 +128,20 @@ func (mnt *Mount) afterLoad() {
 func (epi *epollInterest) afterLoad() {
 	// Mark all epollInterests as ready after restore so that the next call to
 	// EpollInstance.ReadEvents() rechecks their readiness.
-	epi.Callback(nil)
+	epi.Callback(nil, waiter.EventMaskFromLinux(epi.mask))
+}
+
+// beforeSave is called by stateify.
+func (fd *FileDescription) beforeSave() {
+	fd.saved = true
+	if fd.statusFlags&linux.O_ASYNC != 0 && fd.asyncHandler != nil {
+		fd.asyncHandler.Unregister(fd)
+	}
+}
+
+// afterLoad is called by stateify.
+func (fd *FileDescription) afterLoad() {
+	if fd.statusFlags&linux.O_ASYNC != 0 && fd.asyncHandler != nil {
+		fd.asyncHandler.Register(fd)
+	}
 }

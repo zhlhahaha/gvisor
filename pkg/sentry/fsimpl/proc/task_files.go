@@ -22,7 +22,6 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/safemem"
-	fslock "gvisor.dev/gvisor/pkg/sentry/fs/lock"
 	"gvisor.dev/gvisor/pkg/sentry/fsbridge"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
@@ -57,9 +56,6 @@ func getMM(task *kernel.Task) *mm.MemoryManager {
 // MemoryManager's users count is incremented, and must be decremented by the
 // caller when it is no longer in use.
 func getMMIncRef(task *kernel.Task) (*mm.MemoryManager, error) {
-	if task.ExitState() == kernel.TaskExitDead {
-		return nil, syserror.ESRCH
-	}
 	var m *mm.MemoryManager
 	task.WithMuLocked(func(t *kernel.Task) {
 		m = t.MemoryManager()
@@ -111,9 +107,13 @@ var _ dynamicInode = (*auxvData)(nil)
 
 // Generate implements vfs.DynamicBytesSource.Generate.
 func (d *auxvData) Generate(ctx context.Context, buf *bytes.Buffer) error {
+	if d.task.ExitState() == kernel.TaskExitDead {
+		return syserror.ESRCH
+	}
 	m, err := getMMIncRef(d.task)
 	if err != nil {
-		return err
+		// Return empty file.
+		return nil
 	}
 	defer m.DecUsers(ctx)
 
@@ -157,9 +157,13 @@ var _ dynamicInode = (*cmdlineData)(nil)
 
 // Generate implements vfs.DynamicBytesSource.Generate.
 func (d *cmdlineData) Generate(ctx context.Context, buf *bytes.Buffer) error {
+	if d.task.ExitState() == kernel.TaskExitDead {
+		return syserror.ESRCH
+	}
 	m, err := getMMIncRef(d.task)
 	if err != nil {
-		return err
+		// Return empty file.
+		return nil
 	}
 	defer m.DecUsers(ctx)
 
@@ -472,7 +476,7 @@ func (fd *memFD) PRead(ctx context.Context, dst usermem.IOSequence, offset int64
 	}
 	m, err := getMMIncRef(fd.inode.task)
 	if err != nil {
-		return 0, nil
+		return 0, err
 	}
 	defer m.DecUsers(ctx)
 	// Buffer the read data because of MM locks
@@ -512,16 +516,6 @@ func (fd *memFD) SetStat(context.Context, vfs.SetStatOptions) error {
 
 // Release implements vfs.FileDescriptionImpl.Release.
 func (fd *memFD) Release(context.Context) {}
-
-// LockPOSIX implements vfs.FileDescriptionImpl.LockPOSIX.
-func (fd *memFD) LockPOSIX(ctx context.Context, uid fslock.UniqueID, t fslock.LockType, start, length uint64, whence int16, block fslock.Blocker) error {
-	return fd.Locks().LockPOSIX(ctx, &fd.vfsfd, uid, t, start, length, whence, block)
-}
-
-// UnlockPOSIX implements vfs.FileDescriptionImpl.UnlockPOSIX.
-func (fd *memFD) UnlockPOSIX(ctx context.Context, uid fslock.UniqueID, start, length uint64, whence int16) error {
-	return fd.Locks().UnlockPOSIX(ctx, &fd.vfsfd, uid, start, length, whence)
-}
 
 // mapsData implements vfs.DynamicBytesSource for /proc/[pid]/maps.
 //
@@ -1104,14 +1098,4 @@ func (fd *namespaceFD) SetStat(ctx context.Context, opts vfs.SetStatOptions) err
 // Release implements vfs.FileDescriptionImpl.Release.
 func (fd *namespaceFD) Release(ctx context.Context) {
 	fd.inode.DecRef(ctx)
-}
-
-// LockPOSIX implements vfs.FileDescriptionImpl.LockPOSIX.
-func (fd *namespaceFD) LockPOSIX(ctx context.Context, uid fslock.UniqueID, t fslock.LockType, start, length uint64, whence int16, block fslock.Blocker) error {
-	return fd.Locks().LockPOSIX(ctx, &fd.vfsfd, uid, t, start, length, whence, block)
-}
-
-// UnlockPOSIX implements vfs.FileDescriptionImpl.UnlockPOSIX.
-func (fd *namespaceFD) UnlockPOSIX(ctx context.Context, uid fslock.UniqueID, start, length uint64, whence int16) error {
-	return fd.Locks().UnlockPOSIX(ctx, &fd.vfsfd, uid, start, length, whence)
 }

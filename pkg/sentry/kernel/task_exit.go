@@ -368,8 +368,8 @@ func (t *Task) exitChildren() {
 				Signo: int32(sig),
 				Code:  arch.SignalInfoUser,
 			}
-			siginfo.SetPid(int32(c.tg.pidns.tids[t]))
-			siginfo.SetUid(int32(t.Credentials().RealKUID.In(c.UserNamespace()).OrOverflow()))
+			siginfo.SetPID(int32(c.tg.pidns.tids[t]))
+			siginfo.SetUID(int32(t.Credentials().RealKUID.In(c.UserNamespace()).OrOverflow()))
 			c.tg.signalHandlers.mu.Lock()
 			c.sendSignalLocked(siginfo, true /* group */)
 			c.tg.signalHandlers.mu.Unlock()
@@ -415,6 +415,12 @@ func (tg *ThreadGroup) anyNonExitingTaskLocked() *Task {
 func (t *Task) reparentLocked(parent *Task) {
 	oldParent := t.parent
 	t.parent = parent
+	if oldParent != nil {
+		delete(oldParent.children, t)
+	}
+	if parent != nil {
+		parent.children[t] = struct{}{}
+	}
 	// If a thread group leader's parent changes, reset the thread group's
 	// termination signal to SIGCHLD and re-check exit notification. (Compare
 	// kernel/exit.c:reparent_leader().)
@@ -688,7 +694,8 @@ func (t *Task) exitNotifyLocked(fromPtraceDetach bool) {
 		}
 		if t.parent != nil {
 			delete(t.parent.children, t)
-			t.parent = nil
+			// Do not clear t.parent. It may be still be needed after the task has exited
+			// (for example, to perform ptrace access checks on /proc/[pid] files).
 		}
 	}
 }
@@ -698,8 +705,8 @@ func (t *Task) exitNotificationSignal(sig linux.Signal, receiver *Task) *arch.Si
 	info := &arch.SignalInfo{
 		Signo: int32(sig),
 	}
-	info.SetPid(int32(receiver.tg.pidns.tids[t]))
-	info.SetUid(int32(t.Credentials().RealKUID.In(receiver.UserNamespace()).OrOverflow()))
+	info.SetPID(int32(receiver.tg.pidns.tids[t]))
+	info.SetUID(int32(t.Credentials().RealKUID.In(receiver.UserNamespace()).OrOverflow()))
 	if t.exitStatus.Signaled() {
 		info.Code = arch.CLD_KILLED
 		info.SetStatus(int32(t.exitStatus.Signo))

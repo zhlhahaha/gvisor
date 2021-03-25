@@ -72,7 +72,7 @@ func (FileDescriptionDefaultImpl) Allocate(ctx context.Context, mode, offset, le
 // file_operations::poll == NULL in Linux.
 func (FileDescriptionDefaultImpl) Readiness(mask waiter.EventMask) waiter.EventMask {
 	// include/linux/poll.h:vfs_poll() => DEFAULT_POLLMASK
-	return waiter.EventIn | waiter.EventOut
+	return waiter.ReadableEvents | waiter.WritableEvents
 }
 
 // EventRegister implements waiter.Waitable.EventRegister analogously to
@@ -238,6 +238,8 @@ func (s *StaticData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 
 // WritableDynamicBytesSource extends DynamicBytesSource to allow writes to the
 // underlying source.
+//
+// TODO(b/179825241): Make utility for integer-based writable files.
 type WritableDynamicBytesSource interface {
 	DynamicBytesSource
 
@@ -419,14 +421,29 @@ func (fd *LockFD) Locks() *FileLocks {
 }
 
 // LockBSD implements vfs.FileDescriptionImpl.LockBSD.
-func (fd *LockFD) LockBSD(ctx context.Context, uid fslock.UniqueID, t fslock.LockType, block fslock.Blocker) error {
-	return fd.locks.LockBSD(uid, t, block)
+func (fd *LockFD) LockBSD(ctx context.Context, uid fslock.UniqueID, ownerPID int32, t fslock.LockType, block fslock.Blocker) error {
+	return fd.locks.LockBSD(ctx, uid, ownerPID, t, block)
 }
 
 // UnlockBSD implements vfs.FileDescriptionImpl.UnlockBSD.
 func (fd *LockFD) UnlockBSD(ctx context.Context, uid fslock.UniqueID) error {
 	fd.locks.UnlockBSD(uid)
 	return nil
+}
+
+// LockPOSIX implements vfs.FileDescriptionImpl.LockPOSIX.
+func (fd *LockFD) LockPOSIX(ctx context.Context, uid fslock.UniqueID, ownerPID int32, t fslock.LockType, r fslock.LockRange, block fslock.Blocker) error {
+	return fd.locks.LockPOSIX(ctx, uid, ownerPID, t, r, block)
+}
+
+// UnlockPOSIX implements vfs.FileDescriptionImpl.UnlockPOSIX.
+func (fd *LockFD) UnlockPOSIX(ctx context.Context, uid fslock.UniqueID, r fslock.LockRange) error {
+	return fd.locks.UnlockPOSIX(ctx, uid, r)
+}
+
+// TestPOSIX implements vfs.FileDescriptionImpl.TestPOSIX.
+func (fd *LockFD) TestPOSIX(ctx context.Context, uid fslock.UniqueID, t fslock.LockType, r fslock.LockRange) (linux.Flock, error) {
+	return fd.locks.TestPOSIX(ctx, uid, t, r)
 }
 
 // NoLockFD implements Lock*/Unlock* portion of FileDescriptionImpl interface
@@ -436,7 +453,7 @@ func (fd *LockFD) UnlockBSD(ctx context.Context, uid fslock.UniqueID) error {
 type NoLockFD struct{}
 
 // LockBSD implements vfs.FileDescriptionImpl.LockBSD.
-func (NoLockFD) LockBSD(ctx context.Context, uid fslock.UniqueID, t fslock.LockType, block fslock.Blocker) error {
+func (NoLockFD) LockBSD(ctx context.Context, uid fslock.UniqueID, ownerPID int32, t fslock.LockType, block fslock.Blocker) error {
 	return syserror.ENOLCK
 }
 
@@ -446,11 +463,16 @@ func (NoLockFD) UnlockBSD(ctx context.Context, uid fslock.UniqueID) error {
 }
 
 // LockPOSIX implements vfs.FileDescriptionImpl.LockPOSIX.
-func (NoLockFD) LockPOSIX(ctx context.Context, uid fslock.UniqueID, t fslock.LockType, start, length uint64, whence int16, block fslock.Blocker) error {
+func (NoLockFD) LockPOSIX(ctx context.Context, uid fslock.UniqueID, ownerPID int32, t fslock.LockType, r fslock.LockRange, block fslock.Blocker) error {
 	return syserror.ENOLCK
 }
 
 // UnlockPOSIX implements vfs.FileDescriptionImpl.UnlockPOSIX.
-func (NoLockFD) UnlockPOSIX(ctx context.Context, uid fslock.UniqueID, start, length uint64, whence int16) error {
+func (NoLockFD) UnlockPOSIX(ctx context.Context, uid fslock.UniqueID, r fslock.LockRange) error {
 	return syserror.ENOLCK
+}
+
+// TestPOSIX implements vfs.FileDescriptionImpl.TestPOSIX.
+func (NoLockFD) TestPOSIX(ctx context.Context, uid fslock.UniqueID, t fslock.LockType, r fslock.LockRange) (linux.Flock, error) {
+	return linux.Flock{}, syserror.ENOLCK
 }

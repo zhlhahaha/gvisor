@@ -40,8 +40,8 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
-	"syscall"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/log"
@@ -65,6 +65,34 @@ import (
 
 // Name is the default filesystem name.
 const Name = "9p"
+
+// Mount option names for goferfs.
+const (
+	moptTransport              = "trans"
+	moptReadFD                 = "rfdno"
+	moptWriteFD                = "wfdno"
+	moptAname                  = "aname"
+	moptDfltUID                = "dfltuid"
+	moptDfltGID                = "dfltgid"
+	moptMsize                  = "msize"
+	moptVersion                = "version"
+	moptDentryCacheLimit       = "dentry_cache_limit"
+	moptCache                  = "cache"
+	moptForcePageCache         = "force_page_cache"
+	moptLimitHostFDTranslation = "limit_host_fd_translation"
+	moptOverlayfsStaleRead     = "overlayfs_stale_read"
+)
+
+// Valid values for the "cache" mount option.
+const (
+	cacheNone                = "none"
+	cacheFSCache             = "fscache"
+	cacheFSCacheWritethrough = "fscache_writethrough"
+	cacheRemoteRevalidating  = "remote_revalidating"
+)
+
+// Valid values for "trans" mount option.
+const transportModeFD = "fd"
 
 // FilesystemType implements vfs.FilesystemType.
 //
@@ -301,39 +329,39 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 
 	// Get the attach name.
 	fsopts.aname = "/"
-	if aname, ok := mopts["aname"]; ok {
-		delete(mopts, "aname")
+	if aname, ok := mopts[moptAname]; ok {
+		delete(mopts, moptAname)
 		fsopts.aname = aname
 	}
 
 	// Parse the cache policy. For historical reasons, this defaults to the
 	// least generally-applicable option, InteropModeExclusive.
 	fsopts.interop = InteropModeExclusive
-	if cache, ok := mopts["cache"]; ok {
-		delete(mopts, "cache")
+	if cache, ok := mopts[moptCache]; ok {
+		delete(mopts, moptCache)
 		switch cache {
-		case "fscache":
+		case cacheFSCache:
 			fsopts.interop = InteropModeExclusive
-		case "fscache_writethrough":
+		case cacheFSCacheWritethrough:
 			fsopts.interop = InteropModeWritethrough
-		case "none":
+		case cacheNone:
 			fsopts.regularFilesUseSpecialFileFD = true
 			fallthrough
-		case "remote_revalidating":
+		case cacheRemoteRevalidating:
 			fsopts.interop = InteropModeShared
 		default:
-			ctx.Warningf("gofer.FilesystemType.GetFilesystem: invalid cache policy: cache=%s", cache)
+			ctx.Warningf("gofer.FilesystemType.GetFilesystem: invalid cache policy: %s=%s", moptCache, cache)
 			return nil, nil, syserror.EINVAL
 		}
 	}
 
 	// Parse the default UID and GID.
 	fsopts.dfltuid = _V9FS_DEFUID
-	if dfltuidstr, ok := mopts["dfltuid"]; ok {
-		delete(mopts, "dfltuid")
+	if dfltuidstr, ok := mopts[moptDfltUID]; ok {
+		delete(mopts, moptDfltUID)
 		dfltuid, err := strconv.ParseUint(dfltuidstr, 10, 32)
 		if err != nil {
-			ctx.Warningf("gofer.FilesystemType.GetFilesystem: invalid default UID: dfltuid=%s", dfltuidstr)
+			ctx.Warningf("gofer.FilesystemType.GetFilesystem: invalid default UID: %s=%s", moptDfltUID, dfltuidstr)
 			return nil, nil, syserror.EINVAL
 		}
 		// In Linux, dfltuid is interpreted as a UID and is converted to a KUID
@@ -342,11 +370,11 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		fsopts.dfltuid = auth.KUID(dfltuid)
 	}
 	fsopts.dfltgid = _V9FS_DEFGID
-	if dfltgidstr, ok := mopts["dfltgid"]; ok {
-		delete(mopts, "dfltgid")
+	if dfltgidstr, ok := mopts[moptDfltGID]; ok {
+		delete(mopts, moptDfltGID)
 		dfltgid, err := strconv.ParseUint(dfltgidstr, 10, 32)
 		if err != nil {
-			ctx.Warningf("gofer.FilesystemType.GetFilesystem: invalid default UID: dfltgid=%s", dfltgidstr)
+			ctx.Warningf("gofer.FilesystemType.GetFilesystem: invalid default UID: %s=%s", moptDfltGID, dfltgidstr)
 			return nil, nil, syserror.EINVAL
 		}
 		fsopts.dfltgid = auth.KGID(dfltgid)
@@ -354,11 +382,11 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 
 	// Parse the 9P message size.
 	fsopts.msize = 1024 * 1024 // 1M, tested to give good enough performance up to 64M
-	if msizestr, ok := mopts["msize"]; ok {
-		delete(mopts, "msize")
+	if msizestr, ok := mopts[moptMsize]; ok {
+		delete(mopts, moptMsize)
 		msize, err := strconv.ParseUint(msizestr, 10, 32)
 		if err != nil {
-			ctx.Warningf("gofer.FilesystemType.GetFilesystem: invalid message size: msize=%s", msizestr)
+			ctx.Warningf("gofer.FilesystemType.GetFilesystem: invalid message size: %s=%s", moptMsize, msizestr)
 			return nil, nil, syserror.EINVAL
 		}
 		fsopts.msize = uint32(msize)
@@ -366,34 +394,34 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 
 	// Parse the 9P protocol version.
 	fsopts.version = p9.HighestVersionString()
-	if version, ok := mopts["version"]; ok {
-		delete(mopts, "version")
+	if version, ok := mopts[moptVersion]; ok {
+		delete(mopts, moptVersion)
 		fsopts.version = version
 	}
 
 	// Parse the dentry cache limit.
 	fsopts.maxCachedDentries = 1000
-	if str, ok := mopts["dentry_cache_limit"]; ok {
-		delete(mopts, "dentry_cache_limit")
+	if str, ok := mopts[moptDentryCacheLimit]; ok {
+		delete(mopts, moptDentryCacheLimit)
 		maxCachedDentries, err := strconv.ParseUint(str, 10, 64)
 		if err != nil {
-			ctx.Warningf("gofer.FilesystemType.GetFilesystem: invalid dentry cache limit: dentry_cache_limit=%s", str)
+			ctx.Warningf("gofer.FilesystemType.GetFilesystem: invalid dentry cache limit: %s=%s", moptDentryCacheLimit, str)
 			return nil, nil, syserror.EINVAL
 		}
 		fsopts.maxCachedDentries = maxCachedDentries
 	}
 
 	// Handle simple flags.
-	if _, ok := mopts["force_page_cache"]; ok {
-		delete(mopts, "force_page_cache")
+	if _, ok := mopts[moptForcePageCache]; ok {
+		delete(mopts, moptForcePageCache)
 		fsopts.forcePageCache = true
 	}
-	if _, ok := mopts["limit_host_fd_translation"]; ok {
-		delete(mopts, "limit_host_fd_translation")
+	if _, ok := mopts[moptLimitHostFDTranslation]; ok {
+		delete(mopts, moptLimitHostFDTranslation)
 		fsopts.limitHostFDTranslation = true
 	}
-	if _, ok := mopts["overlayfs_stale_read"]; ok {
-		delete(mopts, "overlayfs_stale_read")
+	if _, ok := mopts[moptOverlayfsStaleRead]; ok {
+		delete(mopts, moptOverlayfsStaleRead)
 		fsopts.overlayfsStaleRead = true
 	}
 	// fsopts.regularFilesUseSpecialFileFD can only be enabled by specifying
@@ -469,34 +497,34 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 
 func getFDFromMountOptionsMap(ctx context.Context, mopts map[string]string) (int, error) {
 	// Check that the transport is "fd".
-	trans, ok := mopts["trans"]
-	if !ok || trans != "fd" {
-		ctx.Warningf("gofer.getFDFromMountOptionsMap: transport must be specified as 'trans=fd'")
+	trans, ok := mopts[moptTransport]
+	if !ok || trans != transportModeFD {
+		ctx.Warningf("gofer.getFDFromMountOptionsMap: transport must be specified as '%s=%s'", moptTransport, transportModeFD)
 		return -1, syserror.EINVAL
 	}
-	delete(mopts, "trans")
+	delete(mopts, moptTransport)
 
 	// Check that read and write FDs are provided and identical.
-	rfdstr, ok := mopts["rfdno"]
+	rfdstr, ok := mopts[moptReadFD]
 	if !ok {
-		ctx.Warningf("gofer.getFDFromMountOptionsMap: read FD must be specified as 'rfdno=<file descriptor>'")
+		ctx.Warningf("gofer.getFDFromMountOptionsMap: read FD must be specified as '%s=<file descriptor>'", moptReadFD)
 		return -1, syserror.EINVAL
 	}
-	delete(mopts, "rfdno")
+	delete(mopts, moptReadFD)
 	rfd, err := strconv.Atoi(rfdstr)
 	if err != nil {
-		ctx.Warningf("gofer.getFDFromMountOptionsMap: invalid read FD: rfdno=%s", rfdstr)
+		ctx.Warningf("gofer.getFDFromMountOptionsMap: invalid read FD: %s=%s", moptReadFD, rfdstr)
 		return -1, syserror.EINVAL
 	}
-	wfdstr, ok := mopts["wfdno"]
+	wfdstr, ok := mopts[moptWriteFD]
 	if !ok {
-		ctx.Warningf("gofer.getFDFromMountOptionsMap: write FD must be specified as 'wfdno=<file descriptor>'")
+		ctx.Warningf("gofer.getFDFromMountOptionsMap: write FD must be specified as '%s=<file descriptor>'", moptWriteFD)
 		return -1, syserror.EINVAL
 	}
-	delete(mopts, "wfdno")
+	delete(mopts, moptWriteFD)
 	wfd, err := strconv.Atoi(wfdstr)
 	if err != nil {
-		ctx.Warningf("gofer.getFDFromMountOptionsMap: invalid write FD: wfdno=%s", wfdstr)
+		ctx.Warningf("gofer.getFDFromMountOptionsMap: invalid write FD: %s=%s", moptWriteFD, wfdstr)
 		return -1, syserror.EINVAL
 	}
 	if rfd != wfd {
@@ -550,10 +578,10 @@ func (fs *filesystem) Release(ctx context.Context) {
 		d.dataMu.Unlock()
 		// Close host FDs if they exist.
 		if d.readFD >= 0 {
-			syscall.Close(int(d.readFD))
+			unix.Close(int(d.readFD))
 		}
 		if d.writeFD >= 0 && d.readFD != d.writeFD {
-			syscall.Close(int(d.writeFD))
+			unix.Close(int(d.writeFD))
 		}
 		d.readFD = -1
 		d.writeFD = -1
@@ -743,7 +771,9 @@ type dentry struct {
 	// for memory mappings. If mmapFD is -1, no such FD is available, and the
 	// internal page cache implementation is used for memory mappings instead.
 	//
-	// These fields are protected by handleMu.
+	// These fields are protected by handleMu. readFD, writeFD, and mmapFD are
+	// additionally written using atomic memory operations, allowing them to be
+	// read (albeit racily) with atomic.LoadInt32() without locking handleMu.
 	//
 	// readFile and writeFile may or may not represent the same p9.File. Once
 	// either p9.File transitions from closed (isNil() == true) to open
@@ -1072,10 +1102,26 @@ func (d *dentry) setStat(ctx context.Context, creds *auth.Credentials, opts *vfs
 
 	d.metadataMu.Lock()
 	defer d.metadataMu.Unlock()
+
+	// As with Linux, if the UID, GID, or file size is changing, we have to
+	// clear permission bits. Note that when set, clearSGID causes
+	// permissions to be updated, but does not modify stat.Mask, as
+	// modification would cause an extra inotify flag to be set.
+	clearSGID := stat.Mask&linux.STATX_UID != 0 && stat.UID != atomic.LoadUint32(&d.uid) ||
+		stat.Mask&linux.STATX_GID != 0 && stat.GID != atomic.LoadUint32(&d.gid) ||
+		stat.Mask&linux.STATX_SIZE != 0
+	if clearSGID {
+		if stat.Mask&linux.STATX_MODE != 0 {
+			stat.Mode = uint16(vfs.ClearSUIDAndSGID(uint32(stat.Mode)))
+		} else {
+			stat.Mode = uint16(vfs.ClearSUIDAndSGID(atomic.LoadUint32(&d.mode)))
+		}
+	}
+
 	if !d.isSynthetic() {
 		if stat.Mask != 0 {
 			if err := d.file.setAttr(ctx, p9.SetAttrMask{
-				Permissions:        stat.Mask&linux.STATX_MODE != 0,
+				Permissions:        stat.Mask&linux.STATX_MODE != 0 || clearSGID,
 				UID:                stat.Mask&linux.STATX_UID != 0,
 				GID:                stat.Mask&linux.STATX_GID != 0,
 				Size:               stat.Mask&linux.STATX_SIZE != 0,
@@ -1110,7 +1156,7 @@ func (d *dentry) setStat(ctx context.Context, creds *auth.Credentials, opts *vfs
 			return nil
 		}
 	}
-	if stat.Mask&linux.STATX_MODE != 0 {
+	if stat.Mask&linux.STATX_MODE != 0 || clearSGID {
 		atomic.StoreUint32(&d.mode, d.fileType()|uint32(stat.Mode))
 	}
 	if stat.Mask&linux.STATX_UID != 0 {
@@ -1214,7 +1260,13 @@ func (d *dentry) checkXattrPermissions(creds *auth.Credentials, name string, ats
 }
 
 func (d *dentry) mayDelete(creds *auth.Credentials, child *dentry) error {
-	return vfs.CheckDeleteSticky(creds, linux.FileMode(atomic.LoadUint32(&d.mode)), auth.KUID(atomic.LoadUint32(&child.uid)))
+	return vfs.CheckDeleteSticky(
+		creds,
+		linux.FileMode(atomic.LoadUint32(&d.mode)),
+		auth.KUID(atomic.LoadUint32(&d.uid)),
+		auth.KUID(atomic.LoadUint32(&child.uid)),
+		auth.KGID(atomic.LoadUint32(&child.gid)),
+	)
 }
 
 func dentryUIDFromP9UID(uid p9.UID) uint32 {
@@ -1351,16 +1403,11 @@ func (d *dentry) checkCachingLocked(ctx context.Context) {
 		return
 	}
 	if refs > 0 {
-		if d.cached {
-			// This isn't strictly necessary (fs.cachedDentries is permitted to
-			// contain dentries with non-zero refs, which are skipped by
-			// fs.evictCachedDentryLocked() upon reaching the end of the LRU),
-			// but since we are already holding fs.renameMu for writing we may
-			// as well.
-			d.fs.cachedDentries.Remove(d)
-			d.fs.cachedDentriesLen--
-			d.cached = false
-		}
+		// This isn't strictly necessary (fs.cachedDentries is permitted to
+		// contain dentries with non-zero refs, which are skipped by
+		// fs.evictCachedDentryLocked() upon reaching the end of the LRU), but
+		// since we are already holding fs.renameMu for writing we may as well.
+		d.removeFromCacheLocked()
 		return
 	}
 	// Deleted and invalidated dentries with zero references are no longer
@@ -1369,20 +1416,18 @@ func (d *dentry) checkCachingLocked(ctx context.Context) {
 		if d.isDeleted() {
 			d.watches.HandleDeletion(ctx)
 		}
-		if d.cached {
-			d.fs.cachedDentries.Remove(d)
-			d.fs.cachedDentriesLen--
-			d.cached = false
-		}
+		d.removeFromCacheLocked()
 		d.destroyLocked(ctx)
 		return
 	}
-	// If d still has inotify watches and it is not deleted or invalidated, we
-	// cannot cache it and allow it to be evicted. Otherwise, we will lose its
-	// watches, even if a new dentry is created for the same file in the future.
-	// Note that the size of d.watches cannot concurrently transition from zero
-	// to non-zero, because adding a watch requires holding a reference on d.
+	// If d still has inotify watches and it is not deleted or invalidated, it
+	// can't be evicted. Otherwise, we will lose its watches, even if a new
+	// dentry is created for the same file in the future. Note that the size of
+	// d.watches cannot concurrently transition from zero to non-zero, because
+	// adding a watch requires holding a reference on d.
 	if d.watches.Size() > 0 {
+		// As in the refs > 0 case, this is not strictly necessary.
+		d.removeFromCacheLocked()
 		return
 	}
 
@@ -1413,6 +1458,15 @@ func (d *dentry) checkCachingLocked(ctx context.Context) {
 	}
 }
 
+// Preconditions: d.fs.renameMu must be locked for writing.
+func (d *dentry) removeFromCacheLocked() {
+	if d.cached {
+		d.fs.cachedDentries.Remove(d)
+		d.fs.cachedDentriesLen--
+		d.cached = false
+	}
+}
+
 // Precondition: fs.renameMu must be locked for writing; it may be temporarily
 // unlocked.
 func (fs *filesystem) evictAllCachedDentriesLocked(ctx context.Context) {
@@ -1426,12 +1480,10 @@ func (fs *filesystem) evictAllCachedDentriesLocked(ctx context.Context) {
 // * fs.cachedDentriesLen != 0.
 func (fs *filesystem) evictCachedDentryLocked(ctx context.Context) {
 	victim := fs.cachedDentries.Back()
-	fs.cachedDentries.Remove(victim)
-	fs.cachedDentriesLen--
-	victim.cached = false
-	// victim.refs may have become non-zero from an earlier path resolution
-	// since it was inserted into fs.cachedDentries.
-	if atomic.LoadInt64(&victim.refs) == 0 {
+	victim.removeFromCacheLocked()
+	// victim.refs or victim.watches.Size() may have become non-zero from an
+	// earlier path resolution since it was inserted into fs.cachedDentries.
+	if atomic.LoadInt64(&victim.refs) == 0 && victim.watches.Size() == 0 {
 		if victim.parent != nil {
 			victim.parent.dirMu.Lock()
 			if !victim.vfsd.IsDead() {
@@ -1497,10 +1549,10 @@ func (d *dentry) destroyLocked(ctx context.Context) {
 	d.readFile = p9file{}
 	d.writeFile = p9file{}
 	if d.readFD >= 0 {
-		syscall.Close(int(d.readFD))
+		unix.Close(int(d.readFD))
 	}
 	if d.writeFD >= 0 && d.readFD != d.writeFD {
-		syscall.Close(int(d.writeFD))
+		unix.Close(int(d.writeFD))
 	}
 	d.readFD = -1
 	d.writeFD = -1
@@ -1668,7 +1720,7 @@ func (d *dentry) ensureSharedHandle(ctx context.Context, read, write, trunc bool
 						}
 						fdsToClose = append(fdsToClose, d.readFD)
 						invalidateTranslations = true
-						d.readFD = h.fd
+						atomic.StoreInt32(&d.readFD, h.fd)
 					} else {
 						// Otherwise, we want to avoid invalidating existing
 						// memmap.Translations (which is expensive); instead, use
@@ -1678,7 +1730,7 @@ func (d *dentry) ensureSharedHandle(ctx context.Context, read, write, trunc bool
 						// may use the old or new file description, but this
 						// doesn't matter since they refer to the same file, and
 						// any racing mappings must be read-only.
-						if err := syscall.Dup3(int(h.fd), int(d.readFD), syscall.O_CLOEXEC); err != nil {
+						if err := unix.Dup3(int(h.fd), int(d.readFD), unix.O_CLOEXEC); err != nil {
 							oldFD := d.readFD
 							d.handleMu.Unlock()
 							ctx.Warningf("gofer.dentry.ensureSharedHandle: failed to dup fd %d to fd %d: %v", h.fd, oldFD, err)
@@ -1689,15 +1741,15 @@ func (d *dentry) ensureSharedHandle(ctx context.Context, read, write, trunc bool
 						h.fd = d.readFD
 					}
 				} else {
-					d.readFD = h.fd
+					atomic.StoreInt32(&d.readFD, h.fd)
 				}
 				if d.writeFD != h.fd && d.writeFD >= 0 {
 					fdsToClose = append(fdsToClose, d.writeFD)
 				}
-				d.writeFD = h.fd
-				d.mmapFD = h.fd
+				atomic.StoreInt32(&d.writeFD, h.fd)
+				atomic.StoreInt32(&d.mmapFD, h.fd)
 			} else if openReadable && d.readFD < 0 {
-				d.readFD = h.fd
+				atomic.StoreInt32(&d.readFD, h.fd)
 				// If the file has not been opened for writing, the new FD may
 				// be used for read-only memory mappings. If the file was
 				// previously opened for reading (without an FD), then existing
@@ -1705,10 +1757,10 @@ func (d *dentry) ensureSharedHandle(ctx context.Context, read, write, trunc bool
 				// invalidate those mappings.
 				if d.writeFile.isNil() {
 					invalidateTranslations = !d.readFile.isNil()
-					d.mmapFD = h.fd
+					atomic.StoreInt32(&d.mmapFD, h.fd)
 				}
 			} else if openWritable && d.writeFD < 0 {
-				d.writeFD = h.fd
+				atomic.StoreInt32(&d.writeFD, h.fd)
 				if d.readFD >= 0 {
 					// We have an existing read-only FD, but the file has just
 					// been opened for writing, so we need to start supporting
@@ -1717,7 +1769,7 @@ func (d *dentry) ensureSharedHandle(ctx context.Context, read, write, trunc bool
 					// writable memory mappings. Switch to using the internal
 					// page cache.
 					invalidateTranslations = true
-					d.mmapFD = -1
+					atomic.StoreInt32(&d.mmapFD, -1)
 				}
 			} else {
 				// The new FD is not useful.
@@ -1729,7 +1781,7 @@ func (d *dentry) ensureSharedHandle(ctx context.Context, read, write, trunc bool
 			// memory mappings. However, we have no writable host FD. Switch to
 			// using the internal page cache.
 			invalidateTranslations = true
-			d.mmapFD = -1
+			atomic.StoreInt32(&d.mmapFD, -1)
 		}
 
 		// Switch to new fids.
@@ -1764,7 +1816,7 @@ func (d *dentry) ensureSharedHandle(ctx context.Context, read, write, trunc bool
 		d.mapsMu.Unlock()
 	}
 	for _, fd := range fdsToClose {
-		syscall.Close(int(fd))
+		unix.Close(int(fd))
 	}
 
 	return nil
@@ -1800,7 +1852,7 @@ func (d *dentry) syncRemoteFileLocked(ctx context.Context) error {
 	// handles otherwise.
 	if d.writeFD >= 0 {
 		ctx.UninterruptibleSleepStart(false)
-		err := syscall.Fsync(int(d.writeFD))
+		err := unix.Fsync(int(d.writeFD))
 		ctx.UninterruptibleSleepFinish(false)
 		return err
 	}
@@ -1809,7 +1861,7 @@ func (d *dentry) syncRemoteFileLocked(ctx context.Context) error {
 	}
 	if d.readFD >= 0 {
 		ctx.UninterruptibleSleepStart(false)
-		err := syscall.Fsync(int(d.readFD))
+		err := unix.Fsync(int(d.readFD))
 		ctx.UninterruptibleSleepFinish(false)
 		return err
 	}
@@ -1942,22 +1994,22 @@ func (fd *fileDescription) RemoveXattr(ctx context.Context, name string) error {
 }
 
 // LockBSD implements vfs.FileDescriptionImpl.LockBSD.
-func (fd *fileDescription) LockBSD(ctx context.Context, uid fslock.UniqueID, t fslock.LockType, block fslock.Blocker) error {
+func (fd *fileDescription) LockBSD(ctx context.Context, uid fslock.UniqueID, ownerPID int32, t fslock.LockType, block fslock.Blocker) error {
 	fd.lockLogging.Do(func() {
 		log.Infof("File lock using gofer file handled internally.")
 	})
-	return fd.LockFD.LockBSD(ctx, uid, t, block)
+	return fd.LockFD.LockBSD(ctx, uid, ownerPID, t, block)
 }
 
 // LockPOSIX implements vfs.FileDescriptionImpl.LockPOSIX.
-func (fd *fileDescription) LockPOSIX(ctx context.Context, uid fslock.UniqueID, t fslock.LockType, start, length uint64, whence int16, block fslock.Blocker) error {
+func (fd *fileDescription) LockPOSIX(ctx context.Context, uid fslock.UniqueID, ownerPID int32, t fslock.LockType, r fslock.LockRange, block fslock.Blocker) error {
 	fd.lockLogging.Do(func() {
 		log.Infof("Range lock using gofer file handled internally.")
 	})
-	return fd.Locks().LockPOSIX(ctx, &fd.vfsfd, uid, t, start, length, whence, block)
+	return fd.Locks().LockPOSIX(ctx, uid, ownerPID, t, r, block)
 }
 
 // UnlockPOSIX implements vfs.FileDescriptionImpl.UnlockPOSIX.
-func (fd *fileDescription) UnlockPOSIX(ctx context.Context, uid fslock.UniqueID, start, length uint64, whence int16) error {
-	return fd.Locks().UnlockPOSIX(ctx, &fd.vfsfd, uid, start, length, whence)
+func (fd *fileDescription) UnlockPOSIX(ctx context.Context, uid fslock.UniqueID, r fslock.LockRange) error {
+	return fd.Locks().UnlockPOSIX(ctx, uid, r)
 }

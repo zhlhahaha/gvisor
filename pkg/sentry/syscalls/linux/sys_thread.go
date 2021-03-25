@@ -16,8 +16,8 @@ package linux
 
 import (
 	"path"
-	"syscall"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
@@ -31,6 +31,11 @@ import (
 )
 
 const (
+	// exitSignalMask is the signal mask to be sent at exit. Same as CSIGNAL in linux.
+	exitSignalMask = 0xff
+)
+
+var (
 	// ExecMaxTotalSize is the maximum length of all argv and envv entries.
 	//
 	// N.B. The behavior here is different than Linux. Linux provides a limit on
@@ -42,9 +47,6 @@ const (
 
 	// ExecMaxElemSize is the maximum length of a single argv or envv entry.
 	ExecMaxElemSize = 32 * usermem.PageSize
-
-	// exitSignalMask is the signal mask to be sent at exit. Same as CSIGNAL in linux.
-	exitSignalMask = 0xff
 )
 
 // Getppid implements linux syscall getppid(2).
@@ -413,11 +415,11 @@ func Waitid(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscal
 	si := arch.SignalInfo{
 		Signo: int32(linux.SIGCHLD),
 	}
-	si.SetPid(int32(wr.TID))
-	si.SetUid(int32(wr.UID))
+	si.SetPID(int32(wr.TID))
+	si.SetUID(int32(wr.UID))
 	// TODO(b/73541790): convert kernel.ExitStatus to functions and make
 	// WaitResult.Status a linux.WaitStatus.
-	s := syscall.WaitStatus(wr.Status)
+	s := unix.WaitStatus(wr.Status)
 	switch {
 	case s.Exited():
 		si.Code = arch.CLD_EXITED

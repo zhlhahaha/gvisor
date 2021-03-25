@@ -16,11 +16,9 @@ package pipe
 
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
-	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
-	fslock "gvisor.dev/gvisor/pkg/sentry/fs/lock"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/syserror"
@@ -63,10 +61,19 @@ func NewVFSPipe(isNamed bool, sizeBytes int64) *VFSPipe {
 // ReaderWriterPair returns read-only and write-only FDs for vp.
 //
 // Preconditions: statusFlags should not contain an open access mode.
-func (vp *VFSPipe) ReaderWriterPair(mnt *vfs.Mount, vfsd *vfs.Dentry, statusFlags uint32) (*vfs.FileDescription, *vfs.FileDescription) {
+func (vp *VFSPipe) ReaderWriterPair(ctx context.Context, mnt *vfs.Mount, vfsd *vfs.Dentry, statusFlags uint32) (*vfs.FileDescription, *vfs.FileDescription, error) {
 	// Connected pipes share the same locks.
 	locks := &vfs.FileLocks{}
-	return vp.newFD(mnt, vfsd, linux.O_RDONLY|statusFlags, locks), vp.newFD(mnt, vfsd, linux.O_WRONLY|statusFlags, locks)
+	r, err := vp.newFD(mnt, vfsd, linux.O_RDONLY|statusFlags, locks)
+	if err != nil {
+		return nil, nil, err
+	}
+	w, err := vp.newFD(mnt, vfsd, linux.O_WRONLY|statusFlags, locks)
+	if err != nil {
+		r.DecRef(ctx)
+		return nil, nil, err
+	}
+	return r, w, nil
 }
 
 // Allocate implements vfs.FileDescriptionImpl.Allocate.
@@ -85,7 +92,10 @@ func (vp *VFSPipe) Open(ctx context.Context, mnt *vfs.Mount, vfsd *vfs.Dentry, s
 		return nil, syserror.EINVAL
 	}
 
-	fd := vp.newFD(mnt, vfsd, statusFlags, locks)
+	fd, err := vp.newFD(mnt, vfsd, statusFlags, locks)
+	if err != nil {
+		return nil, err
+	}
 
 	// Named pipes have special blocking semantics during open:
 	//
@@ -137,16 +147,18 @@ func (vp *VFSPipe) Open(ctx context.Context, mnt *vfs.Mount, vfsd *vfs.Dentry, s
 }
 
 // Preconditions: vp.mu must be held.
-func (vp *VFSPipe) newFD(mnt *vfs.Mount, vfsd *vfs.Dentry, statusFlags uint32, locks *vfs.FileLocks) *vfs.FileDescription {
+func (vp *VFSPipe) newFD(mnt *vfs.Mount, vfsd *vfs.Dentry, statusFlags uint32, locks *vfs.FileLocks) (*vfs.FileDescription, error) {
 	fd := &VFSPipeFD{
 		pipe: &vp.pipe,
 	}
 	fd.LockFD.Init(locks)
-	fd.vfsfd.Init(fd, statusFlags, mnt, vfsd, &vfs.FileDescriptionOptions{
+	if err := fd.vfsfd.Init(fd, statusFlags, mnt, vfsd, &vfs.FileDescriptionOptions{
 		DenyPRead:         true,
 		DenyPWrite:        true,
 		UseDentryMetadata: true,
-	})
+	}); err != nil {
+		return nil, err
+	}
 
 	switch {
 	case fd.vfsfd.IsReadable() && fd.vfsfd.IsWritable():
@@ -160,7 +172,7 @@ func (vp *VFSPipe) newFD(mnt *vfs.Mount, vfsd *vfs.Dentry, statusFlags uint32, l
 		panic("invalid pipe flags: must be readable, writable, or both")
 	}
 
-	return &fd.vfsfd
+	return &fd.vfsfd, nil
 }
 
 // VFSPipeFD implements vfs.FileDescriptionImpl for pipes. It also implements
@@ -182,11 +194,11 @@ func (fd *VFSPipeFD) Release(context.Context) {
 	var event waiter.EventMask
 	if fd.vfsfd.IsReadable() {
 		fd.pipe.rClose()
-		event |= waiter.EventOut
+		event |= waiter.WritableEvents
 	}
 	if fd.vfsfd.IsWritable() {
 		fd.pipe.wClose()
-		event |= waiter.EventIn | waiter.EventHUp
+		event |= waiter.ReadableEvents | waiter.EventHUp
 	}
 	if event == 0 {
 		panic("invalid pipe flags: must be readable, writable, or both")
@@ -255,12 +267,10 @@ func (fd *VFSPipeFD) SetPipeSize(size int64) (int64, error) {
 // SpliceToNonPipe performs a splice operation from fd to a non-pipe file.
 func (fd *VFSPipeFD) SpliceToNonPipe(ctx context.Context, out *vfs.FileDescription, off, count int64) (int64, error) {
 	fd.pipe.mu.Lock()
-	defer fd.pipe.mu.Unlock()
 
 	// Cap the sequence at number of bytes actually available.
-	v := fd.pipe.queuedLocked()
-	if v < count {
-		count = v
+	if count > fd.pipe.size {
+		count = fd.pipe.size
 	}
 	src := usermem.IOSequence{
 		IO:    fd,
@@ -277,155 +287,96 @@ func (fd *VFSPipeFD) SpliceToNonPipe(ctx context.Context, out *vfs.FileDescripti
 		n, err = out.PWrite(ctx, src, off, vfs.WriteOptions{})
 	}
 	if n > 0 {
-		fd.pipe.view.TrimFront(n)
+		fd.pipe.consumeLocked(n)
+	}
+
+	fd.pipe.mu.Unlock()
+
+	if n > 0 {
+		fd.pipe.Notify(waiter.WritableEvents)
 	}
 	return n, err
 }
 
 // SpliceFromNonPipe performs a splice operation from a non-pipe file to fd.
 func (fd *VFSPipeFD) SpliceFromNonPipe(ctx context.Context, in *vfs.FileDescription, off, count int64) (int64, error) {
-	fd.pipe.mu.Lock()
-	defer fd.pipe.mu.Unlock()
-
 	dst := usermem.IOSequence{
 		IO:    fd,
 		Addrs: usermem.AddrRangeSeqOf(usermem.AddrRange{0, usermem.Addr(count)}),
 	}
 
+	var (
+		n   int64
+		err error
+	)
+	fd.pipe.mu.Lock()
 	if off == -1 {
-		return in.Read(ctx, dst, vfs.ReadOptions{})
+		n, err = in.Read(ctx, dst, vfs.ReadOptions{})
+	} else {
+		n, err = in.PRead(ctx, dst, off, vfs.ReadOptions{})
 	}
-	return in.PRead(ctx, dst, off, vfs.ReadOptions{})
+	fd.pipe.mu.Unlock()
+
+	if n > 0 {
+		fd.pipe.Notify(waiter.ReadableEvents)
+	}
+	return n, err
 }
 
 // CopyIn implements usermem.IO.CopyIn. Note that it is the caller's
-// responsibility to trim fd.pipe.view after the read is completed.
+// responsibility to call fd.pipe.consumeLocked() and
+// fd.pipe.Notify(waiter.WritableEvents) after the read is completed.
+//
+// Preconditions: fd.pipe.mu must be locked.
 func (fd *VFSPipeFD) CopyIn(ctx context.Context, addr usermem.Addr, dst []byte, opts usermem.IOOpts) (int, error) {
-	origCount := int64(len(dst))
-	n, err := fd.pipe.readLocked(ctx, readOps{
-		left: func() int64 {
-			return int64(len(dst))
-		},
-		limit: func(l int64) {
-			dst = dst[:l]
-		},
-		read: func(view *buffer.View) (int64, error) {
-			n, err := view.ReadAt(dst, 0)
-			return int64(n), err
-		},
+	n, err := fd.pipe.peekLocked(int64(len(dst)), func(srcs safemem.BlockSeq) (uint64, error) {
+		return safemem.CopySeq(safemem.BlockSeqOf(safemem.BlockFromSafeSlice(dst)), srcs)
 	})
-	if n > 0 {
-		fd.pipe.Notify(waiter.EventOut)
-	}
-	if err == nil && n != origCount {
-		return int(n), syserror.ErrWouldBlock
-	}
 	return int(n), err
 }
 
-// CopyOut implements usermem.IO.CopyOut.
+// CopyOut implements usermem.IO.CopyOut. Note that it is the caller's
+// responsibility to call fd.pipe.Notify(waiter.ReadableEvents) after the write
+// is completed.
+//
+// Preconditions: fd.pipe.mu must be locked.
 func (fd *VFSPipeFD) CopyOut(ctx context.Context, addr usermem.Addr, src []byte, opts usermem.IOOpts) (int, error) {
-	origCount := int64(len(src))
-	n, err := fd.pipe.writeLocked(ctx, writeOps{
-		left: func() int64 {
-			return int64(len(src))
-		},
-		limit: func(l int64) {
-			src = src[:l]
-		},
-		write: func(view *buffer.View) (int64, error) {
-			view.Append(src)
-			return int64(len(src)), nil
-		},
+	n, err := fd.pipe.writeLocked(int64(len(src)), func(dsts safemem.BlockSeq) (uint64, error) {
+		return safemem.CopySeq(dsts, safemem.BlockSeqOf(safemem.BlockFromSafeSlice(src)))
 	})
-	if n > 0 {
-		fd.pipe.Notify(waiter.EventIn)
-	}
-	if err == nil && n != origCount {
-		return int(n), syserror.ErrWouldBlock
-	}
 	return int(n), err
 }
 
 // ZeroOut implements usermem.IO.ZeroOut.
+//
+// Preconditions: fd.pipe.mu must be locked.
 func (fd *VFSPipeFD) ZeroOut(ctx context.Context, addr usermem.Addr, toZero int64, opts usermem.IOOpts) (int64, error) {
-	origCount := toZero
-	n, err := fd.pipe.writeLocked(ctx, writeOps{
-		left: func() int64 {
-			return toZero
-		},
-		limit: func(l int64) {
-			toZero = l
-		},
-		write: func(view *buffer.View) (int64, error) {
-			view.Grow(view.Size()+toZero, true /* zero */)
-			return toZero, nil
-		},
+	n, err := fd.pipe.writeLocked(toZero, func(dsts safemem.BlockSeq) (uint64, error) {
+		return safemem.ZeroSeq(dsts)
 	})
-	if n > 0 {
-		fd.pipe.Notify(waiter.EventIn)
-	}
-	if err == nil && n != origCount {
-		return n, syserror.ErrWouldBlock
-	}
 	return n, err
 }
 
 // CopyInTo implements usermem.IO.CopyInTo. Note that it is the caller's
-// responsibility to trim fd.pipe.view after the read is completed.
+// responsibility to call fd.pipe.consumeLocked() and
+// fd.pipe.Notify(waiter.WritableEvents) after the read is completed.
+//
+// Preconditions: fd.pipe.mu must be locked.
 func (fd *VFSPipeFD) CopyInTo(ctx context.Context, ars usermem.AddrRangeSeq, dst safemem.Writer, opts usermem.IOOpts) (int64, error) {
-	count := ars.NumBytes()
-	if count == 0 {
-		return 0, nil
-	}
-	origCount := count
-	n, err := fd.pipe.readLocked(ctx, readOps{
-		left: func() int64 {
-			return count
-		},
-		limit: func(l int64) {
-			count = l
-		},
-		read: func(view *buffer.View) (int64, error) {
-			n, err := view.ReadToSafememWriter(dst, uint64(count))
-			return int64(n), err
-		},
+	return fd.pipe.peekLocked(ars.NumBytes(), func(srcs safemem.BlockSeq) (uint64, error) {
+		return dst.WriteFromBlocks(srcs)
 	})
-	if n > 0 {
-		fd.pipe.Notify(waiter.EventOut)
-	}
-	if err == nil && n != origCount {
-		return n, syserror.ErrWouldBlock
-	}
-	return n, err
 }
 
-// CopyOutFrom implements usermem.IO.CopyOutFrom.
+// CopyOutFrom implements usermem.IO.CopyOutFrom. Note that it is the caller's
+// responsibility to call fd.pipe.Notify(waiter.ReadableEvents) after the write
+// is completed.
+//
+// Preconditions: fd.pipe.mu must be locked.
 func (fd *VFSPipeFD) CopyOutFrom(ctx context.Context, ars usermem.AddrRangeSeq, src safemem.Reader, opts usermem.IOOpts) (int64, error) {
-	count := ars.NumBytes()
-	if count == 0 {
-		return 0, nil
-	}
-	origCount := count
-	n, err := fd.pipe.writeLocked(ctx, writeOps{
-		left: func() int64 {
-			return count
-		},
-		limit: func(l int64) {
-			count = l
-		},
-		write: func(view *buffer.View) (int64, error) {
-			n, err := view.WriteFromSafememReader(src, uint64(count))
-			return int64(n), err
-		},
+	return fd.pipe.writeLocked(ars.NumBytes(), func(dsts safemem.BlockSeq) (uint64, error) {
+		return src.ReadToBlocks(dsts)
 	})
-	if n > 0 {
-		fd.pipe.Notify(waiter.EventIn)
-	}
-	if err == nil && n != origCount {
-		return n, syserror.ErrWouldBlock
-	}
-	return n, err
 }
 
 // SwapUint32 implements usermem.IO.SwapUint32.
@@ -467,47 +418,23 @@ func spliceOrTee(ctx context.Context, dst, src *VFSPipeFD, count int64, removeFr
 	}
 
 	lockTwoPipes(dst.pipe, src.pipe)
-	defer dst.pipe.mu.Unlock()
-	defer src.pipe.mu.Unlock()
-
-	n, err := dst.pipe.writeLocked(ctx, writeOps{
-		left: func() int64 {
-			return count
-		},
-		limit: func(l int64) {
-			count = l
-		},
-		write: func(dstView *buffer.View) (int64, error) {
-			return src.pipe.readLocked(ctx, readOps{
-				left: func() int64 {
-					return count
-				},
-				limit: func(l int64) {
-					count = l
-				},
-				read: func(srcView *buffer.View) (int64, error) {
-					n, err := srcView.ReadToSafememWriter(dstView, uint64(count))
-					if n > 0 && removeFromSrc {
-						srcView.TrimFront(int64(n))
-					}
-					return int64(n), err
-				},
-			})
-		},
+	n, err := dst.pipe.writeLocked(count, func(dsts safemem.BlockSeq) (uint64, error) {
+		n, err := src.pipe.peekLocked(int64(dsts.NumBytes()), func(srcs safemem.BlockSeq) (uint64, error) {
+			return safemem.CopySeq(dsts, srcs)
+		})
+		if n > 0 && removeFromSrc {
+			src.pipe.consumeLocked(n)
+		}
+		return uint64(n), err
 	})
+	dst.pipe.mu.Unlock()
+	src.pipe.mu.Unlock()
+
 	if n > 0 {
-		dst.pipe.Notify(waiter.EventIn)
-		src.pipe.Notify(waiter.EventOut)
+		dst.pipe.Notify(waiter.ReadableEvents)
+		if removeFromSrc {
+			src.pipe.Notify(waiter.WritableEvents)
+		}
 	}
 	return n, err
-}
-
-// LockPOSIX implements vfs.FileDescriptionImpl.LockPOSIX.
-func (fd *VFSPipeFD) LockPOSIX(ctx context.Context, uid fslock.UniqueID, t fslock.LockType, start, length uint64, whence int16, block fslock.Blocker) error {
-	return fd.Locks().LockPOSIX(ctx, &fd.vfsfd, uid, t, start, length, whence, block)
-}
-
-// UnlockPOSIX implements vfs.FileDescriptionImpl.UnlockPOSIX.
-func (fd *VFSPipeFD) UnlockPOSIX(ctx context.Context, uid fslock.UniqueID, start, length uint64, whence int16) error {
-	return fd.Locks().UnlockPOSIX(ctx, &fd.vfsfd, uid, start, length, whence)
 }

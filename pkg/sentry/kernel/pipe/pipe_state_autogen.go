@@ -19,6 +19,7 @@ func (i *inodeOperations) StateFields() []string {
 
 func (i *inodeOperations) beforeSave() {}
 
+// +checklocksignore
 func (i *inodeOperations) StateSave(stateSinkObject state.Sink) {
 	i.beforeSave()
 	stateSinkObject.Save(0, &i.InodeSimpleAttributes)
@@ -27,6 +28,7 @@ func (i *inodeOperations) StateSave(stateSinkObject state.Sink) {
 
 func (i *inodeOperations) afterLoad() {}
 
+// +checklocksignore
 func (i *inodeOperations) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &i.InodeSimpleAttributes)
 	stateSourceObject.Load(1, &i.p)
@@ -41,7 +43,9 @@ func (p *Pipe) StateFields() []string {
 		"isNamed",
 		"readers",
 		"writers",
-		"view",
+		"buf",
+		"off",
+		"size",
 		"max",
 		"hadWriter",
 	}
@@ -49,25 +53,30 @@ func (p *Pipe) StateFields() []string {
 
 func (p *Pipe) beforeSave() {}
 
+// +checklocksignore
 func (p *Pipe) StateSave(stateSinkObject state.Sink) {
 	p.beforeSave()
 	stateSinkObject.Save(0, &p.isNamed)
 	stateSinkObject.Save(1, &p.readers)
 	stateSinkObject.Save(2, &p.writers)
-	stateSinkObject.Save(3, &p.view)
-	stateSinkObject.Save(4, &p.max)
-	stateSinkObject.Save(5, &p.hadWriter)
+	stateSinkObject.Save(3, &p.buf)
+	stateSinkObject.Save(4, &p.off)
+	stateSinkObject.Save(5, &p.size)
+	stateSinkObject.Save(6, &p.max)
+	stateSinkObject.Save(7, &p.hadWriter)
 }
 
-func (p *Pipe) afterLoad() {}
-
+// +checklocksignore
 func (p *Pipe) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &p.isNamed)
 	stateSourceObject.Load(1, &p.readers)
 	stateSourceObject.Load(2, &p.writers)
-	stateSourceObject.Load(3, &p.view)
-	stateSourceObject.Load(4, &p.max)
-	stateSourceObject.Load(5, &p.hadWriter)
+	stateSourceObject.Load(3, &p.buf)
+	stateSourceObject.Load(4, &p.off)
+	stateSourceObject.Load(5, &p.size)
+	stateSourceObject.Load(6, &p.max)
+	stateSourceObject.Load(7, &p.hadWriter)
+	stateSourceObject.AfterLoad(p.afterLoad)
 }
 
 func (r *Reader) StateTypeName() string {
@@ -82,6 +91,7 @@ func (r *Reader) StateFields() []string {
 
 func (r *Reader) beforeSave() {}
 
+// +checklocksignore
 func (r *Reader) StateSave(stateSinkObject state.Sink) {
 	r.beforeSave()
 	stateSinkObject.Save(0, &r.ReaderWriter)
@@ -89,6 +99,7 @@ func (r *Reader) StateSave(stateSinkObject state.Sink) {
 
 func (r *Reader) afterLoad() {}
 
+// +checklocksignore
 func (r *Reader) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &r.ReaderWriter)
 }
@@ -105,6 +116,7 @@ func (rw *ReaderWriter) StateFields() []string {
 
 func (rw *ReaderWriter) beforeSave() {}
 
+// +checklocksignore
 func (rw *ReaderWriter) StateSave(stateSinkObject state.Sink) {
 	rw.beforeSave()
 	stateSinkObject.Save(0, &rw.Pipe)
@@ -112,6 +124,7 @@ func (rw *ReaderWriter) StateSave(stateSinkObject state.Sink) {
 
 func (rw *ReaderWriter) afterLoad() {}
 
+// +checklocksignore
 func (rw *ReaderWriter) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &rw.Pipe)
 }
@@ -128,6 +141,7 @@ func (vp *VFSPipe) StateFields() []string {
 
 func (vp *VFSPipe) beforeSave() {}
 
+// +checklocksignore
 func (vp *VFSPipe) StateSave(stateSinkObject state.Sink) {
 	vp.beforeSave()
 	stateSinkObject.Save(0, &vp.pipe)
@@ -135,6 +149,7 @@ func (vp *VFSPipe) StateSave(stateSinkObject state.Sink) {
 
 func (vp *VFSPipe) afterLoad() {}
 
+// +checklocksignore
 func (vp *VFSPipe) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &vp.pipe)
 }
@@ -155,6 +170,7 @@ func (fd *VFSPipeFD) StateFields() []string {
 
 func (fd *VFSPipeFD) beforeSave() {}
 
+// +checklocksignore
 func (fd *VFSPipeFD) StateSave(stateSinkObject state.Sink) {
 	fd.beforeSave()
 	stateSinkObject.Save(0, &fd.vfsfd)
@@ -166,6 +182,7 @@ func (fd *VFSPipeFD) StateSave(stateSinkObject state.Sink) {
 
 func (fd *VFSPipeFD) afterLoad() {}
 
+// +checklocksignore
 func (fd *VFSPipeFD) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &fd.vfsfd)
 	stateSourceObject.Load(1, &fd.FileDescriptionDefaultImpl)
@@ -186,6 +203,7 @@ func (w *Writer) StateFields() []string {
 
 func (w *Writer) beforeSave() {}
 
+// +checklocksignore
 func (w *Writer) StateSave(stateSinkObject state.Sink) {
 	w.beforeSave()
 	stateSinkObject.Save(0, &w.ReaderWriter)
@@ -193,6 +211,7 @@ func (w *Writer) StateSave(stateSinkObject state.Sink) {
 
 func (w *Writer) afterLoad() {}
 
+// +checklocksignore
 func (w *Writer) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &w.ReaderWriter)
 }

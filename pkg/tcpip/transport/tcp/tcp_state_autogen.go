@@ -28,6 +28,7 @@ func (c *cubicState) StateFields() []string {
 
 func (c *cubicState) beforeSave() {}
 
+// +checklocksignore
 func (c *cubicState) StateSave(stateSinkObject state.Sink) {
 	c.beforeSave()
 	var tValue unixTime = c.saveT()
@@ -45,6 +46,7 @@ func (c *cubicState) StateSave(stateSinkObject state.Sink) {
 
 func (c *cubicState) afterLoad() {}
 
+// +checklocksignore
 func (c *cubicState) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &c.wLastMax)
 	stateSourceObject.Load(1, &c.wMax)
@@ -71,6 +73,7 @@ func (s *SACKInfo) StateFields() []string {
 
 func (s *SACKInfo) beforeSave() {}
 
+// +checklocksignore
 func (s *SACKInfo) StateSave(stateSinkObject state.Sink) {
 	s.beforeSave()
 	stateSinkObject.Save(0, &s.Blocks)
@@ -79,6 +82,7 @@ func (s *SACKInfo) StateSave(stateSinkObject state.Sink) {
 
 func (s *SACKInfo) afterLoad() {}
 
+// +checklocksignore
 func (s *SACKInfo) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &s.Blocks)
 	stateSourceObject.Load(1, &s.NumBlocks)
@@ -102,6 +106,7 @@ func (r *rcvBufAutoTuneParams) StateFields() []string {
 
 func (r *rcvBufAutoTuneParams) beforeSave() {}
 
+// +checklocksignore
 func (r *rcvBufAutoTuneParams) StateSave(stateSinkObject state.Sink) {
 	r.beforeSave()
 	var measureTimeValue unixTime = r.saveMeasureTime()
@@ -117,6 +122,7 @@ func (r *rcvBufAutoTuneParams) StateSave(stateSinkObject state.Sink) {
 
 func (r *rcvBufAutoTuneParams) afterLoad() {}
 
+// +checklocksignore
 func (r *rcvBufAutoTuneParams) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(1, &r.copied)
 	stateSourceObject.Load(2, &r.prevCopied)
@@ -134,24 +140,22 @@ func (e *EndpointInfo) StateTypeName() string {
 func (e *EndpointInfo) StateFields() []string {
 	return []string{
 		"TransportEndpointInfo",
-		"HardError",
 	}
 }
 
 func (e *EndpointInfo) beforeSave() {}
 
+// +checklocksignore
 func (e *EndpointInfo) StateSave(stateSinkObject state.Sink) {
 	e.beforeSave()
-	var HardErrorValue string = e.saveHardError()
-	stateSinkObject.SaveValue(1, HardErrorValue)
 	stateSinkObject.Save(0, &e.TransportEndpointInfo)
 }
 
 func (e *EndpointInfo) afterLoad() {}
 
+// +checklocksignore
 func (e *EndpointInfo) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &e.TransportEndpointInfo)
-	stateSourceObject.LoadValue(1, new(string), func(y interface{}) { e.loadHardError(y.(string)) })
 }
 
 func (e *endpoint) StateTypeName() string {
@@ -161,8 +165,10 @@ func (e *endpoint) StateTypeName() string {
 func (e *endpoint) StateFields() []string {
 	return []string{
 		"EndpointInfo",
+		"DefaultSocketOptionsHandler",
 		"waiterQueue",
 		"uniqueID",
+		"hardError",
 		"lastError",
 		"rcvList",
 		"rcvClosed",
@@ -174,7 +180,6 @@ func (e *endpoint) StateFields() []string {
 		"state",
 		"boundNICID",
 		"ttl",
-		"v6only",
 		"isConnectNotified",
 		"portFlags",
 		"boundBindToDevice",
@@ -188,19 +193,16 @@ func (e *endpoint) StateFields() []string {
 		"recentTSTime",
 		"tsOffset",
 		"shutdownFlags",
+		"tcpRecovery",
 		"sackPermitted",
 		"sack",
-		"bindToDevice",
 		"delay",
-		"cork",
 		"scoreboard",
-		"slowAck",
 		"segmentQueue",
 		"synRcvdCount",
 		"userMSS",
 		"maxSynRetries",
 		"windowClamp",
-		"sndBufSize",
 		"sndBufUsed",
 		"sndClosed",
 		"sndBufInQueue",
@@ -222,148 +224,146 @@ func (e *endpoint) StateFields() []string {
 		"closed",
 		"txHash",
 		"owner",
-		"linger",
 		"ops",
+		"lastOutOfWindowAckTime",
 	}
 }
 
+// +checklocksignore
 func (e *endpoint) StateSave(stateSinkObject state.Sink) {
 	e.beforeSave()
-	var lastErrorValue string = e.saveLastError()
-	stateSinkObject.SaveValue(3, lastErrorValue)
 	var stateValue EndpointState = e.saveState()
-	stateSinkObject.SaveValue(11, stateValue)
+	stateSinkObject.SaveValue(13, stateValue)
 	var recentTSTimeValue unixTime = e.saveRecentTSTime()
-	stateSinkObject.SaveValue(25, recentTSTimeValue)
+	stateSinkObject.SaveValue(26, recentTSTimeValue)
 	var acceptedChanValue []*endpoint = e.saveAcceptedChan()
-	stateSinkObject.SaveValue(51, acceptedChanValue)
+	stateSinkObject.SaveValue(49, acceptedChanValue)
+	var lastOutOfWindowAckTimeValue unixTime = e.saveLastOutOfWindowAckTime()
+	stateSinkObject.SaveValue(61, lastOutOfWindowAckTimeValue)
 	stateSinkObject.Save(0, &e.EndpointInfo)
-	stateSinkObject.Save(1, &e.waiterQueue)
-	stateSinkObject.Save(2, &e.uniqueID)
-	stateSinkObject.Save(4, &e.rcvList)
-	stateSinkObject.Save(5, &e.rcvClosed)
-	stateSinkObject.Save(6, &e.rcvBufSize)
-	stateSinkObject.Save(7, &e.rcvBufUsed)
-	stateSinkObject.Save(8, &e.rcvAutoParams)
-	stateSinkObject.Save(9, &e.rcvMemUsed)
-	stateSinkObject.Save(10, &e.ownedByUser)
-	stateSinkObject.Save(12, &e.boundNICID)
-	stateSinkObject.Save(13, &e.ttl)
-	stateSinkObject.Save(14, &e.v6only)
-	stateSinkObject.Save(15, &e.isConnectNotified)
-	stateSinkObject.Save(16, &e.portFlags)
-	stateSinkObject.Save(17, &e.boundBindToDevice)
-	stateSinkObject.Save(18, &e.boundPortFlags)
-	stateSinkObject.Save(19, &e.boundDest)
-	stateSinkObject.Save(20, &e.effectiveNetProtos)
-	stateSinkObject.Save(21, &e.workerRunning)
-	stateSinkObject.Save(22, &e.workerCleanup)
-	stateSinkObject.Save(23, &e.sendTSOk)
-	stateSinkObject.Save(24, &e.recentTS)
-	stateSinkObject.Save(26, &e.tsOffset)
-	stateSinkObject.Save(27, &e.shutdownFlags)
-	stateSinkObject.Save(28, &e.sackPermitted)
-	stateSinkObject.Save(29, &e.sack)
-	stateSinkObject.Save(30, &e.bindToDevice)
-	stateSinkObject.Save(31, &e.delay)
-	stateSinkObject.Save(32, &e.cork)
+	stateSinkObject.Save(1, &e.DefaultSocketOptionsHandler)
+	stateSinkObject.Save(2, &e.waiterQueue)
+	stateSinkObject.Save(3, &e.uniqueID)
+	stateSinkObject.Save(4, &e.hardError)
+	stateSinkObject.Save(5, &e.lastError)
+	stateSinkObject.Save(6, &e.rcvList)
+	stateSinkObject.Save(7, &e.rcvClosed)
+	stateSinkObject.Save(8, &e.rcvBufSize)
+	stateSinkObject.Save(9, &e.rcvBufUsed)
+	stateSinkObject.Save(10, &e.rcvAutoParams)
+	stateSinkObject.Save(11, &e.rcvMemUsed)
+	stateSinkObject.Save(12, &e.ownedByUser)
+	stateSinkObject.Save(14, &e.boundNICID)
+	stateSinkObject.Save(15, &e.ttl)
+	stateSinkObject.Save(16, &e.isConnectNotified)
+	stateSinkObject.Save(17, &e.portFlags)
+	stateSinkObject.Save(18, &e.boundBindToDevice)
+	stateSinkObject.Save(19, &e.boundPortFlags)
+	stateSinkObject.Save(20, &e.boundDest)
+	stateSinkObject.Save(21, &e.effectiveNetProtos)
+	stateSinkObject.Save(22, &e.workerRunning)
+	stateSinkObject.Save(23, &e.workerCleanup)
+	stateSinkObject.Save(24, &e.sendTSOk)
+	stateSinkObject.Save(25, &e.recentTS)
+	stateSinkObject.Save(27, &e.tsOffset)
+	stateSinkObject.Save(28, &e.shutdownFlags)
+	stateSinkObject.Save(29, &e.tcpRecovery)
+	stateSinkObject.Save(30, &e.sackPermitted)
+	stateSinkObject.Save(31, &e.sack)
+	stateSinkObject.Save(32, &e.delay)
 	stateSinkObject.Save(33, &e.scoreboard)
-	stateSinkObject.Save(34, &e.slowAck)
-	stateSinkObject.Save(35, &e.segmentQueue)
-	stateSinkObject.Save(36, &e.synRcvdCount)
-	stateSinkObject.Save(37, &e.userMSS)
-	stateSinkObject.Save(38, &e.maxSynRetries)
-	stateSinkObject.Save(39, &e.windowClamp)
-	stateSinkObject.Save(40, &e.sndBufSize)
-	stateSinkObject.Save(41, &e.sndBufUsed)
-	stateSinkObject.Save(42, &e.sndClosed)
-	stateSinkObject.Save(43, &e.sndBufInQueue)
-	stateSinkObject.Save(44, &e.sndQueue)
-	stateSinkObject.Save(45, &e.cc)
-	stateSinkObject.Save(46, &e.packetTooBigCount)
-	stateSinkObject.Save(47, &e.sndMTU)
-	stateSinkObject.Save(48, &e.keepalive)
-	stateSinkObject.Save(49, &e.userTimeout)
-	stateSinkObject.Save(50, &e.deferAccept)
-	stateSinkObject.Save(52, &e.rcv)
-	stateSinkObject.Save(53, &e.snd)
-	stateSinkObject.Save(54, &e.connectingAddress)
-	stateSinkObject.Save(55, &e.amss)
-	stateSinkObject.Save(56, &e.sendTOS)
-	stateSinkObject.Save(57, &e.gso)
-	stateSinkObject.Save(58, &e.tcpLingerTimeout)
-	stateSinkObject.Save(59, &e.closed)
-	stateSinkObject.Save(60, &e.txHash)
-	stateSinkObject.Save(61, &e.owner)
-	stateSinkObject.Save(62, &e.linger)
-	stateSinkObject.Save(63, &e.ops)
+	stateSinkObject.Save(34, &e.segmentQueue)
+	stateSinkObject.Save(35, &e.synRcvdCount)
+	stateSinkObject.Save(36, &e.userMSS)
+	stateSinkObject.Save(37, &e.maxSynRetries)
+	stateSinkObject.Save(38, &e.windowClamp)
+	stateSinkObject.Save(39, &e.sndBufUsed)
+	stateSinkObject.Save(40, &e.sndClosed)
+	stateSinkObject.Save(41, &e.sndBufInQueue)
+	stateSinkObject.Save(42, &e.sndQueue)
+	stateSinkObject.Save(43, &e.cc)
+	stateSinkObject.Save(44, &e.packetTooBigCount)
+	stateSinkObject.Save(45, &e.sndMTU)
+	stateSinkObject.Save(46, &e.keepalive)
+	stateSinkObject.Save(47, &e.userTimeout)
+	stateSinkObject.Save(48, &e.deferAccept)
+	stateSinkObject.Save(50, &e.rcv)
+	stateSinkObject.Save(51, &e.snd)
+	stateSinkObject.Save(52, &e.connectingAddress)
+	stateSinkObject.Save(53, &e.amss)
+	stateSinkObject.Save(54, &e.sendTOS)
+	stateSinkObject.Save(55, &e.gso)
+	stateSinkObject.Save(56, &e.tcpLingerTimeout)
+	stateSinkObject.Save(57, &e.closed)
+	stateSinkObject.Save(58, &e.txHash)
+	stateSinkObject.Save(59, &e.owner)
+	stateSinkObject.Save(60, &e.ops)
 }
 
+// +checklocksignore
 func (e *endpoint) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &e.EndpointInfo)
-	stateSourceObject.LoadWait(1, &e.waiterQueue)
-	stateSourceObject.Load(2, &e.uniqueID)
-	stateSourceObject.LoadWait(4, &e.rcvList)
-	stateSourceObject.Load(5, &e.rcvClosed)
-	stateSourceObject.Load(6, &e.rcvBufSize)
-	stateSourceObject.Load(7, &e.rcvBufUsed)
-	stateSourceObject.Load(8, &e.rcvAutoParams)
-	stateSourceObject.Load(9, &e.rcvMemUsed)
-	stateSourceObject.Load(10, &e.ownedByUser)
-	stateSourceObject.Load(12, &e.boundNICID)
-	stateSourceObject.Load(13, &e.ttl)
-	stateSourceObject.Load(14, &e.v6only)
-	stateSourceObject.Load(15, &e.isConnectNotified)
-	stateSourceObject.Load(16, &e.portFlags)
-	stateSourceObject.Load(17, &e.boundBindToDevice)
-	stateSourceObject.Load(18, &e.boundPortFlags)
-	stateSourceObject.Load(19, &e.boundDest)
-	stateSourceObject.Load(20, &e.effectiveNetProtos)
-	stateSourceObject.Load(21, &e.workerRunning)
-	stateSourceObject.Load(22, &e.workerCleanup)
-	stateSourceObject.Load(23, &e.sendTSOk)
-	stateSourceObject.Load(24, &e.recentTS)
-	stateSourceObject.Load(26, &e.tsOffset)
-	stateSourceObject.Load(27, &e.shutdownFlags)
-	stateSourceObject.Load(28, &e.sackPermitted)
-	stateSourceObject.Load(29, &e.sack)
-	stateSourceObject.Load(30, &e.bindToDevice)
-	stateSourceObject.Load(31, &e.delay)
-	stateSourceObject.Load(32, &e.cork)
+	stateSourceObject.Load(1, &e.DefaultSocketOptionsHandler)
+	stateSourceObject.LoadWait(2, &e.waiterQueue)
+	stateSourceObject.Load(3, &e.uniqueID)
+	stateSourceObject.Load(4, &e.hardError)
+	stateSourceObject.Load(5, &e.lastError)
+	stateSourceObject.LoadWait(6, &e.rcvList)
+	stateSourceObject.Load(7, &e.rcvClosed)
+	stateSourceObject.Load(8, &e.rcvBufSize)
+	stateSourceObject.Load(9, &e.rcvBufUsed)
+	stateSourceObject.Load(10, &e.rcvAutoParams)
+	stateSourceObject.Load(11, &e.rcvMemUsed)
+	stateSourceObject.Load(12, &e.ownedByUser)
+	stateSourceObject.Load(14, &e.boundNICID)
+	stateSourceObject.Load(15, &e.ttl)
+	stateSourceObject.Load(16, &e.isConnectNotified)
+	stateSourceObject.Load(17, &e.portFlags)
+	stateSourceObject.Load(18, &e.boundBindToDevice)
+	stateSourceObject.Load(19, &e.boundPortFlags)
+	stateSourceObject.Load(20, &e.boundDest)
+	stateSourceObject.Load(21, &e.effectiveNetProtos)
+	stateSourceObject.Load(22, &e.workerRunning)
+	stateSourceObject.Load(23, &e.workerCleanup)
+	stateSourceObject.Load(24, &e.sendTSOk)
+	stateSourceObject.Load(25, &e.recentTS)
+	stateSourceObject.Load(27, &e.tsOffset)
+	stateSourceObject.Load(28, &e.shutdownFlags)
+	stateSourceObject.Load(29, &e.tcpRecovery)
+	stateSourceObject.Load(30, &e.sackPermitted)
+	stateSourceObject.Load(31, &e.sack)
+	stateSourceObject.Load(32, &e.delay)
 	stateSourceObject.Load(33, &e.scoreboard)
-	stateSourceObject.Load(34, &e.slowAck)
-	stateSourceObject.LoadWait(35, &e.segmentQueue)
-	stateSourceObject.Load(36, &e.synRcvdCount)
-	stateSourceObject.Load(37, &e.userMSS)
-	stateSourceObject.Load(38, &e.maxSynRetries)
-	stateSourceObject.Load(39, &e.windowClamp)
-	stateSourceObject.Load(40, &e.sndBufSize)
-	stateSourceObject.Load(41, &e.sndBufUsed)
-	stateSourceObject.Load(42, &e.sndClosed)
-	stateSourceObject.Load(43, &e.sndBufInQueue)
-	stateSourceObject.LoadWait(44, &e.sndQueue)
-	stateSourceObject.Load(45, &e.cc)
-	stateSourceObject.Load(46, &e.packetTooBigCount)
-	stateSourceObject.Load(47, &e.sndMTU)
-	stateSourceObject.Load(48, &e.keepalive)
-	stateSourceObject.Load(49, &e.userTimeout)
-	stateSourceObject.Load(50, &e.deferAccept)
-	stateSourceObject.LoadWait(52, &e.rcv)
-	stateSourceObject.LoadWait(53, &e.snd)
-	stateSourceObject.Load(54, &e.connectingAddress)
-	stateSourceObject.Load(55, &e.amss)
-	stateSourceObject.Load(56, &e.sendTOS)
-	stateSourceObject.Load(57, &e.gso)
-	stateSourceObject.Load(58, &e.tcpLingerTimeout)
-	stateSourceObject.Load(59, &e.closed)
-	stateSourceObject.Load(60, &e.txHash)
-	stateSourceObject.Load(61, &e.owner)
-	stateSourceObject.Load(62, &e.linger)
-	stateSourceObject.Load(63, &e.ops)
-	stateSourceObject.LoadValue(3, new(string), func(y interface{}) { e.loadLastError(y.(string)) })
-	stateSourceObject.LoadValue(11, new(EndpointState), func(y interface{}) { e.loadState(y.(EndpointState)) })
-	stateSourceObject.LoadValue(25, new(unixTime), func(y interface{}) { e.loadRecentTSTime(y.(unixTime)) })
-	stateSourceObject.LoadValue(51, new([]*endpoint), func(y interface{}) { e.loadAcceptedChan(y.([]*endpoint)) })
+	stateSourceObject.LoadWait(34, &e.segmentQueue)
+	stateSourceObject.Load(35, &e.synRcvdCount)
+	stateSourceObject.Load(36, &e.userMSS)
+	stateSourceObject.Load(37, &e.maxSynRetries)
+	stateSourceObject.Load(38, &e.windowClamp)
+	stateSourceObject.Load(39, &e.sndBufUsed)
+	stateSourceObject.Load(40, &e.sndClosed)
+	stateSourceObject.Load(41, &e.sndBufInQueue)
+	stateSourceObject.LoadWait(42, &e.sndQueue)
+	stateSourceObject.Load(43, &e.cc)
+	stateSourceObject.Load(44, &e.packetTooBigCount)
+	stateSourceObject.Load(45, &e.sndMTU)
+	stateSourceObject.Load(46, &e.keepalive)
+	stateSourceObject.Load(47, &e.userTimeout)
+	stateSourceObject.Load(48, &e.deferAccept)
+	stateSourceObject.LoadWait(50, &e.rcv)
+	stateSourceObject.LoadWait(51, &e.snd)
+	stateSourceObject.Load(52, &e.connectingAddress)
+	stateSourceObject.Load(53, &e.amss)
+	stateSourceObject.Load(54, &e.sendTOS)
+	stateSourceObject.Load(55, &e.gso)
+	stateSourceObject.Load(56, &e.tcpLingerTimeout)
+	stateSourceObject.Load(57, &e.closed)
+	stateSourceObject.Load(58, &e.txHash)
+	stateSourceObject.Load(59, &e.owner)
+	stateSourceObject.Load(60, &e.ops)
+	stateSourceObject.LoadValue(13, new(EndpointState), func(y interface{}) { e.loadState(y.(EndpointState)) })
+	stateSourceObject.LoadValue(26, new(unixTime), func(y interface{}) { e.loadRecentTSTime(y.(unixTime)) })
+	stateSourceObject.LoadValue(49, new([]*endpoint), func(y interface{}) { e.loadAcceptedChan(y.([]*endpoint)) })
+	stateSourceObject.LoadValue(61, new(unixTime), func(y interface{}) { e.loadLastOutOfWindowAckTime(y.(unixTime)) })
 	stateSourceObject.AfterLoad(e.afterLoad)
 }
 
@@ -373,7 +373,6 @@ func (k *keepalive) StateTypeName() string {
 
 func (k *keepalive) StateFields() []string {
 	return []string{
-		"enabled",
 		"idle",
 		"interval",
 		"count",
@@ -383,23 +382,23 @@ func (k *keepalive) StateFields() []string {
 
 func (k *keepalive) beforeSave() {}
 
+// +checklocksignore
 func (k *keepalive) StateSave(stateSinkObject state.Sink) {
 	k.beforeSave()
-	stateSinkObject.Save(0, &k.enabled)
-	stateSinkObject.Save(1, &k.idle)
-	stateSinkObject.Save(2, &k.interval)
-	stateSinkObject.Save(3, &k.count)
-	stateSinkObject.Save(4, &k.unacked)
+	stateSinkObject.Save(0, &k.idle)
+	stateSinkObject.Save(1, &k.interval)
+	stateSinkObject.Save(2, &k.count)
+	stateSinkObject.Save(3, &k.unacked)
 }
 
 func (k *keepalive) afterLoad() {}
 
+// +checklocksignore
 func (k *keepalive) StateLoad(stateSourceObject state.Source) {
-	stateSourceObject.Load(0, &k.enabled)
-	stateSourceObject.Load(1, &k.idle)
-	stateSourceObject.Load(2, &k.interval)
-	stateSourceObject.Load(3, &k.count)
-	stateSourceObject.Load(4, &k.unacked)
+	stateSourceObject.Load(0, &k.idle)
+	stateSourceObject.Load(1, &k.interval)
+	stateSourceObject.Load(2, &k.count)
+	stateSourceObject.Load(3, &k.unacked)
 }
 
 func (rc *rackControl) StateTypeName() string {
@@ -410,38 +409,64 @@ func (rc *rackControl) StateFields() []string {
 	return []string{
 		"dsackSeen",
 		"endSequence",
+		"exitedRecovery",
 		"fack",
 		"minRTT",
-		"rtt",
 		"reorderSeen",
+		"reoWnd",
+		"reoWndIncr",
+		"reoWndPersist",
+		"rtt",
+		"rttSeq",
 		"xmitTime",
+		"tlpRxtOut",
+		"tlpHighRxt",
+		"snd",
 	}
 }
 
 func (rc *rackControl) beforeSave() {}
 
+// +checklocksignore
 func (rc *rackControl) StateSave(stateSinkObject state.Sink) {
 	rc.beforeSave()
 	var xmitTimeValue unixTime = rc.saveXmitTime()
-	stateSinkObject.SaveValue(6, xmitTimeValue)
+	stateSinkObject.SaveValue(11, xmitTimeValue)
 	stateSinkObject.Save(0, &rc.dsackSeen)
 	stateSinkObject.Save(1, &rc.endSequence)
-	stateSinkObject.Save(2, &rc.fack)
-	stateSinkObject.Save(3, &rc.minRTT)
-	stateSinkObject.Save(4, &rc.rtt)
+	stateSinkObject.Save(2, &rc.exitedRecovery)
+	stateSinkObject.Save(3, &rc.fack)
+	stateSinkObject.Save(4, &rc.minRTT)
 	stateSinkObject.Save(5, &rc.reorderSeen)
+	stateSinkObject.Save(6, &rc.reoWnd)
+	stateSinkObject.Save(7, &rc.reoWndIncr)
+	stateSinkObject.Save(8, &rc.reoWndPersist)
+	stateSinkObject.Save(9, &rc.rtt)
+	stateSinkObject.Save(10, &rc.rttSeq)
+	stateSinkObject.Save(12, &rc.tlpRxtOut)
+	stateSinkObject.Save(13, &rc.tlpHighRxt)
+	stateSinkObject.Save(14, &rc.snd)
 }
 
 func (rc *rackControl) afterLoad() {}
 
+// +checklocksignore
 func (rc *rackControl) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &rc.dsackSeen)
 	stateSourceObject.Load(1, &rc.endSequence)
-	stateSourceObject.Load(2, &rc.fack)
-	stateSourceObject.Load(3, &rc.minRTT)
-	stateSourceObject.Load(4, &rc.rtt)
+	stateSourceObject.Load(2, &rc.exitedRecovery)
+	stateSourceObject.Load(3, &rc.fack)
+	stateSourceObject.Load(4, &rc.minRTT)
 	stateSourceObject.Load(5, &rc.reorderSeen)
-	stateSourceObject.LoadValue(6, new(unixTime), func(y interface{}) { rc.loadXmitTime(y.(unixTime)) })
+	stateSourceObject.Load(6, &rc.reoWnd)
+	stateSourceObject.Load(7, &rc.reoWndIncr)
+	stateSourceObject.Load(8, &rc.reoWndPersist)
+	stateSourceObject.Load(9, &rc.rtt)
+	stateSourceObject.Load(10, &rc.rttSeq)
+	stateSourceObject.Load(12, &rc.tlpRxtOut)
+	stateSourceObject.Load(13, &rc.tlpHighRxt)
+	stateSourceObject.Load(14, &rc.snd)
+	stateSourceObject.LoadValue(11, new(unixTime), func(y interface{}) { rc.loadXmitTime(y.(unixTime)) })
 }
 
 func (r *receiver) StateTypeName() string {
@@ -456,6 +481,7 @@ func (r *receiver) StateFields() []string {
 		"rcvWnd",
 		"rcvWUP",
 		"rcvWndScale",
+		"prevBufUsed",
 		"closed",
 		"pendingRcvdSegments",
 		"pendingBufUsed",
@@ -465,23 +491,26 @@ func (r *receiver) StateFields() []string {
 
 func (r *receiver) beforeSave() {}
 
+// +checklocksignore
 func (r *receiver) StateSave(stateSinkObject state.Sink) {
 	r.beforeSave()
 	var lastRcvdAckTimeValue unixTime = r.saveLastRcvdAckTime()
-	stateSinkObject.SaveValue(9, lastRcvdAckTimeValue)
+	stateSinkObject.SaveValue(10, lastRcvdAckTimeValue)
 	stateSinkObject.Save(0, &r.ep)
 	stateSinkObject.Save(1, &r.rcvNxt)
 	stateSinkObject.Save(2, &r.rcvAcc)
 	stateSinkObject.Save(3, &r.rcvWnd)
 	stateSinkObject.Save(4, &r.rcvWUP)
 	stateSinkObject.Save(5, &r.rcvWndScale)
-	stateSinkObject.Save(6, &r.closed)
-	stateSinkObject.Save(7, &r.pendingRcvdSegments)
-	stateSinkObject.Save(8, &r.pendingBufUsed)
+	stateSinkObject.Save(6, &r.prevBufUsed)
+	stateSinkObject.Save(7, &r.closed)
+	stateSinkObject.Save(8, &r.pendingRcvdSegments)
+	stateSinkObject.Save(9, &r.pendingBufUsed)
 }
 
 func (r *receiver) afterLoad() {}
 
+// +checklocksignore
 func (r *receiver) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &r.ep)
 	stateSourceObject.Load(1, &r.rcvNxt)
@@ -489,10 +518,11 @@ func (r *receiver) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(3, &r.rcvWnd)
 	stateSourceObject.Load(4, &r.rcvWUP)
 	stateSourceObject.Load(5, &r.rcvWndScale)
-	stateSourceObject.Load(6, &r.closed)
-	stateSourceObject.Load(7, &r.pendingRcvdSegments)
-	stateSourceObject.Load(8, &r.pendingBufUsed)
-	stateSourceObject.LoadValue(9, new(unixTime), func(y interface{}) { r.loadLastRcvdAckTime(y.(unixTime)) })
+	stateSourceObject.Load(6, &r.prevBufUsed)
+	stateSourceObject.Load(7, &r.closed)
+	stateSourceObject.Load(8, &r.pendingRcvdSegments)
+	stateSourceObject.Load(9, &r.pendingBufUsed)
+	stateSourceObject.LoadValue(10, new(unixTime), func(y interface{}) { r.loadLastRcvdAckTime(y.(unixTime)) })
 }
 
 func (r *renoState) StateTypeName() string {
@@ -507,6 +537,7 @@ func (r *renoState) StateFields() []string {
 
 func (r *renoState) beforeSave() {}
 
+// +checklocksignore
 func (r *renoState) StateSave(stateSinkObject state.Sink) {
 	r.beforeSave()
 	stateSinkObject.Save(0, &r.s)
@@ -514,8 +545,59 @@ func (r *renoState) StateSave(stateSinkObject state.Sink) {
 
 func (r *renoState) afterLoad() {}
 
+// +checklocksignore
 func (r *renoState) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &r.s)
+}
+
+func (rr *renoRecovery) StateTypeName() string {
+	return "pkg/tcpip/transport/tcp.renoRecovery"
+}
+
+func (rr *renoRecovery) StateFields() []string {
+	return []string{
+		"s",
+	}
+}
+
+func (rr *renoRecovery) beforeSave() {}
+
+// +checklocksignore
+func (rr *renoRecovery) StateSave(stateSinkObject state.Sink) {
+	rr.beforeSave()
+	stateSinkObject.Save(0, &rr.s)
+}
+
+func (rr *renoRecovery) afterLoad() {}
+
+// +checklocksignore
+func (rr *renoRecovery) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &rr.s)
+}
+
+func (sr *sackRecovery) StateTypeName() string {
+	return "pkg/tcpip/transport/tcp.sackRecovery"
+}
+
+func (sr *sackRecovery) StateFields() []string {
+	return []string{
+		"s",
+	}
+}
+
+func (sr *sackRecovery) beforeSave() {}
+
+// +checklocksignore
+func (sr *sackRecovery) StateSave(stateSinkObject state.Sink) {
+	sr.beforeSave()
+	stateSinkObject.Save(0, &sr.s)
+}
+
+func (sr *sackRecovery) afterLoad() {}
+
+// +checklocksignore
+func (sr *sackRecovery) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &sr.s)
 }
 
 func (s *SACKScoreboard) StateTypeName() string {
@@ -531,6 +613,7 @@ func (s *SACKScoreboard) StateFields() []string {
 
 func (s *SACKScoreboard) beforeSave() {}
 
+// +checklocksignore
 func (s *SACKScoreboard) StateSave(stateSinkObject state.Sink) {
 	s.beforeSave()
 	stateSinkObject.Save(0, &s.smss)
@@ -539,6 +622,7 @@ func (s *SACKScoreboard) StateSave(stateSinkObject state.Sink) {
 
 func (s *SACKScoreboard) afterLoad() {}
 
+// +checklocksignore
 func (s *SACKScoreboard) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &s.smss)
 	stateSourceObject.Load(1, &s.maxSACKED)
@@ -558,10 +642,8 @@ func (s *segment) StateFields() []string {
 		"dstAddr",
 		"netProto",
 		"nicID",
-		"remoteLinkAddr",
 		"data",
 		"hdr",
-		"viewToDeliver",
 		"sequenceNumber",
 		"ackNumber",
 		"flags",
@@ -575,21 +657,24 @@ func (s *segment) StateFields() []string {
 		"xmitTime",
 		"xmitCount",
 		"acked",
+		"dataMemSize",
+		"lost",
 	}
 }
 
 func (s *segment) beforeSave() {}
 
+// +checklocksignore
 func (s *segment) StateSave(stateSinkObject state.Sink) {
 	s.beforeSave()
 	var dataValue buffer.VectorisedView = s.saveData()
-	stateSinkObject.SaveValue(9, dataValue)
+	stateSinkObject.SaveValue(8, dataValue)
 	var optionsValue []byte = s.saveOptions()
-	stateSinkObject.SaveValue(19, optionsValue)
+	stateSinkObject.SaveValue(17, optionsValue)
 	var rcvdTimeValue unixTime = s.saveRcvdTime()
-	stateSinkObject.SaveValue(21, rcvdTimeValue)
+	stateSinkObject.SaveValue(19, rcvdTimeValue)
 	var xmitTimeValue unixTime = s.saveXmitTime()
-	stateSinkObject.SaveValue(22, xmitTimeValue)
+	stateSinkObject.SaveValue(20, xmitTimeValue)
 	stateSinkObject.Save(0, &s.segmentEntry)
 	stateSinkObject.Save(1, &s.refCnt)
 	stateSinkObject.Save(2, &s.ep)
@@ -598,23 +683,24 @@ func (s *segment) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(5, &s.dstAddr)
 	stateSinkObject.Save(6, &s.netProto)
 	stateSinkObject.Save(7, &s.nicID)
-	stateSinkObject.Save(8, &s.remoteLinkAddr)
-	stateSinkObject.Save(10, &s.hdr)
-	stateSinkObject.Save(11, &s.viewToDeliver)
-	stateSinkObject.Save(12, &s.sequenceNumber)
-	stateSinkObject.Save(13, &s.ackNumber)
-	stateSinkObject.Save(14, &s.flags)
-	stateSinkObject.Save(15, &s.window)
-	stateSinkObject.Save(16, &s.csum)
-	stateSinkObject.Save(17, &s.csumValid)
-	stateSinkObject.Save(18, &s.parsedOptions)
-	stateSinkObject.Save(20, &s.hasNewSACKInfo)
-	stateSinkObject.Save(23, &s.xmitCount)
-	stateSinkObject.Save(24, &s.acked)
+	stateSinkObject.Save(9, &s.hdr)
+	stateSinkObject.Save(10, &s.sequenceNumber)
+	stateSinkObject.Save(11, &s.ackNumber)
+	stateSinkObject.Save(12, &s.flags)
+	stateSinkObject.Save(13, &s.window)
+	stateSinkObject.Save(14, &s.csum)
+	stateSinkObject.Save(15, &s.csumValid)
+	stateSinkObject.Save(16, &s.parsedOptions)
+	stateSinkObject.Save(18, &s.hasNewSACKInfo)
+	stateSinkObject.Save(21, &s.xmitCount)
+	stateSinkObject.Save(22, &s.acked)
+	stateSinkObject.Save(23, &s.dataMemSize)
+	stateSinkObject.Save(24, &s.lost)
 }
 
 func (s *segment) afterLoad() {}
 
+// +checklocksignore
 func (s *segment) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &s.segmentEntry)
 	stateSourceObject.Load(1, &s.refCnt)
@@ -624,23 +710,23 @@ func (s *segment) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(5, &s.dstAddr)
 	stateSourceObject.Load(6, &s.netProto)
 	stateSourceObject.Load(7, &s.nicID)
-	stateSourceObject.Load(8, &s.remoteLinkAddr)
-	stateSourceObject.Load(10, &s.hdr)
-	stateSourceObject.Load(11, &s.viewToDeliver)
-	stateSourceObject.Load(12, &s.sequenceNumber)
-	stateSourceObject.Load(13, &s.ackNumber)
-	stateSourceObject.Load(14, &s.flags)
-	stateSourceObject.Load(15, &s.window)
-	stateSourceObject.Load(16, &s.csum)
-	stateSourceObject.Load(17, &s.csumValid)
-	stateSourceObject.Load(18, &s.parsedOptions)
-	stateSourceObject.Load(20, &s.hasNewSACKInfo)
-	stateSourceObject.Load(23, &s.xmitCount)
-	stateSourceObject.Load(24, &s.acked)
-	stateSourceObject.LoadValue(9, new(buffer.VectorisedView), func(y interface{}) { s.loadData(y.(buffer.VectorisedView)) })
-	stateSourceObject.LoadValue(19, new([]byte), func(y interface{}) { s.loadOptions(y.([]byte)) })
-	stateSourceObject.LoadValue(21, new(unixTime), func(y interface{}) { s.loadRcvdTime(y.(unixTime)) })
-	stateSourceObject.LoadValue(22, new(unixTime), func(y interface{}) { s.loadXmitTime(y.(unixTime)) })
+	stateSourceObject.Load(9, &s.hdr)
+	stateSourceObject.Load(10, &s.sequenceNumber)
+	stateSourceObject.Load(11, &s.ackNumber)
+	stateSourceObject.Load(12, &s.flags)
+	stateSourceObject.Load(13, &s.window)
+	stateSourceObject.Load(14, &s.csum)
+	stateSourceObject.Load(15, &s.csumValid)
+	stateSourceObject.Load(16, &s.parsedOptions)
+	stateSourceObject.Load(18, &s.hasNewSACKInfo)
+	stateSourceObject.Load(21, &s.xmitCount)
+	stateSourceObject.Load(22, &s.acked)
+	stateSourceObject.Load(23, &s.dataMemSize)
+	stateSourceObject.Load(24, &s.lost)
+	stateSourceObject.LoadValue(8, new(buffer.VectorisedView), func(y interface{}) { s.loadData(y.(buffer.VectorisedView)) })
+	stateSourceObject.LoadValue(17, new([]byte), func(y interface{}) { s.loadOptions(y.([]byte)) })
+	stateSourceObject.LoadValue(19, new(unixTime), func(y interface{}) { s.loadRcvdTime(y.(unixTime)) })
+	stateSourceObject.LoadValue(20, new(unixTime), func(y interface{}) { s.loadXmitTime(y.(unixTime)) })
 }
 
 func (q *segmentQueue) StateTypeName() string {
@@ -657,6 +743,7 @@ func (q *segmentQueue) StateFields() []string {
 
 func (q *segmentQueue) beforeSave() {}
 
+// +checklocksignore
 func (q *segmentQueue) StateSave(stateSinkObject state.Sink) {
 	q.beforeSave()
 	stateSinkObject.Save(0, &q.list)
@@ -666,6 +753,7 @@ func (q *segmentQueue) StateSave(stateSinkObject state.Sink) {
 
 func (q *segmentQueue) afterLoad() {}
 
+// +checklocksignore
 func (q *segmentQueue) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.LoadWait(0, &q.list)
 	stateSourceObject.Load(1, &q.ep)
@@ -682,10 +770,12 @@ func (s *sender) StateFields() []string {
 		"lastSendTime",
 		"dupAckCount",
 		"fr",
+		"lr",
 		"sndCwnd",
 		"sndSsthresh",
 		"sndCAAckCount",
 		"outstanding",
+		"sackedOut",
 		"sndWnd",
 		"sndUna",
 		"sndNxt",
@@ -712,72 +802,78 @@ func (s *sender) StateFields() []string {
 
 func (s *sender) beforeSave() {}
 
+// +checklocksignore
 func (s *sender) StateSave(stateSinkObject state.Sink) {
 	s.beforeSave()
 	var lastSendTimeValue unixTime = s.saveLastSendTime()
 	stateSinkObject.SaveValue(1, lastSendTimeValue)
 	var rttMeasureTimeValue unixTime = s.saveRttMeasureTime()
-	stateSinkObject.SaveValue(12, rttMeasureTimeValue)
+	stateSinkObject.SaveValue(14, rttMeasureTimeValue)
 	var firstRetransmittedSegXmitTimeValue unixTime = s.saveFirstRetransmittedSegXmitTime()
-	stateSinkObject.SaveValue(13, firstRetransmittedSegXmitTimeValue)
+	stateSinkObject.SaveValue(15, firstRetransmittedSegXmitTimeValue)
 	stateSinkObject.Save(0, &s.ep)
 	stateSinkObject.Save(2, &s.dupAckCount)
 	stateSinkObject.Save(3, &s.fr)
-	stateSinkObject.Save(4, &s.sndCwnd)
-	stateSinkObject.Save(5, &s.sndSsthresh)
-	stateSinkObject.Save(6, &s.sndCAAckCount)
-	stateSinkObject.Save(7, &s.outstanding)
-	stateSinkObject.Save(8, &s.sndWnd)
-	stateSinkObject.Save(9, &s.sndUna)
-	stateSinkObject.Save(10, &s.sndNxt)
-	stateSinkObject.Save(11, &s.rttMeasureSeqNum)
-	stateSinkObject.Save(14, &s.closed)
-	stateSinkObject.Save(15, &s.writeNext)
-	stateSinkObject.Save(16, &s.writeList)
-	stateSinkObject.Save(17, &s.rtt)
-	stateSinkObject.Save(18, &s.rto)
-	stateSinkObject.Save(19, &s.minRTO)
-	stateSinkObject.Save(20, &s.maxRTO)
-	stateSinkObject.Save(21, &s.maxRetries)
-	stateSinkObject.Save(22, &s.maxPayloadSize)
-	stateSinkObject.Save(23, &s.gso)
-	stateSinkObject.Save(24, &s.sndWndScale)
-	stateSinkObject.Save(25, &s.maxSentAck)
-	stateSinkObject.Save(26, &s.state)
-	stateSinkObject.Save(27, &s.cc)
-	stateSinkObject.Save(28, &s.rc)
+	stateSinkObject.Save(4, &s.lr)
+	stateSinkObject.Save(5, &s.sndCwnd)
+	stateSinkObject.Save(6, &s.sndSsthresh)
+	stateSinkObject.Save(7, &s.sndCAAckCount)
+	stateSinkObject.Save(8, &s.outstanding)
+	stateSinkObject.Save(9, &s.sackedOut)
+	stateSinkObject.Save(10, &s.sndWnd)
+	stateSinkObject.Save(11, &s.sndUna)
+	stateSinkObject.Save(12, &s.sndNxt)
+	stateSinkObject.Save(13, &s.rttMeasureSeqNum)
+	stateSinkObject.Save(16, &s.closed)
+	stateSinkObject.Save(17, &s.writeNext)
+	stateSinkObject.Save(18, &s.writeList)
+	stateSinkObject.Save(19, &s.rtt)
+	stateSinkObject.Save(20, &s.rto)
+	stateSinkObject.Save(21, &s.minRTO)
+	stateSinkObject.Save(22, &s.maxRTO)
+	stateSinkObject.Save(23, &s.maxRetries)
+	stateSinkObject.Save(24, &s.maxPayloadSize)
+	stateSinkObject.Save(25, &s.gso)
+	stateSinkObject.Save(26, &s.sndWndScale)
+	stateSinkObject.Save(27, &s.maxSentAck)
+	stateSinkObject.Save(28, &s.state)
+	stateSinkObject.Save(29, &s.cc)
+	stateSinkObject.Save(30, &s.rc)
 }
 
+// +checklocksignore
 func (s *sender) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &s.ep)
 	stateSourceObject.Load(2, &s.dupAckCount)
 	stateSourceObject.Load(3, &s.fr)
-	stateSourceObject.Load(4, &s.sndCwnd)
-	stateSourceObject.Load(5, &s.sndSsthresh)
-	stateSourceObject.Load(6, &s.sndCAAckCount)
-	stateSourceObject.Load(7, &s.outstanding)
-	stateSourceObject.Load(8, &s.sndWnd)
-	stateSourceObject.Load(9, &s.sndUna)
-	stateSourceObject.Load(10, &s.sndNxt)
-	stateSourceObject.Load(11, &s.rttMeasureSeqNum)
-	stateSourceObject.Load(14, &s.closed)
-	stateSourceObject.Load(15, &s.writeNext)
-	stateSourceObject.Load(16, &s.writeList)
-	stateSourceObject.Load(17, &s.rtt)
-	stateSourceObject.Load(18, &s.rto)
-	stateSourceObject.Load(19, &s.minRTO)
-	stateSourceObject.Load(20, &s.maxRTO)
-	stateSourceObject.Load(21, &s.maxRetries)
-	stateSourceObject.Load(22, &s.maxPayloadSize)
-	stateSourceObject.Load(23, &s.gso)
-	stateSourceObject.Load(24, &s.sndWndScale)
-	stateSourceObject.Load(25, &s.maxSentAck)
-	stateSourceObject.Load(26, &s.state)
-	stateSourceObject.Load(27, &s.cc)
-	stateSourceObject.Load(28, &s.rc)
+	stateSourceObject.Load(4, &s.lr)
+	stateSourceObject.Load(5, &s.sndCwnd)
+	stateSourceObject.Load(6, &s.sndSsthresh)
+	stateSourceObject.Load(7, &s.sndCAAckCount)
+	stateSourceObject.Load(8, &s.outstanding)
+	stateSourceObject.Load(9, &s.sackedOut)
+	stateSourceObject.Load(10, &s.sndWnd)
+	stateSourceObject.Load(11, &s.sndUna)
+	stateSourceObject.Load(12, &s.sndNxt)
+	stateSourceObject.Load(13, &s.rttMeasureSeqNum)
+	stateSourceObject.Load(16, &s.closed)
+	stateSourceObject.Load(17, &s.writeNext)
+	stateSourceObject.Load(18, &s.writeList)
+	stateSourceObject.Load(19, &s.rtt)
+	stateSourceObject.Load(20, &s.rto)
+	stateSourceObject.Load(21, &s.minRTO)
+	stateSourceObject.Load(22, &s.maxRTO)
+	stateSourceObject.Load(23, &s.maxRetries)
+	stateSourceObject.Load(24, &s.maxPayloadSize)
+	stateSourceObject.Load(25, &s.gso)
+	stateSourceObject.Load(26, &s.sndWndScale)
+	stateSourceObject.Load(27, &s.maxSentAck)
+	stateSourceObject.Load(28, &s.state)
+	stateSourceObject.Load(29, &s.cc)
+	stateSourceObject.Load(30, &s.rc)
 	stateSourceObject.LoadValue(1, new(unixTime), func(y interface{}) { s.loadLastSendTime(y.(unixTime)) })
-	stateSourceObject.LoadValue(12, new(unixTime), func(y interface{}) { s.loadRttMeasureTime(y.(unixTime)) })
-	stateSourceObject.LoadValue(13, new(unixTime), func(y interface{}) { s.loadFirstRetransmittedSegXmitTime(y.(unixTime)) })
+	stateSourceObject.LoadValue(14, new(unixTime), func(y interface{}) { s.loadRttMeasureTime(y.(unixTime)) })
+	stateSourceObject.LoadValue(15, new(unixTime), func(y interface{}) { s.loadFirstRetransmittedSegXmitTime(y.(unixTime)) })
 	stateSourceObject.AfterLoad(s.afterLoad)
 }
 
@@ -795,6 +891,7 @@ func (r *rtt) StateFields() []string {
 
 func (r *rtt) beforeSave() {}
 
+// +checklocksignore
 func (r *rtt) StateSave(stateSinkObject state.Sink) {
 	r.beforeSave()
 	stateSinkObject.Save(0, &r.srtt)
@@ -804,6 +901,7 @@ func (r *rtt) StateSave(stateSinkObject state.Sink) {
 
 func (r *rtt) afterLoad() {}
 
+// +checklocksignore
 func (r *rtt) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &r.srtt)
 	stateSourceObject.Load(1, &r.rttvar)
@@ -827,6 +925,7 @@ func (f *fastRecovery) StateFields() []string {
 
 func (f *fastRecovery) beforeSave() {}
 
+// +checklocksignore
 func (f *fastRecovery) StateSave(stateSinkObject state.Sink) {
 	f.beforeSave()
 	stateSinkObject.Save(0, &f.active)
@@ -839,6 +938,7 @@ func (f *fastRecovery) StateSave(stateSinkObject state.Sink) {
 
 func (f *fastRecovery) afterLoad() {}
 
+// +checklocksignore
 func (f *fastRecovery) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &f.active)
 	stateSourceObject.Load(1, &f.first)
@@ -861,6 +961,7 @@ func (u *unixTime) StateFields() []string {
 
 func (u *unixTime) beforeSave() {}
 
+// +checklocksignore
 func (u *unixTime) StateSave(stateSinkObject state.Sink) {
 	u.beforeSave()
 	stateSinkObject.Save(0, &u.second)
@@ -869,6 +970,7 @@ func (u *unixTime) StateSave(stateSinkObject state.Sink) {
 
 func (u *unixTime) afterLoad() {}
 
+// +checklocksignore
 func (u *unixTime) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &u.second)
 	stateSourceObject.Load(1, &u.nano)
@@ -887,6 +989,7 @@ func (l *endpointList) StateFields() []string {
 
 func (l *endpointList) beforeSave() {}
 
+// +checklocksignore
 func (l *endpointList) StateSave(stateSinkObject state.Sink) {
 	l.beforeSave()
 	stateSinkObject.Save(0, &l.head)
@@ -895,6 +998,7 @@ func (l *endpointList) StateSave(stateSinkObject state.Sink) {
 
 func (l *endpointList) afterLoad() {}
 
+// +checklocksignore
 func (l *endpointList) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &l.head)
 	stateSourceObject.Load(1, &l.tail)
@@ -913,6 +1017,7 @@ func (e *endpointEntry) StateFields() []string {
 
 func (e *endpointEntry) beforeSave() {}
 
+// +checklocksignore
 func (e *endpointEntry) StateSave(stateSinkObject state.Sink) {
 	e.beforeSave()
 	stateSinkObject.Save(0, &e.next)
@@ -921,6 +1026,7 @@ func (e *endpointEntry) StateSave(stateSinkObject state.Sink) {
 
 func (e *endpointEntry) afterLoad() {}
 
+// +checklocksignore
 func (e *endpointEntry) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &e.next)
 	stateSourceObject.Load(1, &e.prev)
@@ -939,6 +1045,7 @@ func (l *segmentList) StateFields() []string {
 
 func (l *segmentList) beforeSave() {}
 
+// +checklocksignore
 func (l *segmentList) StateSave(stateSinkObject state.Sink) {
 	l.beforeSave()
 	stateSinkObject.Save(0, &l.head)
@@ -947,6 +1054,7 @@ func (l *segmentList) StateSave(stateSinkObject state.Sink) {
 
 func (l *segmentList) afterLoad() {}
 
+// +checklocksignore
 func (l *segmentList) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &l.head)
 	stateSourceObject.Load(1, &l.tail)
@@ -965,6 +1073,7 @@ func (e *segmentEntry) StateFields() []string {
 
 func (e *segmentEntry) beforeSave() {}
 
+// +checklocksignore
 func (e *segmentEntry) StateSave(stateSinkObject state.Sink) {
 	e.beforeSave()
 	stateSinkObject.Save(0, &e.next)
@@ -973,6 +1082,7 @@ func (e *segmentEntry) StateSave(stateSinkObject state.Sink) {
 
 func (e *segmentEntry) afterLoad() {}
 
+// +checklocksignore
 func (e *segmentEntry) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &e.next)
 	stateSourceObject.Load(1, &e.prev)
@@ -988,6 +1098,8 @@ func init() {
 	state.Register((*rackControl)(nil))
 	state.Register((*receiver)(nil))
 	state.Register((*renoState)(nil))
+	state.Register((*renoRecovery)(nil))
+	state.Register((*sackRecovery)(nil))
 	state.Register((*SACKScoreboard)(nil))
 	state.Register((*segment)(nil))
 	state.Register((*segmentQueue)(nil))

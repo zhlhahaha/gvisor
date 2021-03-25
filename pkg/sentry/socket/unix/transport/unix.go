@@ -16,8 +16,6 @@
 package transport
 
 import (
-	"sync/atomic"
-
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/log"
@@ -28,8 +26,16 @@ import (
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
-// initialLimit is the starting limit for the socket buffers.
-const initialLimit = 16 * 1024
+const (
+	// The minimum size of the send/receive buffers.
+	minimumBufferSize = 4 << 10 // 4 KiB (match default in linux)
+
+	// The default size of the send/receive buffers.
+	defaultBufferSize = 208 << 10 // 208 KiB  (default in linux for net.core.wmem_default)
+
+	// The maximum permitted size for the send/receive buffers.
+	maxBufferSize = 4 << 20 // 4 MiB 4 MiB (default in linux for net.core.wmem_max)
+)
 
 // A RightsControlMessage is a control message containing FDs.
 //
@@ -171,42 +177,35 @@ type Endpoint interface {
 	Type() linux.SockType
 
 	// GetLocalAddress returns the address to which the endpoint is bound.
-	GetLocalAddress() (tcpip.FullAddress, *tcpip.Error)
+	GetLocalAddress() (tcpip.FullAddress, tcpip.Error)
 
 	// GetRemoteAddress returns the address to which the endpoint is
 	// connected.
-	GetRemoteAddress() (tcpip.FullAddress, *tcpip.Error)
+	GetRemoteAddress() (tcpip.FullAddress, tcpip.Error)
 
 	// SetSockOpt sets a socket option.
-	SetSockOpt(opt tcpip.SettableSocketOption) *tcpip.Error
-
-	// SetSockOptBool sets a socket option for simple cases when a value has
-	// the int type.
-	SetSockOptBool(opt tcpip.SockOptBool, v bool) *tcpip.Error
+	SetSockOpt(opt tcpip.SettableSocketOption) tcpip.Error
 
 	// SetSockOptInt sets a socket option for simple cases when a value has
 	// the int type.
-	SetSockOptInt(opt tcpip.SockOptInt, v int) *tcpip.Error
+	SetSockOptInt(opt tcpip.SockOptInt, v int) tcpip.Error
 
 	// GetSockOpt gets a socket option.
-	GetSockOpt(opt tcpip.GettableSocketOption) *tcpip.Error
-
-	// GetSockOptBool gets a socket option for simple cases when a return
-	// value has the int type.
-	GetSockOptBool(opt tcpip.SockOptBool) (bool, *tcpip.Error)
+	GetSockOpt(opt tcpip.GettableSocketOption) tcpip.Error
 
 	// GetSockOptInt gets a socket option for simple cases when a return
 	// value has the int type.
-	GetSockOptInt(opt tcpip.SockOptInt) (int, *tcpip.Error)
+	GetSockOptInt(opt tcpip.SockOptInt) (int, tcpip.Error)
 
 	// State returns the current state of the socket, as represented by Linux in
 	// procfs.
 	State() uint32
 
-	// LastError implements tcpip.Endpoint.LastError.
-	LastError() *tcpip.Error
+	// LastError clears and returns the last error reported by the endpoint.
+	LastError() tcpip.Error
 
-	// SocketOptions implements tcpip.Endpoint.SocketOptions.
+	// SocketOptions returns the structure which contains all the socket
+	// level options.
 	SocketOptions() *tcpip.SocketOptions
 }
 
@@ -377,13 +376,13 @@ func (q *queueReceiver) Recv(ctx context.Context, data [][]byte, creds bool, num
 
 // RecvNotify implements Receiver.RecvNotify.
 func (q *queueReceiver) RecvNotify() {
-	q.readQueue.WriterQueue.Notify(waiter.EventOut)
+	q.readQueue.WriterQueue.Notify(waiter.WritableEvents)
 }
 
 // CloseNotify implements Receiver.CloseNotify.
 func (q *queueReceiver) CloseNotify() {
-	q.readQueue.ReaderQueue.Notify(waiter.EventIn)
-	q.readQueue.WriterQueue.Notify(waiter.EventOut)
+	q.readQueue.ReaderQueue.Notify(waiter.ReadableEvents)
+	q.readQueue.WriterQueue.Notify(waiter.WritableEvents)
 }
 
 // CloseRecv implements Receiver.CloseRecv.
@@ -589,7 +588,7 @@ type ConnectedEndpoint interface {
 	Passcred() bool
 
 	// GetLocalAddress implements Endpoint.GetLocalAddress.
-	GetLocalAddress() (tcpip.FullAddress, *tcpip.Error)
+	GetLocalAddress() (tcpip.FullAddress, tcpip.Error)
 
 	// Send sends a single message. This method does not block.
 	//
@@ -636,6 +635,10 @@ type ConnectedEndpoint interface {
 	// CloseUnread sets the fact that this end is closed with unread data to
 	// the peer socket.
 	CloseUnread()
+
+	// SetSendBufferSize is called when the endpoint's send buffer size is
+	// changed.
+	SetSendBufferSize(v int64) (newSz int64)
 }
 
 // +stateify savable
@@ -649,7 +652,7 @@ type connectedEndpoint struct {
 		Passcred() bool
 
 		// GetLocalAddress implements Endpoint.GetLocalAddress.
-		GetLocalAddress() (tcpip.FullAddress, *tcpip.Error)
+		GetLocalAddress() (tcpip.FullAddress, tcpip.Error)
 
 		// Type implements Endpoint.Type.
 		Type() linux.SockType
@@ -664,7 +667,7 @@ func (e *connectedEndpoint) Passcred() bool {
 }
 
 // GetLocalAddress implements ConnectedEndpoint.GetLocalAddress.
-func (e *connectedEndpoint) GetLocalAddress() (tcpip.FullAddress, *tcpip.Error) {
+func (e *connectedEndpoint) GetLocalAddress() (tcpip.FullAddress, tcpip.Error) {
 	return e.endpoint.GetLocalAddress()
 }
 
@@ -689,13 +692,13 @@ func (e *connectedEndpoint) Send(ctx context.Context, data [][]byte, c ControlMe
 
 // SendNotify implements ConnectedEndpoint.SendNotify.
 func (e *connectedEndpoint) SendNotify() {
-	e.writeQueue.ReaderQueue.Notify(waiter.EventIn)
+	e.writeQueue.ReaderQueue.Notify(waiter.ReadableEvents)
 }
 
 // CloseNotify implements ConnectedEndpoint.CloseNotify.
 func (e *connectedEndpoint) CloseNotify() {
-	e.writeQueue.ReaderQueue.Notify(waiter.EventIn)
-	e.writeQueue.WriterQueue.Notify(waiter.EventOut)
+	e.writeQueue.ReaderQueue.Notify(waiter.ReadableEvents)
+	e.writeQueue.WriterQueue.Notify(waiter.WritableEvents)
 }
 
 // CloseSend implements ConnectedEndpoint.CloseSend.
@@ -731,20 +734,28 @@ func (e *connectedEndpoint) CloseUnread() {
 	e.writeQueue.CloseUnread()
 }
 
-// baseEndpoint is an embeddable unix endpoint base used in both the connected and connectionless
-// unix domain socket Endpoint implementations.
+// SetSendBufferSize implements ConnectedEndpoint.SetSendBufferSize.
+// SetSendBufferSize sets the send buffer size for the write queue to the
+// specified value.
+func (e *connectedEndpoint) SetSendBufferSize(v int64) (newSz int64) {
+	e.writeQueue.SetMaxQueueSize(v)
+	return v
+}
+
+// baseEndpoint is an embeddable unix endpoint base used in both the connected
+// and connectionless unix domain socket Endpoint implementations.
 //
 // Not to be used on its own.
 //
 // +stateify savable
 type baseEndpoint struct {
 	*waiter.Queue
-
-	// passcred specifies whether SCM_CREDENTIALS socket control messages are
-	// enabled on this endpoint. Must be accessed atomically.
-	passcred int32
+	tcpip.DefaultSocketOptionsHandler
 
 	// Mutex protects the below fields.
+	//
+	// See the lock ordering comment in package kernel/epoll regarding when
+	// this lock can safely be held.
 	sync.Mutex `state:"nosave"`
 
 	// receiver allows Messages to be received.
@@ -758,9 +769,7 @@ type baseEndpoint struct {
 	// or may be used if the endpoint is connected.
 	path string
 
-	// linger is used for SO_LINGER socket option.
-	linger tcpip.LingerOption
-
+	// ops is used to get socket level options.
 	ops tcpip.SocketOptions
 }
 
@@ -768,25 +777,27 @@ type baseEndpoint struct {
 func (e *baseEndpoint) EventRegister(we *waiter.Entry, mask waiter.EventMask) {
 	e.Queue.EventRegister(we, mask)
 	e.Lock()
-	if e.connected != nil {
-		e.connected.EventUpdate()
-	}
+	c := e.connected
 	e.Unlock()
+	if c != nil {
+		c.EventUpdate()
+	}
 }
 
 // EventUnregister implements waiter.Waitable.EventUnregister.
 func (e *baseEndpoint) EventUnregister(we *waiter.Entry) {
 	e.Queue.EventUnregister(we)
 	e.Lock()
-	if e.connected != nil {
-		e.connected.EventUpdate()
-	}
+	c := e.connected
 	e.Unlock()
+	if c != nil {
+		c.EventUpdate()
+	}
 }
 
 // Passcred implements Credentialer.Passcred.
 func (e *baseEndpoint) Passcred() bool {
-	return atomic.LoadInt32(&e.passcred) != 0
+	return e.SocketOptions().GetPassCred()
 }
 
 // ConnectedPasscred implements Credentialer.ConnectedPasscred.
@@ -794,14 +805,6 @@ func (e *baseEndpoint) ConnectedPasscred() bool {
 	e.Lock()
 	defer e.Unlock()
 	return e.connected != nil && e.connected.Passcred()
-}
-
-func (e *baseEndpoint) setPasscred(pc bool) {
-	if pc {
-		atomic.StoreInt32(&e.passcred, 1)
-	} else {
-		atomic.StoreInt32(&e.passcred, 0)
-	}
 }
 
 // Connected implements ConnectingEndpoint.Connected.
@@ -813,19 +816,20 @@ func (e *baseEndpoint) Connected() bool {
 func (e *baseEndpoint) RecvMsg(ctx context.Context, data [][]byte, creds bool, numRights int, peek bool, addr *tcpip.FullAddress) (int64, int64, ControlMessages, bool, *syserr.Error) {
 	e.Lock()
 
-	if e.receiver == nil {
+	receiver := e.receiver
+	if receiver == nil {
 		e.Unlock()
 		return 0, 0, ControlMessages{}, false, syserr.ErrNotConnected
 	}
 
-	recvLen, msgLen, cms, cmt, a, notify, err := e.receiver.Recv(ctx, data, creds, numRights, peek)
+	recvLen, msgLen, cms, cmt, a, notify, err := receiver.Recv(ctx, data, creds, numRights, peek)
 	e.Unlock()
 	if err != nil {
 		return 0, 0, ControlMessages{}, false, err
 	}
 
 	if notify {
-		e.receiver.RecvNotify()
+		receiver.RecvNotify()
 	}
 
 	if addr != nil {
@@ -847,41 +851,24 @@ func (e *baseEndpoint) SendMsg(ctx context.Context, data [][]byte, c ControlMess
 		return 0, syserr.ErrAlreadyConnected
 	}
 
-	n, notify, err := e.connected.Send(ctx, data, c, tcpip.FullAddress{Addr: tcpip.Address(e.path)})
+	connected := e.connected
+	n, notify, err := connected.Send(ctx, data, c, tcpip.FullAddress{Addr: tcpip.Address(e.path)})
 	e.Unlock()
 
 	if notify {
-		e.connected.SendNotify()
+		connected.SendNotify()
 	}
 
 	return n, err
 }
 
 // SetSockOpt sets a socket option.
-func (e *baseEndpoint) SetSockOpt(opt tcpip.SettableSocketOption) *tcpip.Error {
-	switch v := opt.(type) {
-	case *tcpip.LingerOption:
-		e.Lock()
-		e.linger = *v
-		e.Unlock()
-	}
+func (e *baseEndpoint) SetSockOpt(opt tcpip.SettableSocketOption) tcpip.Error {
 	return nil
 }
 
-func (e *baseEndpoint) SetSockOptBool(opt tcpip.SockOptBool, v bool) *tcpip.Error {
+func (e *baseEndpoint) SetSockOptInt(opt tcpip.SockOptInt, v int) tcpip.Error {
 	switch opt {
-	case tcpip.PasscredOption:
-		e.setPasscred(v)
-	case tcpip.ReuseAddressOption:
-	default:
-		log.Warningf("Unsupported socket option: %d", opt)
-	}
-	return nil
-}
-
-func (e *baseEndpoint) SetSockOptInt(opt tcpip.SockOptInt, v int) *tcpip.Error {
-	switch opt {
-	case tcpip.SendBufferSizeOption:
 	case tcpip.ReceiveBufferSizeOption:
 	default:
 		log.Warningf("Unsupported socket option: %d", opt)
@@ -889,33 +876,19 @@ func (e *baseEndpoint) SetSockOptInt(opt tcpip.SockOptInt, v int) *tcpip.Error {
 	return nil
 }
 
-func (e *baseEndpoint) GetSockOptBool(opt tcpip.SockOptBool) (bool, *tcpip.Error) {
-	switch opt {
-	case tcpip.KeepaliveEnabledOption, tcpip.AcceptConnOption:
-		return false, nil
-
-	case tcpip.PasscredOption:
-		return e.Passcred(), nil
-
-	default:
-		log.Warningf("Unsupported socket option: %d", opt)
-		return false, tcpip.ErrUnknownProtocolOption
-	}
-}
-
-func (e *baseEndpoint) GetSockOptInt(opt tcpip.SockOptInt) (int, *tcpip.Error) {
+func (e *baseEndpoint) GetSockOptInt(opt tcpip.SockOptInt) (int, tcpip.Error) {
 	switch opt {
 	case tcpip.ReceiveQueueSizeOption:
 		v := 0
 		e.Lock()
 		if !e.Connected() {
 			e.Unlock()
-			return -1, tcpip.ErrNotConnected
+			return -1, &tcpip.ErrNotConnected{}
 		}
 		v = int(e.receiver.RecvQueuedSize())
 		e.Unlock()
 		if v < 0 {
-			return -1, tcpip.ErrQueueSizeNotSupported
+			return -1, &tcpip.ErrQueueSizeNotSupported{}
 		}
 		return v, nil
 
@@ -923,25 +896,12 @@ func (e *baseEndpoint) GetSockOptInt(opt tcpip.SockOptInt) (int, *tcpip.Error) {
 		e.Lock()
 		if !e.Connected() {
 			e.Unlock()
-			return -1, tcpip.ErrNotConnected
+			return -1, &tcpip.ErrNotConnected{}
 		}
 		v := e.connected.SendQueuedSize()
 		e.Unlock()
 		if v < 0 {
-			return -1, tcpip.ErrQueueSizeNotSupported
-		}
-		return int(v), nil
-
-	case tcpip.SendBufferSizeOption:
-		e.Lock()
-		if !e.Connected() {
-			e.Unlock()
-			return -1, tcpip.ErrNotConnected
-		}
-		v := e.connected.SendMaxQueueSize()
-		e.Unlock()
-		if v < 0 {
-			return -1, tcpip.ErrQueueSizeNotSupported
+			return -1, &tcpip.ErrQueueSizeNotSupported{}
 		}
 		return int(v), nil
 
@@ -949,38 +909,29 @@ func (e *baseEndpoint) GetSockOptInt(opt tcpip.SockOptInt) (int, *tcpip.Error) {
 		e.Lock()
 		if e.receiver == nil {
 			e.Unlock()
-			return -1, tcpip.ErrNotConnected
+			return -1, &tcpip.ErrNotConnected{}
 		}
 		v := e.receiver.RecvMaxQueueSize()
 		e.Unlock()
 		if v < 0 {
-			return -1, tcpip.ErrQueueSizeNotSupported
+			return -1, &tcpip.ErrQueueSizeNotSupported{}
 		}
 		return int(v), nil
 
 	default:
 		log.Warningf("Unsupported socket option: %d", opt)
-		return -1, tcpip.ErrUnknownProtocolOption
+		return -1, &tcpip.ErrUnknownProtocolOption{}
 	}
 }
 
 // GetSockOpt implements tcpip.Endpoint.GetSockOpt.
-func (e *baseEndpoint) GetSockOpt(opt tcpip.GettableSocketOption) *tcpip.Error {
-	switch o := opt.(type) {
-	case *tcpip.LingerOption:
-		e.Lock()
-		*o = e.linger
-		e.Unlock()
-		return nil
-
-	default:
-		log.Warningf("Unsupported socket option: %T", opt)
-		return tcpip.ErrUnknownProtocolOption
-	}
+func (e *baseEndpoint) GetSockOpt(opt tcpip.GettableSocketOption) tcpip.Error {
+	log.Warningf("Unsupported socket option: %T", opt)
+	return &tcpip.ErrUnknownProtocolOption{}
 }
 
 // LastError implements Endpoint.LastError.
-func (*baseEndpoint) LastError() *tcpip.Error {
+func (*baseEndpoint) LastError() tcpip.Error {
 	return nil
 }
 
@@ -998,29 +949,33 @@ func (e *baseEndpoint) Shutdown(flags tcpip.ShutdownFlags) *syserr.Error {
 		return syserr.ErrNotConnected
 	}
 
-	if flags&tcpip.ShutdownRead != 0 {
-		e.receiver.CloseRecv()
+	var (
+		r             = e.receiver
+		c             = e.connected
+		shutdownRead  = flags&tcpip.ShutdownRead != 0
+		shutdownWrite = flags&tcpip.ShutdownWrite != 0
+	)
+	if shutdownRead {
+		r.CloseRecv()
 	}
-
-	if flags&tcpip.ShutdownWrite != 0 {
-		e.connected.CloseSend()
+	if shutdownWrite {
+		c.CloseSend()
 	}
-
 	e.Unlock()
 
-	if flags&tcpip.ShutdownRead != 0 {
-		e.receiver.CloseNotify()
+	// Don't hold e.Mutex while calling CloseNotify.
+	if shutdownRead {
+		r.CloseNotify()
 	}
-
-	if flags&tcpip.ShutdownWrite != 0 {
-		e.connected.CloseNotify()
+	if shutdownWrite {
+		c.CloseNotify()
 	}
 
 	return nil
 }
 
 // GetLocalAddress returns the bound path.
-func (e *baseEndpoint) GetLocalAddress() (tcpip.FullAddress, *tcpip.Error) {
+func (e *baseEndpoint) GetLocalAddress() (tcpip.FullAddress, tcpip.Error) {
 	e.Lock()
 	defer e.Unlock()
 	return tcpip.FullAddress{Addr: tcpip.Address(e.path)}, nil
@@ -1028,17 +983,49 @@ func (e *baseEndpoint) GetLocalAddress() (tcpip.FullAddress, *tcpip.Error) {
 
 // GetRemoteAddress returns the local address of the connected endpoint (if
 // available).
-func (e *baseEndpoint) GetRemoteAddress() (tcpip.FullAddress, *tcpip.Error) {
+func (e *baseEndpoint) GetRemoteAddress() (tcpip.FullAddress, tcpip.Error) {
 	e.Lock()
 	c := e.connected
 	e.Unlock()
 	if c != nil {
 		return c.GetLocalAddress()
 	}
-	return tcpip.FullAddress{}, tcpip.ErrNotConnected
+	return tcpip.FullAddress{}, &tcpip.ErrNotConnected{}
 }
 
 // Release implements BoundEndpoint.Release.
 func (*baseEndpoint) Release(context.Context) {
 	// Binding a baseEndpoint doesn't take a reference.
+}
+
+// stackHandler is just a stub implementation of tcpip.StackHandler to provide
+// when initializing socketoptions.
+type stackHandler struct {
+}
+
+// Option implements tcpip.StackHandler.
+func (h *stackHandler) Option(option interface{}) tcpip.Error {
+	panic("unimplemented")
+}
+
+// TransportProtocolOption implements tcpip.StackHandler.
+func (h *stackHandler) TransportProtocolOption(proto tcpip.TransportProtocolNumber, option tcpip.GettableTransportProtocolOption) tcpip.Error {
+	panic("unimplemented")
+}
+
+// getSendBufferLimits implements tcpip.GetSendBufferLimits.
+//
+// AF_UNIX sockets buffer sizes are not tied to the networking stack/namespace
+// in linux but are bound by net.core.(wmem|rmem)_(max|default).
+//
+// In gVisor net.core sysctls today are not exposed or if exposed are currently
+// tied to the networking stack in use. This makes it complicated for AF_UNIX
+// when we are in a new namespace w/ no networking stack. As a result for now we
+// define default/max values here in the unix socket implementation itself.
+func getSendBufferLimits(tcpip.StackHandler) tcpip.SendBufferSizeOption {
+	return tcpip.SendBufferSizeOption{
+		Min:     minimumBufferSize,
+		Default: defaultBufferSize,
+		Max:     maxBufferSize,
+	}
 }
