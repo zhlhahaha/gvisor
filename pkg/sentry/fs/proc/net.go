@@ -23,6 +23,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/fs"
 	"gvisor.dev/gvisor/pkg/sentry/fs/proc/seqfile"
@@ -35,7 +36,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/socket/unix/transport"
 	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
-	"gvisor.dev/gvisor/pkg/usermem"
 )
 
 // LINT.IfChange
@@ -128,13 +128,17 @@ func (*ifinet6) NeedsUpdate(generation int64) bool {
 
 // ReadSeqFileData implements seqfile.SeqSource.ReadSeqFileData.
 func (n *ifinet6) ReadSeqFileData(ctx context.Context, h seqfile.SeqHandle) ([]seqfile.SeqData, int64) {
+	contents := n.contents()
+	minI := 0
 	if h != nil {
-		return nil, 0
+		minI = h.(int) + 1
+		if minI > len(contents) {
+			minI = len(contents)
+		}
 	}
-
 	var data []seqfile.SeqData
-	for _, l := range n.contents() {
-		data = append(data, seqfile.SeqData{Buf: []byte(l), Handle: (*ifinet6)(nil)})
+	for i, l := range contents[minI:] {
+		data = append(data, seqfile.SeqData{Buf: []byte(l), Handle: i + minI})
 	}
 
 	return data, 0
@@ -155,10 +159,6 @@ func (n *netDev) NeedsUpdate(generation int64) bool {
 // ReadSeqFileData implements seqfile.SeqSource.ReadSeqFileData. See Linux's
 // net/core/net-procfs.c:dev_seq_show.
 func (n *netDev) ReadSeqFileData(ctx context.Context, h seqfile.SeqHandle) ([]seqfile.SeqData, int64) {
-	if h != nil {
-		return nil, 0
-	}
-
 	interfaces := n.s.Interfaces()
 	contents := make([]string, 2, 2+len(interfaces))
 	// Add the table header. From net/core/net-procfs.c:dev_seq_show.
@@ -197,9 +197,16 @@ func (n *netDev) ReadSeqFileData(ctx context.Context, h seqfile.SeqHandle) ([]se
 		contents = append(contents, l)
 	}
 
+	minI := 0
+	if h != nil {
+		minI = h.(int) + 1
+		if minI > len(contents) {
+			minI = len(contents)
+		}
+	}
 	var data []seqfile.SeqData
-	for _, l := range contents {
-		data = append(data, seqfile.SeqData{Buf: []byte(l), Handle: (*netDev)(nil)})
+	for i, l := range contents[minI:] {
+		data = append(data, seqfile.SeqData{Buf: []byte(l), Handle: i + minI})
 	}
 
 	return data, 0
@@ -264,10 +271,6 @@ func sprintSlice(s []uint64) string {
 // ReadSeqFileData implements seqfile.SeqSource.ReadSeqFileData. See Linux's
 // net/core/net-procfs.c:dev_seq_show.
 func (n *netSnmp) ReadSeqFileData(ctx context.Context, h seqfile.SeqHandle) ([]seqfile.SeqData, int64) {
-	if h != nil {
-		return nil, 0
-	}
-
 	contents := make([]string, 0, len(snmp)*2)
 	types := []interface{}{
 		&inet.StatSNMPIP{},
@@ -309,9 +312,16 @@ func (n *netSnmp) ReadSeqFileData(ctx context.Context, h seqfile.SeqHandle) ([]s
 		)
 	}
 
+	minI := 0
+	if h != nil {
+		minI = h.(int) + 1
+		if minI > len(contents) {
+			minI = len(contents)
+		}
+	}
 	data := make([]seqfile.SeqData, 0, len(snmp)*2)
-	for _, l := range contents {
-		data = append(data, seqfile.SeqData{Buf: []byte(l), Handle: (*netSnmp)(nil)})
+	for i, l := range contents[minI:] {
+		data = append(data, seqfile.SeqData{Buf: []byte(l), Handle: i + minI})
 	}
 
 	return data, 0
@@ -332,10 +342,6 @@ func (n *netRoute) NeedsUpdate(generation int64) bool {
 // ReadSeqFileData implements seqfile.SeqSource.ReadSeqFileData.
 // See Linux's net/ipv4/fib_trie.c:fib_route_seq_show.
 func (n *netRoute) ReadSeqFileData(ctx context.Context, h seqfile.SeqHandle) ([]seqfile.SeqData, int64) {
-	if h != nil {
-		return nil, 0
-	}
-
 	interfaces := n.s.Interfaces()
 	contents := []string{"Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT"}
 	for _, rt := range n.s.RouteTable() {
@@ -361,10 +367,10 @@ func (n *netRoute) ReadSeqFileData(ctx context.Context, h seqfile.SeqHandle) ([]
 		)
 		if len(rt.GatewayAddr) == header.IPv4AddressSize {
 			flags |= linux.RTF_GATEWAY
-			gw = usermem.ByteOrder.Uint32(rt.GatewayAddr)
+			gw = hostarch.ByteOrder.Uint32(rt.GatewayAddr)
 		}
 		if len(rt.DstAddr) == header.IPv4AddressSize {
-			prefix = usermem.ByteOrder.Uint32(rt.DstAddr)
+			prefix = hostarch.ByteOrder.Uint32(rt.DstAddr)
 		}
 		l := fmt.Sprintf(
 			"%s\t%08X\t%08X\t%04X\t%d\t%d\t%d\t%08X\t%d\t%d\t%d",
@@ -383,10 +389,17 @@ func (n *netRoute) ReadSeqFileData(ctx context.Context, h seqfile.SeqHandle) ([]
 		contents = append(contents, l)
 	}
 
+	minI := 0
+	if h != nil {
+		minI = h.(int) + 1
+		if minI > len(contents) {
+			minI = len(contents)
+		}
+	}
 	var data []seqfile.SeqData
-	for _, l := range contents {
+	for i, l := range contents[minI:] {
 		l = fmt.Sprintf("%-127s\n", l)
-		data = append(data, seqfile.SeqData{Buf: []byte(l), Handle: (*netRoute)(nil)})
+		data = append(data, seqfile.SeqData{Buf: []byte(l), Handle: i + minI})
 	}
 
 	return data, 0
@@ -406,10 +419,6 @@ func (*netUnix) NeedsUpdate(generation int64) bool {
 
 // ReadSeqFileData implements seqfile.SeqSource.ReadSeqFileData.
 func (n *netUnix) ReadSeqFileData(ctx context.Context, h seqfile.SeqHandle) ([]seqfile.SeqData, int64) {
-	if h != nil {
-		return []seqfile.SeqData{}, 0
-	}
-
 	var buf bytes.Buffer
 	for _, se := range n.k.ListSockets() {
 		s := se.Sock.Get()
@@ -482,15 +491,22 @@ func (n *netUnix) ReadSeqFileData(ctx context.Context, h seqfile.SeqHandle) ([]s
 		s.DecRef(ctx)
 	}
 
-	data := []seqfile.SeqData{
-		{
+	minI := 0
+	if h != nil {
+		minI = h.(int) + 1
+	}
+	var data []seqfile.SeqData
+	if minI <= 0 {
+		data = append(data, seqfile.SeqData{
 			Buf:    []byte("Num       RefCount Protocol Flags    Type St Inode Path\n"),
-			Handle: n,
-		},
-		{
+			Handle: 0,
+		})
+	}
+	if minI <= 1 {
+		data = append(data, seqfile.SeqData{
 			Buf:    buf.Bytes(),
-			Handle: n,
-		},
+			Handle: 1,
+		})
 	}
 	return data, 0
 }
@@ -504,7 +520,7 @@ func networkToHost16(n uint16) uint16 {
 	// binary.BigEndian.Uint16() require a read of binary.BigEndian and an
 	// interface method call, defeating inlining.
 	buf := [2]byte{byte(n >> 8 & 0xff), byte(n & 0xff)}
-	return usermem.ByteOrder.Uint16(buf[:])
+	return hostarch.ByteOrder.Uint16(buf[:])
 }
 
 func writeInetAddr(w io.Writer, family int, i linux.SockAddr) {
@@ -526,14 +542,14 @@ func writeInetAddr(w io.Writer, family int, i linux.SockAddr) {
 		// __be32 which is a typedef for an unsigned int, and is printed with
 		// %X. This means that for a little-endian machine, Linux prints the
 		// least-significant byte of the address first. To emulate this, we first
-		// invert the byte order for the address using usermem.ByteOrder.Uint32,
+		// invert the byte order for the address using hostarch.ByteOrder.Uint32,
 		// which makes it have the equivalent encoding to a __be32 on a little
 		// endian machine. Note that this operation is a no-op on a big endian
 		// machine. Then similar to Linux, we format it with %X, which will print
 		// the most-significant byte of the __be32 address first, which is now
 		// actually the least-significant byte of the original address in
 		// linux.SockAddrInet.Addr on little endian machines, due to the conversion.
-		addr := usermem.ByteOrder.Uint32(a.Addr[:])
+		addr := hostarch.ByteOrder.Uint32(a.Addr[:])
 
 		fmt.Fprintf(w, "%08X:%04X ", addr, port)
 	case linux.AF_INET6:
@@ -543,10 +559,10 @@ func writeInetAddr(w io.Writer, family int, i linux.SockAddr) {
 		}
 
 		port := networkToHost16(a.Port)
-		addr0 := usermem.ByteOrder.Uint32(a.Addr[0:4])
-		addr1 := usermem.ByteOrder.Uint32(a.Addr[4:8])
-		addr2 := usermem.ByteOrder.Uint32(a.Addr[8:12])
-		addr3 := usermem.ByteOrder.Uint32(a.Addr[12:16])
+		addr0 := hostarch.ByteOrder.Uint32(a.Addr[0:4])
+		addr1 := hostarch.ByteOrder.Uint32(a.Addr[4:8])
+		addr2 := hostarch.ByteOrder.Uint32(a.Addr[8:12])
+		addr3 := hostarch.ByteOrder.Uint32(a.Addr[12:16])
 		fmt.Fprintf(w, "%08X%08X%08X%08X:%04X ", addr0, addr1, addr2, addr3, port)
 	}
 }
@@ -556,10 +572,6 @@ func commonReadSeqFileDataTCP(ctx context.Context, n seqfile.SeqHandle, k *kerne
 	// happen for example if we're here for "sentryctl cat". When t is nil,
 	// degrade gracefully and retrieve what we can.
 	t := kernel.TaskFromContext(ctx)
-
-	if h != nil {
-		return nil, 0
-	}
 
 	var buf bytes.Buffer
 	for _, se := range k.ListSockets() {
@@ -667,15 +679,22 @@ func commonReadSeqFileDataTCP(ctx context.Context, n seqfile.SeqHandle, k *kerne
 		s.DecRef(ctx)
 	}
 
-	data := []seqfile.SeqData{
-		{
+	minI := 0
+	if h != nil {
+		minI = h.(int) + 1
+	}
+	var data []seqfile.SeqData
+	if minI <= 0 {
+		data = append(data, seqfile.SeqData{
 			Buf:    header,
-			Handle: n,
-		},
-		{
+			Handle: 0,
+		})
+	}
+	if minI <= 1 {
+		data = append(data, seqfile.SeqData{
 			Buf:    buf.Bytes(),
-			Handle: n,
-		},
+			Handle: 1,
+		})
 	}
 	return data, 0
 }
@@ -734,10 +753,6 @@ func (n *netUDP) ReadSeqFileData(ctx context.Context, h seqfile.SeqHandle) ([]se
 	// happen for example if we're here for "sentryctl cat". When t is nil,
 	// degrade gracefully and retrieve what we can.
 	t := kernel.TaskFromContext(ctx)
-
-	if h != nil {
-		return nil, 0
-	}
 
 	var buf bytes.Buffer
 	for _, se := range n.k.ListSockets() {
@@ -825,15 +840,22 @@ func (n *netUDP) ReadSeqFileData(ctx context.Context, h seqfile.SeqHandle) ([]se
 		s.DecRef(ctx)
 	}
 
-	data := []seqfile.SeqData{
-		{
+	minI := 0
+	if h != nil {
+		minI = h.(int) + 1
+	}
+	var data []seqfile.SeqData
+	if minI <= 0 {
+		data = append(data, seqfile.SeqData{
 			Buf:    []byte("  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops             \n"),
-			Handle: n,
-		},
-		{
+			Handle: 0,
+		})
+	}
+	if minI <= 1 {
+		data = append(data, seqfile.SeqData{
 			Buf:    buf.Bytes(),
-			Handle: n,
-		},
+			Handle: 1,
+		})
 	}
 	return data, 0
 }
