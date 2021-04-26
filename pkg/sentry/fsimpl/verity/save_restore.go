@@ -1,4 +1,4 @@
-// Copyright 2019 The gVisor Authors.
+// Copyright 2020 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,18 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package tcp
+package verity
 
 import (
-	"time"
+	"sync/atomic"
+
+	"gvisor.dev/gvisor/pkg/refsvfs2"
 )
 
-// saveT is invoked by stateify.
-func (c *cubicState) saveT() unixTime {
-	return unixTime{c.t.Unix(), c.t.UnixNano()}
-}
-
-// loadT is invoked by stateify.
-func (c *cubicState) loadT(unix unixTime) {
-	c.t = time.Unix(unix.second, unix.nano)
+func (d *dentry) afterLoad() {
+	if atomic.LoadInt64(&d.refs) != -1 {
+		refsvfs2.Register(d)
+	}
 }

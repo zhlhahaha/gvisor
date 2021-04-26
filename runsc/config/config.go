@@ -55,6 +55,9 @@ type Config struct {
 	// PanicLog is the path to log GO's runtime messages, if not empty.
 	PanicLog string `flag:"panic-log"`
 
+	// CoverageReport is the path to write Go coverage information, if not empty.
+	CoverageReport string `flag:"coverage-report"`
+
 	// DebugLogFormat is the log format for debug.
 	DebugLogFormat string `flag:"debug-log-format"`
 
@@ -171,6 +174,9 @@ type Config struct {
 
 	// Enables seccomp inside the sandbox.
 	OCISeccomp bool `flag:"oci-seccomp"`
+
+	// Mounts the cgroup filesystem backed by the sentry's cgroupfs.
+	Cgroupfs bool `flag:"cgroupfs"`
 
 	// TestOnlyAllowRunAsCurrentUserWithoutChroot should only be used in
 	// tests. It allows runsc to start the sandbox process as the current

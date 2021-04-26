@@ -314,7 +314,7 @@ func (e *endpoint) onAddressAssignedLocked(addr tcpip.Address) {
 	//   Snooping switches MUST manage multicast forwarding state based on MLD
 	//   Report and Done messages sent with the unspecified address as the
 	//   IPv6 source address.
-	if header.IsV6LinkLocalAddress(addr) {
+	if header.IsV6LinkLocalUnicastAddress(addr) {
 		e.mu.mld.sendQueuedReports()
 	}
 }
@@ -410,12 +410,14 @@ func (e *endpoint) dupTentativeAddrDetected(addr tcpip.Address, holderLinkAddr t
 //
 // Must only be called when the forwarding status changes.
 func (e *endpoint) transitionForwarding(forwarding bool) {
+	allRoutersGroups := [...]tcpip.Address{
+		header.IPv6AllRoutersInterfaceLocalMulticastAddress,
+		header.IPv6AllRoutersLinkLocalMulticastAddress,
+		header.IPv6AllRoutersSiteLocalMulticastAddress,
+	}
+
 	e.mu.Lock()
 	defer e.mu.Unlock()
-
-	if !e.Enabled() {
-		return
-	}
 
 	if forwarding {
 		// When transitioning into an IPv6 router, host-only state (NDP discovered
@@ -423,9 +425,50 @@ func (e *endpoint) transitionForwarding(forwarding bool) {
 		// cleaned up/invalidated and NDP router solicitations are stopped.
 		e.mu.ndp.stopSolicitingRouters()
 		e.mu.ndp.cleanupState(true /* hostOnly */)
-	} else {
-		// When transitioning into an IPv6 host, NDP router solicitations are
-		// started.
+
+		// As per RFC 4291 section 2.8:
+		//
+		//   A router is required to recognize all addresses that a host is
+		//   required to recognize, plus the following addresses as identifying
+		//   itself:
+		//
+		//      o The All-Routers multicast addresses defined in Section 2.7.1.
+		//
+		// As per RFC 4291 section 2.7.1,
+		//
+		//      All Routers Addresses:   FF01:0:0:0:0:0:0:2
+		//                               FF02:0:0:0:0:0:0:2
+		//                               FF05:0:0:0:0:0:0:2
+		//
+		//   The above multicast addresses identify the group of all IPv6 routers,
+		//   within scope 1 (interface-local), 2 (link-local), or 5 (site-local).
+		for _, g := range allRoutersGroups {
+			if err := e.joinGroupLocked(g); err != nil {
+				// joinGroupLocked only returns an error if the group address is not a
+				// valid IPv6 multicast address.
+				panic(fmt.Sprintf("e.joinGroupLocked(%s): %s", g, err))
+			}
+		}
+
+		return
+	}
+
+	for _, g := range allRoutersGroups {
+		switch err := e.leaveGroupLocked(g).(type) {
+		case nil:
+		case *tcpip.ErrBadLocalAddress:
+			// The endpoint may have already left the multicast group.
+		default:
+			panic(fmt.Sprintf("e.leaveGroupLocked(%s): %s", g, err))
+		}
+	}
+
+	// When transitioning into an IPv6 host, NDP router solicitations are
+	// started if the endpoint is enabled.
+	//
+	// If the endpoint is not currently enabled, routers will be solicited when
+	// the endpoint becomes enabled (if it is still a host).
+	if e.Enabled() {
 		e.mu.ndp.startSolicitingRouters()
 	}
 }
@@ -573,7 +616,7 @@ func (e *endpoint) disableLocked() {
 	e.mu.ndp.cleanupState(false /* hostOnly */)
 
 	// The endpoint may have already left the multicast group.
-	switch err := e.leaveGroupLocked(header.IPv6AllNodesMulticastAddress); err.(type) {
+	switch err := e.leaveGroupLocked(header.IPv6AllNodesMulticastAddress).(type) {
 	case nil, *tcpip.ErrBadLocalAddress:
 	default:
 		panic(fmt.Sprintf("unexpected error when leaving group = %s: %s", header.IPv6AllNodesMulticastAddress, err))
@@ -632,9 +675,9 @@ func addIPHeader(srcAddr, dstAddr tcpip.Address, pkt *stack.PacketBuffer, params
 	return nil
 }
 
-func packetMustBeFragmented(pkt *stack.PacketBuffer, networkMTU uint32, gso *stack.GSO) bool {
+func packetMustBeFragmented(pkt *stack.PacketBuffer, networkMTU uint32) bool {
 	payload := pkt.TransportHeader().View().Size() + pkt.Data().Size()
-	return (gso == nil || gso.Type == stack.GSONone) && uint32(payload) > networkMTU
+	return pkt.GSOOptions.Type == stack.GSONone && uint32(payload) > networkMTU
 }
 
 // handleFragments fragments pkt and calls the handler function on each
@@ -642,7 +685,7 @@ func packetMustBeFragmented(pkt *stack.PacketBuffer, networkMTU uint32, gso *sta
 // fragments left to be processed. The IP header must already be present in the
 // original packet. The transport header protocol number is required to avoid
 // parsing the IPv6 extension headers.
-func (e *endpoint) handleFragments(r *stack.Route, gso *stack.GSO, networkMTU uint32, pkt *stack.PacketBuffer, transProto tcpip.TransportProtocolNumber, handler func(*stack.PacketBuffer) tcpip.Error) (int, int, tcpip.Error) {
+func (e *endpoint) handleFragments(r *stack.Route, networkMTU uint32, pkt *stack.PacketBuffer, transProto tcpip.TransportProtocolNumber, handler func(*stack.PacketBuffer) tcpip.Error) (int, int, tcpip.Error) {
 	networkHeader := header.IPv6(pkt.NetworkHeader().View())
 
 	// TODO(gvisor.dev/issue/3912): Once the Authentication or ESP Headers are
@@ -681,7 +724,7 @@ func (e *endpoint) handleFragments(r *stack.Route, gso *stack.GSO, networkMTU ui
 }
 
 // WritePacket writes a packet to the given destination address and protocol.
-func (e *endpoint) WritePacket(r *stack.Route, gso *stack.GSO, params stack.NetworkHeaderParams, pkt *stack.PacketBuffer) tcpip.Error {
+func (e *endpoint) WritePacket(r *stack.Route, params stack.NetworkHeaderParams, pkt *stack.PacketBuffer) tcpip.Error {
 	if err := addIPHeader(r.LocalAddress(), r.RemoteAddress(), pkt, params, nil /* extensionHeaders */); err != nil {
 		return err
 	}
@@ -689,7 +732,7 @@ func (e *endpoint) WritePacket(r *stack.Route, gso *stack.GSO, params stack.Netw
 	// iptables filtering. All packets that reach here are locally
 	// generated.
 	outNicName := e.protocol.stack.FindNICNameFromID(e.nic.ID())
-	if ok := e.protocol.stack.IPTables().Check(stack.Output, pkt, gso, r, "" /* preroutingAddr */, "" /* inNicName */, outNicName); !ok {
+	if ok := e.protocol.stack.IPTables().Check(stack.Output, pkt, r, "" /* preroutingAddr */, "" /* inNicName */, outNicName); !ok {
 		// iptables is telling us to drop the packet.
 		e.stats.ip.IPTablesOutputDropped.Increment()
 		return nil
@@ -712,10 +755,10 @@ func (e *endpoint) WritePacket(r *stack.Route, gso *stack.GSO, params stack.Netw
 		}
 	}
 
-	return e.writePacket(r, gso, pkt, params.Protocol, false /* headerIncluded */)
+	return e.writePacket(r, pkt, params.Protocol, false /* headerIncluded */)
 }
 
-func (e *endpoint) writePacket(r *stack.Route, gso *stack.GSO, pkt *stack.PacketBuffer, protocol tcpip.TransportProtocolNumber, headerIncluded bool) tcpip.Error {
+func (e *endpoint) writePacket(r *stack.Route, pkt *stack.PacketBuffer, protocol tcpip.TransportProtocolNumber, headerIncluded bool) tcpip.Error {
 	if r.Loop()&stack.PacketLoop != 0 {
 		// If the packet was generated by the stack (not a raw/packet endpoint
 		// where a packet may be written with the header included), then we can
@@ -726,6 +769,15 @@ func (e *endpoint) writePacket(r *stack.Route, gso *stack.GSO, pkt *stack.Packet
 		return nil
 	}
 
+	// Postrouting NAT can only change the source address, and does not alter the
+	// route or outgoing interface of the packet.
+	outNicName := e.protocol.stack.FindNICNameFromID(e.nic.ID())
+	if ok := e.protocol.stack.IPTables().Check(stack.Postrouting, pkt, r, "" /* preroutingAddr */, "" /* inNicName */, outNicName); !ok {
+		// iptables is telling us to drop the packet.
+		e.stats.ip.IPTablesPostroutingDropped.Increment()
+		return nil
+	}
+
 	stats := e.stats.ip
 	networkMTU, err := calculateNetworkMTU(e.nic.MTU(), uint32(pkt.NetworkHeader().View().Size()))
 	if err != nil {
@@ -733,20 +785,20 @@ func (e *endpoint) writePacket(r *stack.Route, gso *stack.GSO, pkt *stack.Packet
 		return err
 	}
 
-	if packetMustBeFragmented(pkt, networkMTU, gso) {
-		sent, remain, err := e.handleFragments(r, gso, networkMTU, pkt, protocol, func(fragPkt *stack.PacketBuffer) tcpip.Error {
+	if packetMustBeFragmented(pkt, networkMTU) {
+		sent, remain, err := e.handleFragments(r, networkMTU, pkt, protocol, func(fragPkt *stack.PacketBuffer) tcpip.Error {
 			// TODO(gvisor.dev/issue/3884): Evaluate whether we want to send each
 			// fragment one by one using WritePacket() (current strategy) or if we
 			// want to create a PacketBufferList from the fragments and feed it to
 			// WritePackets(). It'll be faster but cost more memory.
-			return e.nic.WritePacket(r, gso, ProtocolNumber, fragPkt)
+			return e.nic.WritePacket(r, ProtocolNumber, fragPkt)
 		})
 		stats.PacketsSent.IncrementBy(uint64(sent))
 		stats.OutgoingPacketErrors.IncrementBy(uint64(remain))
 		return err
 	}
 
-	if err := e.nic.WritePacket(r, gso, ProtocolNumber, pkt); err != nil {
+	if err := e.nic.WritePacket(r, ProtocolNumber, pkt); err != nil {
 		stats.OutgoingPacketErrors.Increment()
 		return err
 	}
@@ -756,7 +808,7 @@ func (e *endpoint) writePacket(r *stack.Route, gso *stack.GSO, pkt *stack.Packet
 }
 
 // WritePackets implements stack.NetworkEndpoint.WritePackets.
-func (e *endpoint) WritePackets(r *stack.Route, gso *stack.GSO, pkts stack.PacketBufferList, params stack.NetworkHeaderParams) (int, tcpip.Error) {
+func (e *endpoint) WritePackets(r *stack.Route, pkts stack.PacketBufferList, params stack.NetworkHeaderParams) (int, tcpip.Error) {
 	if r.Loop()&stack.PacketLoop != 0 {
 		panic("not implemented")
 	}
@@ -776,11 +828,11 @@ func (e *endpoint) WritePackets(r *stack.Route, gso *stack.GSO, pkts stack.Packe
 			stats.OutgoingPacketErrors.IncrementBy(uint64(pkts.Len()))
 			return 0, err
 		}
-		if packetMustBeFragmented(pb, networkMTU, gso) {
+		if packetMustBeFragmented(pb, networkMTU) {
 			// Keep track of the packet that is about to be fragmented so it can be
 			// removed once the fragmentation is done.
 			originalPkt := pb
-			if _, _, err := e.handleFragments(r, gso, networkMTU, pb, params.Protocol, func(fragPkt *stack.PacketBuffer) tcpip.Error {
+			if _, _, err := e.handleFragments(r, networkMTU, pb, params.Protocol, func(fragPkt *stack.PacketBuffer) tcpip.Error {
 				// Modify the packet list in place with the new fragments.
 				pkts.InsertAfter(pb, fragPkt)
 				pb = fragPkt
@@ -797,9 +849,9 @@ func (e *endpoint) WritePackets(r *stack.Route, gso *stack.GSO, pkts stack.Packe
 	// iptables filtering. All packets that reach here are locally
 	// generated.
 	outNicName := e.protocol.stack.FindNICNameFromID(e.nic.ID())
-	dropped, natPkts := e.protocol.stack.IPTables().CheckPackets(stack.Output, pkts, gso, r, "" /* inNicName */, outNicName)
-	stats.IPTablesOutputDropped.IncrementBy(uint64(len(dropped)))
-	for pkt := range dropped {
+	outputDropped, natPkts := e.protocol.stack.IPTables().CheckPackets(stack.Output, pkts, r, "" /* inNicName */, outNicName)
+	stats.IPTablesOutputDropped.IncrementBy(uint64(len(outputDropped)))
+	for pkt := range outputDropped {
 		pkts.Remove(pkt)
 	}
 
@@ -820,14 +872,23 @@ func (e *endpoint) WritePackets(r *stack.Route, gso *stack.GSO, pkts stack.Packe
 		locallyDelivered++
 	}
 
+	// We ignore the list of NAT-ed packets here because Postrouting NAT can only
+	// change the source address, and does not alter the route or outgoing
+	// interface of the packet.
+	postroutingDropped, _ := e.protocol.stack.IPTables().CheckPackets(stack.Postrouting, pkts, r, "" /* inNicName */, outNicName)
+	stats.IPTablesPostroutingDropped.IncrementBy(uint64(len(postroutingDropped)))
+	for pkt := range postroutingDropped {
+		pkts.Remove(pkt)
+	}
+
 	// The rest of the packets can be delivered to the NIC as a batch.
 	pktsLen := pkts.Len()
-	written, err := e.nic.WritePackets(r, gso, pkts, ProtocolNumber)
+	written, err := e.nic.WritePackets(r, pkts, ProtocolNumber)
 	stats.PacketsSent.IncrementBy(uint64(written))
 	stats.OutgoingPacketErrors.IncrementBy(uint64(pktsLen - written))
 
 	// Dropped packets aren't errors, so include them in the return value.
-	return locallyDelivered + written + len(dropped), err
+	return locallyDelivered + written + len(outputDropped) + len(postroutingDropped), err
 }
 
 // WriteHeaderIncludedPacket implements stack.NetworkEndpoint.
@@ -863,12 +924,22 @@ func (e *endpoint) WriteHeaderIncludedPacket(r *stack.Route, pkt *stack.PacketBu
 		return &tcpip.ErrMalformedHeader{}
 	}
 
-	return e.writePacket(r, nil /* gso */, pkt, proto, true /* headerIncluded */)
+	return e.writePacket(r, pkt, proto, true /* headerIncluded */)
 }
 
 // forwardPacket attempts to forward a packet to its final destination.
 func (e *endpoint) forwardPacket(pkt *stack.PacketBuffer) tcpip.Error {
 	h := header.IPv6(pkt.NetworkHeader().View())
+
+	dstAddr := h.DestinationAddress()
+	if header.IsV6LinkLocalUnicastAddress(h.SourceAddress()) || header.IsV6LinkLocalUnicastAddress(dstAddr) || header.IsV6LinkLocalMulticastAddress(dstAddr) {
+		// As per RFC 4291 section 2.5.6,
+		//
+		//   Routers must not forward any packets with Link-Local source or
+		//   destination addresses to other links.
+		return nil
+	}
+
 	hopLimit := h.HopLimit()
 	if hopLimit <= 1 {
 		// As per RFC 4443 section 3.3,
@@ -880,8 +951,6 @@ func (e *endpoint) forwardPacket(pkt *stack.PacketBuffer) tcpip.Error {
 		//   too small an initial Hop Limit value.
 		return e.protocol.returnError(&icmpReasonHopLimitExceeded{}, pkt)
 	}
-
-	dstAddr := h.DestinationAddress()
 
 	// Check if the destination is owned by the stack.
 	if ep := e.protocol.findEndpointWithAddress(dstAddr); ep != nil {
@@ -958,7 +1027,7 @@ func (e *endpoint) HandlePacket(pkt *stack.PacketBuffer) {
 
 		// Loopback traffic skips the prerouting chain.
 		inNicName := e.protocol.stack.FindNICNameFromID(e.nic.ID())
-		if ok := e.protocol.stack.IPTables().Check(stack.Prerouting, pkt, nil, nil, e.MainAddress().Address, inNicName, "" /* outNicName */); !ok {
+		if ok := e.protocol.stack.IPTables().Check(stack.Prerouting, pkt, nil, e.MainAddress().Address, inNicName, "" /* outNicName */); !ok {
 			// iptables is telling us to drop the packet.
 			stats.IPTablesPreroutingDropped.Increment()
 			return
@@ -1028,7 +1097,7 @@ func (e *endpoint) handleValidatedPacket(h header.IPv6, pkt *stack.PacketBuffer)
 	// iptables filtering. All packets that reach here are intended for
 	// this machine and need not be forwarded.
 	inNicName := e.protocol.stack.FindNICNameFromID(e.nic.ID())
-	if ok := e.protocol.stack.IPTables().Check(stack.Input, pkt, nil, nil, "" /* preroutingAddr */, inNicName, "" /* outNicName */); !ok {
+	if ok := e.protocol.stack.IPTables().Check(stack.Input, pkt, nil, "" /* preroutingAddr */, inNicName, "" /* outNicName */); !ok {
 		// iptables is telling us to drop the packet.
 		stats.IPTablesInputDropped.Increment()
 		return
@@ -1571,7 +1640,7 @@ func (e *endpoint) getLinkLocalAddressRLocked() tcpip.Address {
 	var linkLocalAddr tcpip.Address
 	e.mu.addressableEndpointState.ForEachPrimaryEndpoint(func(addressEndpoint stack.AddressEndpoint) bool {
 		if addressEndpoint.IsAssigned(false /* allowExpired */) {
-			if addr := addressEndpoint.AddressWithPrefix().Address; header.IsV6LinkLocalAddress(addr) {
+			if addr := addressEndpoint.AddressWithPrefix().Address; header.IsV6LinkLocalUnicastAddress(addr) {
 				linkLocalAddr = addr
 				return false
 			}
@@ -1979,9 +2048,9 @@ func (p *protocol) Forwarding() bool {
 // Returns true if the forwarding status was updated.
 func (p *protocol) setForwarding(v bool) bool {
 	if v {
-		return atomic.SwapUint32(&p.forwarding, 1) == 0
+		return atomic.CompareAndSwapUint32(&p.forwarding, 0 /* old */, 1 /* new */)
 	}
-	return atomic.SwapUint32(&p.forwarding, 0) == 1
+	return atomic.CompareAndSwapUint32(&p.forwarding, 1 /* old */, 0 /* new */)
 }
 
 // SetForwarding implements stack.ForwardingNetworkProtocol.

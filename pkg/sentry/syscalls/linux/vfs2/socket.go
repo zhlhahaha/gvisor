@@ -35,12 +35,6 @@ import (
 	"gvisor.dev/gvisor/pkg/hostarch"
 )
 
-// minListenBacklog is the minimum reasonable backlog for listening sockets.
-const minListenBacklog = 8
-
-// maxListenBacklog is the maximum allowed backlog for listening sockets.
-const maxListenBacklog = 1024
-
 // maxAddrLen is the maximum socket address length we're willing to accept.
 const maxAddrLen = 200
 
@@ -51,6 +45,9 @@ const maxOptLen = 1024 * 8
 // willing to accept. Note that this limit is smaller than Linux, which allows
 // buffers upto INT_MAX.
 const maxControlLen = 10 * 1024 * 1024
+
+// maxListenBacklog is the maximum limit of listen backlog supported.
+const maxListenBacklog = 1024
 
 // nameLenOffset is the offset from the start of the MessageHeader64 struct to
 // the NameLen field.
@@ -371,7 +368,7 @@ func Bind(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallC
 // Listen implements the linux syscall listen(2).
 func Listen(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	fd := args[0].Int()
-	backlog := args[1].Int()
+	backlog := args[1].Uint()
 
 	// Get socket from the file descriptor.
 	file := t.GetFileVFS2(fd)
@@ -386,13 +383,22 @@ func Listen(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscal
 		return 0, nil, syserror.ENOTSOCK
 	}
 
-	// Per Linux, the backlog is silently capped to reasonable values.
-	if backlog <= 0 {
-		backlog = minListenBacklog
-	}
 	if backlog > maxListenBacklog {
+		// Linux treats incoming backlog as uint with a limit defined by
+		// sysctl_somaxconn.
+		// https://github.com/torvalds/linux/blob/7acac4b3196/net/socket.c#L1666
 		backlog = maxListenBacklog
 	}
+
+	// Accept one more than the configured listen backlog to keep in parity with
+	// Linux. Ref, because of missing equality check here:
+	// https://github.com/torvalds/linux/blob/7acac4b3196/include/net/sock.h#L937
+	//
+	// In case of unix domain sockets, the following check
+	// https://github.com/torvalds/linux/blob/7d6beb71da3/net/unix/af_unix.c#L1293
+	// will allow 1 connect through since it checks for a receive queue len >
+	// backlog and not >=.
+	backlog++
 
 	return 0, nil, s.Listen(t, int(backlog)).ToError()
 }

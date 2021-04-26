@@ -737,7 +737,7 @@ func (ndp *ndpState) handleRA(ip tcpip.Address, ra header.NDPRouterAdvert) {
 			prefix := opt.Subnet()
 
 			// Is the prefix a link-local?
-			if header.IsV6LinkLocalAddress(prefix.ID()) {
+			if header.IsV6LinkLocalUnicastAddress(prefix.ID()) {
 				// ...Yes, skip as per RFC 4861 section 6.3.4,
 				// and RFC 4862 section 5.5.3.b (for SLAAC).
 				continue
@@ -1703,7 +1703,7 @@ func (ndp *ndpState) startSolicitingRouters() {
 			//       the unspecified address if no address is assigned
 			//       to the sending interface.
 			localAddr := header.IPv6Any
-			if addressEndpoint := ndp.ep.AcquireOutgoingPrimaryAddress(header.IPv6AllRoutersMulticastAddress, false); addressEndpoint != nil {
+			if addressEndpoint := ndp.ep.AcquireOutgoingPrimaryAddress(header.IPv6AllRoutersLinkLocalMulticastAddress, false); addressEndpoint != nil {
 				localAddr = addressEndpoint.AddressWithPrefix().Address
 				addressEndpoint.DecRef()
 			}
@@ -1730,7 +1730,7 @@ func (ndp *ndpState) startSolicitingRouters() {
 			icmpData.SetChecksum(header.ICMPv6Checksum(header.ICMPv6ChecksumParams{
 				Header: icmpData,
 				Src:    localAddr,
-				Dst:    header.IPv6AllRoutersMulticastAddress,
+				Dst:    header.IPv6AllRoutersLinkLocalMulticastAddress,
 			}))
 
 			pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
@@ -1739,14 +1739,14 @@ func (ndp *ndpState) startSolicitingRouters() {
 			})
 
 			sent := ndp.ep.stats.icmp.packetsSent
-			if err := addIPHeader(localAddr, header.IPv6AllRoutersMulticastAddress, pkt, stack.NetworkHeaderParams{
+			if err := addIPHeader(localAddr, header.IPv6AllRoutersLinkLocalMulticastAddress, pkt, stack.NetworkHeaderParams{
 				Protocol: header.ICMPv6ProtocolNumber,
 				TTL:      header.NDPHopLimit,
 			}, nil /* extensionHeaders */); err != nil {
 				panic(fmt.Sprintf("failed to add IP header: %s", err))
 			}
 
-			if err := ndp.ep.nic.WritePacketToRemote(header.EthernetAddressFromMulticastIPv6Address(header.IPv6AllRoutersMulticastAddress), nil /* gso */, ProtocolNumber, pkt); err != nil {
+			if err := ndp.ep.nic.WritePacketToRemote(header.EthernetAddressFromMulticastIPv6Address(header.IPv6AllRoutersLinkLocalMulticastAddress), ProtocolNumber, pkt); err != nil {
 				sent.dropped.Increment()
 				// Don't send any more messages if we had an error.
 				remaining = 0
@@ -1839,7 +1839,7 @@ func (e *endpoint) sendNDPNS(srcAddr, dstAddr, targetAddr tcpip.Address, remoteL
 	}
 
 	sent := e.stats.icmp.packetsSent
-	err := e.nic.WritePacketToRemote(remoteLinkAddr, nil /* gso */, ProtocolNumber, pkt)
+	err := e.nic.WritePacketToRemote(remoteLinkAddr, ProtocolNumber, pkt)
 	if err != nil {
 		sent.dropped.Increment()
 	} else {

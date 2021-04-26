@@ -178,6 +178,26 @@ const (
 	IPv4FlagDontFragment
 )
 
+// ipv4LinkLocalUnicastSubnet is the IPv4 link local unicast subnet as defined
+// by RFC 3927 section 1.
+var ipv4LinkLocalUnicastSubnet = func() tcpip.Subnet {
+	subnet, err := tcpip.NewSubnet("\xa9\xfe\x00\x00", tcpip.AddressMask("\xff\xff\x00\x00"))
+	if err != nil {
+		panic(err)
+	}
+	return subnet
+}()
+
+// ipv4LinkLocalMulticastSubnet is the IPv4 link local multicast subnet as
+// defined by RFC 5771 section 4.
+var ipv4LinkLocalMulticastSubnet = func() tcpip.Subnet {
+	subnet, err := tcpip.NewSubnet("\xe0\x00\x00\x00", tcpip.AddressMask("\xff\xff\xff\x00"))
+	if err != nil {
+		panic(err)
+	}
+	return subnet
+}()
+
 // IPv4EmptySubnet is the empty IPv4 subnet.
 var IPv4EmptySubnet = func() tcpip.Subnet {
 	subnet, err := tcpip.NewSubnet(IPv4Any, tcpip.AddressMask(IPv4Any))
@@ -421,6 +441,44 @@ func (b IPv4) IsValid(pktSize int) bool {
 	}
 
 	return true
+}
+
+// IsV4LinkLocalUnicastAddress determines if the provided address is an IPv4
+// link-local unicast address.
+func IsV4LinkLocalUnicastAddress(addr tcpip.Address) bool {
+	return ipv4LinkLocalUnicastSubnet.Contains(addr)
+}
+
+// IsV4LinkLocalMulticastAddress determines if the provided address is an IPv4
+// link-local multicast address.
+func IsV4LinkLocalMulticastAddress(addr tcpip.Address) bool {
+	return ipv4LinkLocalMulticastSubnet.Contains(addr)
+}
+
+// IsChecksumValid returns true iff the IPv4 header's checksum is valid.
+func (b IPv4) IsChecksumValid() bool {
+	// There has been some confusion regarding verifying checksums. We need
+	// just look for negative 0 (0xffff) as the checksum, as it's not possible to
+	// get positive 0 (0) for the checksum. Some bad implementations could get it
+	// when doing entry replacement in the early days of the Internet,
+	// however the lore that one needs to check for both persists.
+	//
+	// RFC 1624 section 1 describes the source of this confusion as:
+	//     [the partial recalculation method described in RFC 1071] computes a
+	//     result for certain cases that differs from the one obtained from
+	//     scratch (one's complement of one's complement sum of the original
+	//     fields).
+	//
+	// However RFC 1624 section 5 clarifies that if using the verification method
+	// "recommended by RFC 1071, it does not matter if an intermediate system
+	// generated a -0 instead of +0".
+	//
+	// RFC1071 page 1 specifies the verification method as:
+	//	  (3)  To check a checksum, the 1's complement sum is computed over the
+	//        same set of octets, including the checksum field.  If the result
+	//        is all 1 bits (-0 in 1's complement arithmetic), the check
+	//        succeeds.
+	return b.CalculateChecksum() == 0xffff
 }
 
 // IsV4MulticastAddress determines if the provided address is an IPv4 multicast

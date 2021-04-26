@@ -242,6 +242,7 @@ var Metrics = tcpip.Stats{
 		FastRetransmit:                     mustCreateMetric("/netstack/tcp/fast_retransmit", "Number of TCP segments which were fast retransmitted."),
 		Timeouts:                           mustCreateMetric("/netstack/tcp/timeouts", "Number of times RTO expired."),
 		ChecksumErrors:                     mustCreateMetric("/netstack/tcp/checksum_errors", "Number of segments dropped due to bad checksums."),
+		FailedPortReservations:             mustCreateMetric("/netstack/tcp/failed_port_reservations", "Number of time TCP failed to reserve a port."),
 	},
 	UDP: tcpip.UDPStats{
 		PacketsReceived:          mustCreateMetric("/netstack/udp/packets_received", "Number of UDP datagrams received via HandlePacket."),
@@ -885,10 +886,7 @@ func getSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, fam
 			return nil, syserr.ErrInvalidArgument
 		}
 
-		size, err := ep.GetSockOptInt(tcpip.ReceiveBufferSizeOption)
-		if err != nil {
-			return nil, syserr.TranslateNetstackError(err)
-		}
+		size := ep.SocketOptions().GetReceiveBufferSize()
 
 		if size > math.MaxInt32 {
 			size = math.MaxInt32
@@ -1661,7 +1659,7 @@ func setSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, nam
 		}
 
 		v := hostarch.ByteOrder.Uint32(optVal)
-		ep.SocketOptions().SetSendBufferSize(int64(v), true)
+		ep.SocketOptions().SetSendBufferSize(int64(v), true /* notify */)
 		return nil
 
 	case linux.SO_RCVBUF:
@@ -1670,7 +1668,8 @@ func setSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, nam
 		}
 
 		v := hostarch.ByteOrder.Uint32(optVal)
-		return syserr.TranslateNetstackError(ep.SetSockOptInt(tcpip.ReceiveBufferSizeOption, int(v)))
+		ep.SocketOptions().SetReceiveBufferSize(int64(v), true /* notify */)
+		return nil
 
 	case linux.SO_REUSEADDR:
 		if len(optVal) < sizeOfInt32 {

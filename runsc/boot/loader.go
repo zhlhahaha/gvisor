@@ -29,10 +29,12 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/bpf"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/coverage"
 	"gvisor.dev/gvisor/pkg/cpuid"
 	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/memutil"
+	"gvisor.dev/gvisor/pkg/metric"
 	"gvisor.dev/gvisor/pkg/rand"
 	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/refsvfs2"
@@ -215,6 +217,8 @@ func New(args Args) (*Loader, error) {
 	if err := usage.Init(); err != nil {
 		return nil, fmt.Errorf("setting up memory usage: %v", err)
 	}
+
+	metric.CreateSentryMetrics()
 
 	// Is this a VFSv2 kernel?
 	if args.Conf.VFS2 {
@@ -491,10 +495,6 @@ func (l *Loader) Destroy() {
 	// save/restore.
 	l.k.Release()
 
-	// All sentry-created resources should have been released at this point;
-	// check for reference leaks.
-	refsvfs2.DoLeakCheck()
-
 	// In the success case, stdioFDs and goferFDs will only contain
 	// released/closed FDs that ownership has been passed over to host FDs and
 	// gofer sessions. Close them here in case of failure.
@@ -752,7 +752,7 @@ func (l *Loader) createContainerProcess(root bool, cid string, info *containerIn
 	// Setup the child container file system.
 	l.startGoferMonitor(cid, info.goferFDs)
 
-	mntr := newContainerMounter(info.spec, info.goferFDs, l.k, l.mountHints, kernel.VFS2Enabled)
+	mntr := newContainerMounter(info, l.k, l.mountHints, kernel.VFS2Enabled)
 	if root {
 		if err := mntr.processHints(info.conf, info.procArgs.Credentials); err != nil {
 			return nil, nil, nil, err
@@ -1000,6 +1000,15 @@ func (l *Loader) waitContainer(cid string, waitStatus *uint32) error {
 	// consider the container exited.
 	ws := l.wait(tg)
 	*waitStatus = ws
+
+	// Check for leaks and write coverage report after the root container has
+	// exited. This guarantees that the report is written in cases where the
+	// sandbox is killed by a signal after the ContainerWait request is completed.
+	if l.root.procArgs.ContainerID == cid {
+		// All sentry-created resources should have been released at this point.
+		refsvfs2.DoLeakCheck()
+		coverage.Report()
+	}
 	return nil
 }
 

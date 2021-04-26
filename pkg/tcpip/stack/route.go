@@ -132,7 +132,7 @@ func constructAndValidateRoute(netProto tcpip.NetworkProtocolNumber, addressEndp
 		localAddr = addressEndpoint.AddressWithPrefix().Address
 	}
 
-	if localAddressNIC != outgoingNIC && header.IsV6LinkLocalAddress(localAddr) {
+	if localAddressNIC != outgoingNIC && header.IsV6LinkLocalUnicastAddress(localAddr) {
 		addressEndpoint.DecRef()
 		return nil
 	}
@@ -448,22 +448,22 @@ func (r *Route) isValidForOutgoingRLocked() bool {
 }
 
 // WritePacket writes the packet through the given route.
-func (r *Route) WritePacket(gso *GSO, params NetworkHeaderParams, pkt *PacketBuffer) tcpip.Error {
+func (r *Route) WritePacket(params NetworkHeaderParams, pkt *PacketBuffer) tcpip.Error {
 	if !r.isValidForOutgoing() {
 		return &tcpip.ErrInvalidEndpointState{}
 	}
 
-	return r.outgoingNIC.getNetworkEndpoint(r.NetProto()).WritePacket(r, gso, params, pkt)
+	return r.outgoingNIC.getNetworkEndpoint(r.NetProto()).WritePacket(r, params, pkt)
 }
 
 // WritePackets writes a list of n packets through the given route and returns
 // the number of packets written.
-func (r *Route) WritePackets(gso *GSO, pkts PacketBufferList, params NetworkHeaderParams) (int, tcpip.Error) {
+func (r *Route) WritePackets(pkts PacketBufferList, params NetworkHeaderParams) (int, tcpip.Error) {
 	if !r.isValidForOutgoing() {
 		return 0, &tcpip.ErrInvalidEndpointState{}
 	}
 
-	return r.outgoingNIC.getNetworkEndpoint(r.NetProto()).WritePackets(r, gso, pkts, params)
+	return r.outgoingNIC.getNetworkEndpoint(r.NetProto()).WritePackets(r, pkts, params)
 }
 
 // WriteHeaderIncludedPacket writes a packet already containing a network

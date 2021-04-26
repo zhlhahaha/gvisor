@@ -691,10 +691,6 @@ const (
 	// number of unread bytes in the input buffer should be returned.
 	ReceiveQueueSizeOption
 
-	// ReceiveBufferSizeOption is used by SetSockOptInt/GetSockOptInt to
-	// specify the receive buffer size option.
-	ReceiveBufferSizeOption
-
 	// SendQueueSizeOption is used in GetSockOptInt to specify that the
 	// number of unread bytes in the output buffer should be returned.
 	SendQueueSizeOption
@@ -785,6 +781,13 @@ type TCPRecovery int32
 func (*TCPRecovery) isGettableTransportProtocolOption() {}
 
 func (*TCPRecovery) isSettableTransportProtocolOption() {}
+
+// TCPAlwaysUseSynCookies indicates unconditional usage of syncookies.
+type TCPAlwaysUseSynCookies bool
+
+func (*TCPAlwaysUseSynCookies) isGettableTransportProtocolOption() {}
+
+func (*TCPAlwaysUseSynCookies) isSettableTransportProtocolOption() {}
 
 const (
 	// TCPRACKLossDetection indicates RACK is used for loss detection and
@@ -1020,19 +1023,6 @@ func (*TCPMaxRetriesOption) isGettableTransportProtocolOption() {}
 
 func (*TCPMaxRetriesOption) isSettableTransportProtocolOption() {}
 
-// TCPSynRcvdCountThresholdOption is used by SetSockOpt/GetSockOpt to specify
-// the number of endpoints that can be in SYN-RCVD state before the stack
-// switches to using SYN cookies.
-type TCPSynRcvdCountThresholdOption uint64
-
-func (*TCPSynRcvdCountThresholdOption) isGettableSocketOption() {}
-
-func (*TCPSynRcvdCountThresholdOption) isSettableSocketOption() {}
-
-func (*TCPSynRcvdCountThresholdOption) isGettableTransportProtocolOption() {}
-
-func (*TCPSynRcvdCountThresholdOption) isSettableTransportProtocolOption() {}
-
 // TCPSynRetriesOption is used by SetSockOpt/GetSockOpt to specify stack-wide
 // default for number of times SYN is retransmitted before aborting a connect.
 type TCPSynRetriesOption uint8
@@ -1150,12 +1140,37 @@ type SendBufferSizeOption struct {
 	Max int
 }
 
+// ReceiveBufferSizeOption is used by stack.(Stack*).Option/SetOption to
+// get/set the default, min and max receive buffer sizes.
+type ReceiveBufferSizeOption struct {
+	// Min is the minimum size for send buffer.
+	Min int
+
+	// Default is the default size for send buffer.
+	Default int
+
+	// Max is the maximum size for send buffer.
+	Max int
+}
+
 // GetSendBufferLimits is used to get the send buffer size limits.
 type GetSendBufferLimits func(StackHandler) SendBufferSizeOption
 
 // GetStackSendBufferLimits is used to get default, min and max send buffer size.
 func GetStackSendBufferLimits(so StackHandler) SendBufferSizeOption {
 	var ss SendBufferSizeOption
+	if err := so.Option(&ss); err != nil {
+		panic(fmt.Sprintf("s.Option(%#v) = %s", ss, err))
+	}
+	return ss
+}
+
+// GetReceiveBufferLimits is used to get the send buffer size limits.
+type GetReceiveBufferLimits func(StackHandler) ReceiveBufferSizeOption
+
+// GetStackReceiveBufferLimits is used to get default, min and max send buffer size.
+func GetStackReceiveBufferLimits(so StackHandler) ReceiveBufferSizeOption {
+	var ss ReceiveBufferSizeOption
 	if err := so.Option(&ss); err != nil {
 		panic(fmt.Sprintf("s.Option(%#v) = %s", ss, err))
 	}
@@ -1218,7 +1233,7 @@ func (s *StatCounter) Decrement() {
 }
 
 // Value returns the current value of the counter.
-func (s *StatCounter) Value() uint64 {
+func (s *StatCounter) Value(name ...string) uint64 {
 	return atomic.LoadUint64(&s.count)
 }
 
@@ -1562,6 +1577,10 @@ type IPStats struct {
 	// chain.
 	IPTablesOutputDropped *StatCounter
 
+	// IPTablesPostroutingDropped is the number of IP packets dropped in the
+	// Postrouting chain.
+	IPTablesPostroutingDropped *StatCounter
+
 	// TODO(https://gvisor.dev/issues/5529): Move the IPv4-only option stats out
 	// of IPStats.
 	// OptionTimestampReceived is the number of Timestamp options seen.
@@ -1734,6 +1753,10 @@ type TCPStats struct {
 
 	// ChecksumErrors is the number of segments dropped due to bad checksums.
 	ChecksumErrors *StatCounter
+
+	// FailedPortReservations is the number of times TCP failed to reserve
+	// a port.
+	FailedPortReservations *StatCounter
 }
 
 // UDPStats collects UDP-specific stats.
