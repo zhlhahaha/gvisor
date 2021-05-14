@@ -37,9 +37,9 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
@@ -73,7 +73,7 @@ type Clock interface {
 	// nanoseconds since the Unix epoch.
 	NowNanoseconds() int64
 
-	// NowMonotonic returns a monotonic time value.
+	// NowMonotonic returns a monotonic time value at nanosecond resolution.
 	NowMonotonic() int64
 
 	// AfterFunc waits for the duration to elapse and then calls f in its own
@@ -1107,6 +1107,7 @@ const (
 // LingerOption is used by SetSockOpt/GetSockOpt to set/get the
 // duration for which a socket lingers before returning from Close.
 //
+// +marshal
 // +stateify savable
 type LingerOption struct {
 	Enabled bool
@@ -1219,7 +1220,7 @@ type NetworkProtocolNumber uint32
 
 // A StatCounter keeps track of a statistic.
 type StatCounter struct {
-	count uint64
+	count atomicbitops.AlignedAtomicUint64
 }
 
 // Increment adds one to the counter.
@@ -1234,12 +1235,12 @@ func (s *StatCounter) Decrement() {
 
 // Value returns the current value of the counter.
 func (s *StatCounter) Value(name ...string) uint64 {
-	return atomic.LoadUint64(&s.count)
+	return s.count.Load()
 }
 
 // IncrementBy increments the counter by v.
 func (s *StatCounter) IncrementBy(v uint64) {
-	atomic.AddUint64(&s.count, v)
+	s.count.Add(v)
 }
 
 func (s *StatCounter) String() string {
@@ -1527,12 +1528,52 @@ type IGMPStats struct {
 	// LINT.ThenChange(network/ipv4/stats.go:multiCounterIGMPStats)
 }
 
+// IPForwardingStats collects stats related to IP forwarding (both v4 and v6).
+type IPForwardingStats struct {
+	// LINT.IfChange(IPForwardingStats)
+
+	// Unrouteable is the number of IP packets received which were dropped
+	// because a route to their destination could not be constructed.
+	Unrouteable *StatCounter
+
+	// ExhaustedTTL is the number of IP packets received which were dropped
+	// because their TTL was exhausted.
+	ExhaustedTTL *StatCounter
+
+	// LinkLocalSource is the number of IP packets which were dropped
+	// because they contained a link-local source address.
+	LinkLocalSource *StatCounter
+
+	// LinkLocalDestination is the number of IP packets which were dropped
+	// because they contained a link-local destination address.
+	LinkLocalDestination *StatCounter
+
+	// PacketTooBig is the number of IP packets which were dropped because they
+	// were too big for the outgoing MTU.
+	PacketTooBig *StatCounter
+
+	// ExtensionHeaderProblem is the number of IP packets which were dropped
+	// because of a problem encountered when processing an IPv6 extension
+	// header.
+	ExtensionHeaderProblem *StatCounter
+
+	// Errors is the number of IP packets received which could not be
+	// successfully forwarded.
+	Errors *StatCounter
+
+	// LINT.ThenChange(network/internal/ip/stats.go:multiCounterIPForwardingStats)
+}
+
 // IPStats collects IP-specific stats (both v4 and v6).
 type IPStats struct {
 	// LINT.IfChange(IPStats)
 
 	// PacketsReceived is the number of IP packets received from the link layer.
 	PacketsReceived *StatCounter
+
+	// ValidPacketsReceived is the number of valid IP packets that reached the IP
+	// layer.
+	ValidPacketsReceived *StatCounter
 
 	// DisabledPacketsReceived is the number of IP packets received from the link
 	// layer when the IP layer is disabled.
@@ -1573,6 +1614,10 @@ type IPStats struct {
 	// chain.
 	IPTablesInputDropped *StatCounter
 
+	// IPTablesForwardDropped is the number of IP packets dropped in the Forward
+	// chain.
+	IPTablesForwardDropped *StatCounter
+
 	// IPTablesOutputDropped is the number of IP packets dropped in the Output
 	// chain.
 	IPTablesOutputDropped *StatCounter
@@ -1594,6 +1639,9 @@ type IPStats struct {
 
 	// OptionUnknownReceived is the number of unknown IP options seen.
 	OptionUnknownReceived *StatCounter
+
+	// Forwarding collects stats related to IP forwarding.
+	Forwarding IPForwardingStats
 
 	// LINT.ThenChange(network/internal/ip/stats.go:MultiCounterIPStats)
 }

@@ -55,6 +55,9 @@ type NetworkPacketInfo struct {
 	// LocalAddressBroadcast is true if the packet's local address is a broadcast
 	// address.
 	LocalAddressBroadcast bool
+
+	// IsForwardedPacket is true if the packet is being forwarded.
+	IsForwardedPacket bool
 }
 
 // TransportErrorKind enumerates error types that are handled by the transport
@@ -756,11 +759,6 @@ const (
 	CapabilitySaveRestore
 	CapabilityDisconnectOk
 	CapabilityLoopback
-	CapabilityHardwareGSO
-
-	// CapabilitySoftwareGSO indicates the link endpoint supports of sending
-	// multiple packets using a single call (LinkEndpoint.WritePackets).
-	CapabilitySoftwareGSO
 )
 
 // NetworkLinkEndpoint is a data-link layer that supports sending network
@@ -1047,10 +1045,29 @@ type GSO struct {
 	MaxSize uint32
 }
 
+// SupportedGSO returns the type of segmentation offloading supported.
+type SupportedGSO int
+
+const (
+	// GSONotSupported indicates that segmentation offloading is not supported.
+	GSONotSupported SupportedGSO = iota
+
+	// HWGSOSupported indicates that segmentation offloading may be performed by
+	// the hardware.
+	HWGSOSupported
+
+	// SWGSOSupported indicates that segmentation offloading may be performed in
+	// software.
+	SWGSOSupported
+)
+
 // GSOEndpoint provides access to GSO properties.
 type GSOEndpoint interface {
 	// GSOMaxSize returns the maximum GSO packet size.
 	GSOMaxSize() uint32
+
+	// SupportedGSO returns the supported segmentation offloading.
+	SupportedGSO() SupportedGSO
 }
 
 // SoftwareGSOMaxSize is a maximum allowed size of a software GSO segment.

@@ -840,7 +840,6 @@ func (fd *fileDescription) Release(ctx context.Context) {
 
 // Stat implements vfs.FileDescriptionImpl.Stat.
 func (fd *fileDescription) Stat(ctx context.Context, opts vfs.StatOptions) (linux.Statx, error) {
-	// TODO(b/162788573): Add integrity check for metadata.
 	stat, err := fd.lowerFD.Stat(ctx, opts)
 	if err != nil {
 		return linux.Statx{}, err
@@ -960,10 +959,9 @@ func (fd *fileDescription) generateMerkleLocked(ctx context.Context) ([]byte, ui
 	}
 
 	params := &merkletree.GenerateParams{
-		TreeReader: &merkleReader,
-		TreeWriter: &merkleWriter,
-		Children:   fd.d.childrenNames,
-		//TODO(b/156980949): Support passing other hash algorithms.
+		TreeReader:     &merkleReader,
+		TreeWriter:     &merkleWriter,
+		Children:       fd.d.childrenNames,
 		HashAlgorithms: fd.d.fs.alg.toLinuxHashAlg(),
 		Name:           fd.d.name,
 		Mode:           uint32(stat.Mode),
@@ -1192,8 +1190,6 @@ func (fd *fileDescription) Ioctl(ctx context.Context, uio usermem.IO, args arch.
 	case linux.FS_IOC_GETFLAGS:
 		return fd.verityFlags(ctx, args[2].Pointer())
 	default:
-		// TODO(b/169682228): Investigate which ioctl commands should
-		// be allowed.
 		return 0, syserror.ENOSYS
 	}
 }
@@ -1253,16 +1249,15 @@ func (fd *fileDescription) PRead(ctx context.Context, dst usermem.IOSequence, of
 
 	fd.d.hashMu.RLock()
 	n, err := merkletree.Verify(&merkletree.VerifyParams{
-		Out:      dst.Writer(ctx),
-		File:     &dataReader,
-		Tree:     &merkleReader,
-		Size:     int64(size),
-		Name:     fd.d.name,
-		Mode:     fd.d.mode,
-		UID:      fd.d.uid,
-		GID:      fd.d.gid,
-		Children: fd.d.childrenNames,
-		//TODO(b/156980949): Support passing other hash algorithms.
+		Out:                   dst.Writer(ctx),
+		File:                  &dataReader,
+		Tree:                  &merkleReader,
+		Size:                  int64(size),
+		Name:                  fd.d.name,
+		Mode:                  fd.d.mode,
+		UID:                   fd.d.uid,
+		GID:                   fd.d.gid,
+		Children:              fd.d.childrenNames,
 		HashAlgorithms:        fd.d.fs.alg.toLinuxHashAlg(),
 		ReadOffset:            offset,
 		ReadSize:              dst.NumBytes(),
@@ -1333,7 +1328,7 @@ func (fd *fileDescription) TestPOSIX(ctx context.Context, uid fslock.UniqueID, t
 func (fd *fileDescription) Translate(ctx context.Context, required, optional memmap.MappableRange, at hostarch.AccessType) ([]memmap.Translation, error) {
 	ts, err := fd.lowerMappable.Translate(ctx, required, optional, at)
 	if err != nil {
-		return ts, err
+		return nil, err
 	}
 
 	// dataSize is the size of the whole file.
@@ -1346,17 +1341,17 @@ func (fd *fileDescription) Translate(ctx context.Context, required, optional mem
 	// contains the expected xattrs. If the xattr does not exist, it
 	// indicates unexpected modifications to the file system.
 	if err == syserror.ENODATA {
-		return ts, fd.d.fs.alertIntegrityViolation(fmt.Sprintf("Failed to get xattr %s: %v", merkleSizeXattr, err))
+		return nil, fd.d.fs.alertIntegrityViolation(fmt.Sprintf("Failed to get xattr %s: %v", merkleSizeXattr, err))
 	}
 	if err != nil {
-		return ts, err
+		return nil, err
 	}
 
 	// The dataSize xattr should be an integer. If it's not, it indicates
 	// unexpected modifications to the file system.
 	size, err := strconv.Atoi(dataSize)
 	if err != nil {
-		return ts, fd.d.fs.alertIntegrityViolation(fmt.Sprintf("Failed to convert xattr %s to int: %v", merkleSizeXattr, err))
+		return nil, fd.d.fs.alertIntegrityViolation(fmt.Sprintf("Failed to convert xattr %s to int: %v", merkleSizeXattr, err))
 	}
 
 	merkleReader := FileReadWriteSeeker{
@@ -1389,7 +1384,7 @@ func (fd *fileDescription) Translate(ctx context.Context, required, optional mem
 			DataAndTreeInSameFile: false,
 		})
 		if err != nil {
-			return ts, fd.d.fs.alertIntegrityViolation(fmt.Sprintf("Verification failed: %v", err))
+			return nil, fd.d.fs.alertIntegrityViolation(fmt.Sprintf("Verification failed: %v", err))
 		}
 	}
 	return ts, err
