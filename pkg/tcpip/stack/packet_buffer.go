@@ -134,7 +134,7 @@ type PacketBuffer struct {
 	// https://www.man7.org/linux/man-pages/man7/packet.7.html.
 	PktType tcpip.PacketType
 
-	// NICID is the ID of the interface the network packet was received at.
+	// NICID is the ID of the last interface the network packet was handled at.
 	NICID tcpip.NICID
 
 	// RXTransportChecksumValidated indicates that transport checksum verification
@@ -245,10 +245,10 @@ func (pk *PacketBuffer) dataOffset() int {
 func (pk *PacketBuffer) push(typ headerType, size int) tcpipbuffer.View {
 	h := &pk.headers[typ]
 	if h.length > 0 {
-		panic(fmt.Sprintf("push must not be called twice: type %s", typ))
+		panic(fmt.Sprintf("push(%s, %d) called after previous push", typ, size))
 	}
 	if pk.pushed+size > pk.reserved {
-		panic("not enough headroom reserved")
+		panic(fmt.Sprintf("push(%s, %d) overflows; pushed=%d reserved=%d", typ, size, pk.pushed, pk.reserved))
 	}
 	pk.pushed += size
 	h.offset = -pk.pushed
@@ -261,7 +261,7 @@ func (pk *PacketBuffer) consume(typ headerType, size int) (v tcpipbuffer.View, c
 	if h.length > 0 {
 		panic(fmt.Sprintf("consume must not be called twice: type %s", typ))
 	}
-	if pk.headerOffset()+pk.consumed+size > int(pk.buf.Size()) {
+	if pk.reserved+pk.consumed+size > int(pk.buf.Size()) {
 		return nil, false
 	}
 	h.offset = pk.consumed

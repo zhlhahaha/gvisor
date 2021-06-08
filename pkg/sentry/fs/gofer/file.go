@@ -21,6 +21,7 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/metric"
 	"gvisor.dev/gvisor/pkg/p9"
 	"gvisor.dev/gvisor/pkg/sentry/device"
 	"gvisor.dev/gvisor/pkg/sentry/fs"
@@ -91,7 +92,7 @@ func NewFile(ctx context.Context, dirent *fs.Dirent, name string, flags fs.FileF
 	}
 	if flags.Write {
 		if err := dirent.Inode.CheckPermission(ctx, fs.PermMask{Execute: true}); err == nil {
-			fsmetric.GoferOpensWX.Increment()
+			metric.SuspiciousOperationsMetric.Increment("opened_write_execute_file")
 			log.Warningf("Opened a writable executable: %q", name)
 		}
 	}
@@ -236,10 +237,20 @@ func (f *fileOperations) Write(ctx context.Context, file *fs.File, src usermem.I
 	// and availability of a host-mappable FD.
 	if f.inodeOperations.session().cachePolicy.useCachingInodeOps(file.Dirent.Inode) {
 		n, err = f.inodeOperations.cachingInodeOps.Write(ctx, src, offset)
-	} else if f.inodeOperations.fileState.hostMappable != nil {
-		n, err = f.inodeOperations.fileState.hostMappable.Write(ctx, src, offset)
 	} else {
-		n, err = src.CopyInTo(ctx, f.handles.readWriterAt(ctx, offset))
+		uattr, e := f.UnstableAttr(ctx, file)
+		if e != nil {
+			return 0, e
+		}
+		if f.inodeOperations.fileState.hostMappable != nil {
+			n, err = f.inodeOperations.fileState.hostMappable.Write(ctx, src, offset, uattr)
+		} else {
+			n, err = src.CopyInTo(ctx, f.handles.readWriterAt(ctx, offset))
+			if n > 0 && uattr.Perms.HasSetUIDOrGID() {
+				uattr.Perms.DropSetUIDAndMaybeGID()
+				f.inodeOperations.SetPermissions(ctx, file.Dirent.Inode, uattr.Perms)
+			}
+		}
 	}
 
 	if n == 0 {

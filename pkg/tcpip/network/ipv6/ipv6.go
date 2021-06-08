@@ -63,6 +63,11 @@ const (
 	buckets = 2048
 )
 
+const (
+	forwardingDisabled = 0
+	forwardingEnabled  = 1
+)
+
 // policyTable is the default policy table defined in RFC 6724 section 2.1.
 //
 // A more human-readable version:
@@ -168,6 +173,7 @@ func getLabel(addr tcpip.Address) uint8 {
 var _ stack.DuplicateAddressDetector = (*endpoint)(nil)
 var _ stack.LinkAddressResolver = (*endpoint)(nil)
 var _ stack.LinkResolvableNetworkEndpoint = (*endpoint)(nil)
+var _ stack.ForwardingNetworkEndpoint = (*endpoint)(nil)
 var _ stack.GroupAddressableEndpoint = (*endpoint)(nil)
 var _ stack.AddressableEndpoint = (*endpoint)(nil)
 var _ stack.NetworkEndpoint = (*endpoint)(nil)
@@ -178,7 +184,6 @@ type endpoint struct {
 	nic        stack.NetworkInterface
 	dispatcher stack.TransportDispatcher
 	protocol   *protocol
-	stack      *stack.Stack
 	stats      sharedStats
 
 	// enabled is set to 1 when the endpoint is enabled and 0 when it is
@@ -186,6 +191,12 @@ type endpoint struct {
 	//
 	// Must be accessed using atomic operations.
 	enabled uint32
+
+	// forwarding is set to forwardingEnabled when the endpoint has forwarding
+	// enabled and forwardingDisabled when it is disabled.
+	//
+	// Must be accessed using atomic operations.
+	forwarding uint32
 
 	mu struct {
 		sync.RWMutex
@@ -219,11 +230,11 @@ type endpoint struct {
 // If the NIC was created with a name, it is passed to NICNameFromID.
 //
 // NICNameFromID SHOULD return unique NIC names so unique opaque IIDs are
-// generated for the same prefix on differnt NICs.
+// generated for the same prefix on different NICs.
 type NICNameFromID func(tcpip.NICID, string) string
 
 // OpaqueInterfaceIdentifierOptions holds the options related to the generation
-// of opaque interface indentifiers (IIDs) as defined by RFC 7217.
+// of opaque interface identifiers (IIDs) as defined by RFC 7217.
 type OpaqueInterfaceIdentifierOptions struct {
 	// NICNameFromID is a function that returns a stable name for a specified NIC,
 	// even if the NIC ID changes over time.
@@ -270,6 +281,16 @@ func (*endpoint) DuplicateAddressProtocol() tcpip.NetworkProtocolNumber {
 
 // HandleLinkResolutionFailure implements stack.LinkResolvableNetworkEndpoint.
 func (e *endpoint) HandleLinkResolutionFailure(pkt *stack.PacketBuffer) {
+	// If we are operating as a router, we should return an ICMP error to the
+	// original packet's sender.
+	if pkt.NetworkPacketInfo.IsForwardedPacket {
+		// TODO(gvisor.dev/issue/6005): Propagate asynchronously generated ICMP
+		// errors to local endpoints.
+		e.protocol.returnError(&icmpReasonHostUnreachable{}, pkt)
+		e.stats.ip.Forwarding.Errors.Increment()
+		e.stats.ip.Forwarding.HostUnreachable.Increment()
+		return
+	}
 	// handleControl expects the entire offending packet to be in the packet
 	// buffer's data field.
 	pkt = stack.NewPacketBuffer(stack.PacketBufferOptions{
@@ -405,19 +426,37 @@ func (e *endpoint) dupTentativeAddrDetected(addr tcpip.Address, holderLinkAddr t
 	}
 }
 
-// transitionForwarding transitions the endpoint's forwarding status to
-// forwarding.
+// Forwarding implements stack.ForwardingNetworkEndpoint.
+func (e *endpoint) Forwarding() bool {
+	return atomic.LoadUint32(&e.forwarding) == forwardingEnabled
+}
+
+// setForwarding sets the forwarding status for the endpoint.
 //
-// Must only be called when the forwarding status changes.
-func (e *endpoint) transitionForwarding(forwarding bool) {
+// Returns true if the forwarding status was updated.
+func (e *endpoint) setForwarding(v bool) bool {
+	forwarding := uint32(forwardingDisabled)
+	if v {
+		forwarding = forwardingEnabled
+	}
+
+	return atomic.SwapUint32(&e.forwarding, forwarding) != forwarding
+}
+
+// SetForwarding implements stack.ForwardingNetworkEndpoint.
+func (e *endpoint) SetForwarding(forwarding bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if !e.setForwarding(forwarding) {
+		return
+	}
+
 	allRoutersGroups := [...]tcpip.Address{
 		header.IPv6AllRoutersInterfaceLocalMulticastAddress,
 		header.IPv6AllRoutersLinkLocalMulticastAddress,
 		header.IPv6AllRoutersSiteLocalMulticastAddress,
 	}
-
-	e.mu.Lock()
-	defer e.mu.Unlock()
 
 	if forwarding {
 		// As per RFC 4291 section 2.8:
@@ -506,7 +545,7 @@ func (e *endpoint) Enable() tcpip.Error {
 	// Perform DAD on the all the unicast IPv6 endpoints that are in the permanent
 	// state.
 	//
-	// Addresses may have aleady completed DAD but in the time since the endpoint
+	// Addresses may have already completed DAD but in the time since the endpoint
 	// was last enabled, other devices may have acquired the same addresses.
 	var err tcpip.Error
 	e.mu.addressableEndpointState.ForEachEndpoint(func(addressEndpoint stack.AddressEndpoint) bool {
@@ -611,8 +650,8 @@ func (e *endpoint) DefaultTTL() uint8 {
 	return e.protocol.DefaultTTL()
 }
 
-// MTU implements stack.NetworkEndpoint.MTU. It returns the link-layer MTU minus
-// the network layer max header length.
+// MTU implements stack.NetworkEndpoint. It returns the link-layer MTU minus the
+// network layer max header length.
 func (e *endpoint) MTU() uint32 {
 	networkMTU, err := calculateNetworkMTU(e.nic.MTU(), header.IPv6MinimumSize)
 	if err != nil {
@@ -636,8 +675,7 @@ func addIPHeader(srcAddr, dstAddr tcpip.Address, pkt *stack.PacketBuffer, params
 	if length > math.MaxUint16 {
 		return &tcpip.ErrMessageTooLong{}
 	}
-	ip := header.IPv6(pkt.NetworkHeader().Push(header.IPv6MinimumSize + extHdrsLen))
-	ip.Encode(&header.IPv6Fields{
+	header.IPv6(pkt.NetworkHeader().Push(header.IPv6MinimumSize + extHdrsLen)).Encode(&header.IPv6Fields{
 		PayloadLength:     uint16(length),
 		TransportProtocol: params.Protocol,
 		HopLimit:          params.TTL,
@@ -788,7 +826,7 @@ func (e *endpoint) writePacket(r *stack.Route, pkt *stack.PacketBuffer, protocol
 	return nil
 }
 
-// WritePackets implements stack.NetworkEndpoint.WritePackets.
+// WritePackets implements stack.NetworkEndpoint.
 func (e *endpoint) WritePackets(r *stack.Route, pkts stack.PacketBufferList, params stack.NetworkHeaderParams) (int, tcpip.Error) {
 	if r.Loop()&stack.PacketLoop != 0 {
 		panic("not implemented")
@@ -879,20 +917,20 @@ func (e *endpoint) WriteHeaderIncludedPacket(r *stack.Route, pkt *stack.PacketBu
 	if !ok {
 		return &tcpip.ErrMalformedHeader{}
 	}
-	ip := header.IPv6(h)
+	ipH := header.IPv6(h)
 
 	// Always set the payload length.
 	pktSize := pkt.Data().Size()
-	ip.SetPayloadLength(uint16(pktSize - header.IPv6MinimumSize))
+	ipH.SetPayloadLength(uint16(pktSize - header.IPv6MinimumSize))
 
 	// Set the source address when zero.
-	if ip.SourceAddress() == header.IPv6Any {
-		ip.SetSourceAddress(r.LocalAddress())
+	if ipH.SourceAddress() == header.IPv6Any {
+		ipH.SetSourceAddress(r.LocalAddress())
 	}
 
 	// Set the destination. If the packet already included a destination, it will
 	// be part of the route anyways.
-	ip.SetDestinationAddress(r.RemoteAddress())
+	ipH.SetDestinationAddress(r.RemoteAddress())
 
 	// Populate the packet buffer's network header and don't allow an invalid
 	// packet to be sent.
@@ -953,7 +991,8 @@ func (e *endpoint) forwardPacket(pkt *stack.PacketBuffer) ip.ForwardingError {
 			return nil
 		}
 
-		ep.handleValidatedPacket(h, pkt)
+		// The packet originally arrived on e so provide its NIC as the input NIC.
+		ep.handleValidatedPacket(h, pkt, e.nic.Name() /* inNICName */)
 		return nil
 	}
 
@@ -1066,7 +1105,7 @@ func (e *endpoint) HandlePacket(pkt *stack.PacketBuffer) {
 		}
 	}
 
-	e.handleValidatedPacket(h, pkt)
+	e.handleValidatedPacket(h, pkt, e.nic.Name() /* inNICName */)
 }
 
 // handleLocalPacket is like HandlePacket except it does not perform the
@@ -1085,10 +1124,10 @@ func (e *endpoint) handleLocalPacket(pkt *stack.PacketBuffer, canSkipRXChecksum 
 		return
 	}
 
-	e.handleValidatedPacket(h, pkt)
+	e.handleValidatedPacket(h, pkt, e.nic.Name() /* inNICName */)
 }
 
-func (e *endpoint) handleValidatedPacket(h header.IPv6, pkt *stack.PacketBuffer) {
+func (e *endpoint) handleValidatedPacket(h header.IPv6, pkt *stack.PacketBuffer, inNICName string) {
 	pkt.NICID = e.nic.ID()
 	stats := e.stats.ip
 	stats.ValidPacketsReceived.Increment()
@@ -1109,7 +1148,7 @@ func (e *endpoint) handleValidatedPacket(h header.IPv6, pkt *stack.PacketBuffer)
 	if addressEndpoint := e.AcquireAssignedAddress(dstAddr, e.nic.Promiscuous(), stack.CanBePrimaryEndpoint); addressEndpoint != nil {
 		addressEndpoint.DecRef()
 	} else if !e.IsInGroup(dstAddr) {
-		if !e.protocol.Forwarding() {
+		if !e.Forwarding() {
 			stats.InvalidDestinationAddressesReceived.Increment()
 			return
 		}
@@ -1137,8 +1176,7 @@ func (e *endpoint) handleValidatedPacket(h header.IPv6, pkt *stack.PacketBuffer)
 
 	// iptables filtering. All packets that reach here are intended for
 	// this machine and need not be forwarded.
-	inNicName := e.protocol.stack.FindNICNameFromID(e.nic.ID())
-	if ok := e.protocol.stack.IPTables().Check(stack.Input, pkt, nil, "" /* preroutingAddr */, inNicName, "" /* outNicName */); !ok {
+	if ok := e.protocol.stack.IPTables().Check(stack.Input, pkt, nil, "" /* preroutingAddr */, inNICName, "" /* outNicName */); !ok {
 		// iptables is telling us to drop the packet.
 		stats.IPTablesInputDropped.Increment()
 		return
@@ -1580,7 +1618,7 @@ func (e *endpoint) Close() {
 	e.protocol.forgetEndpoint(e.nic.ID())
 }
 
-// NetworkProtocolNumber implements stack.NetworkEndpoint.NetworkProtocolNumber.
+// NetworkProtocolNumber implements stack.NetworkEndpoint.
 func (e *endpoint) NetworkProtocolNumber() tcpip.NetworkProtocolNumber {
 	return e.protocol.Number()
 }
@@ -1589,8 +1627,8 @@ func (e *endpoint) NetworkProtocolNumber() tcpip.NetworkProtocolNumber {
 func (e *endpoint) AddAndAcquirePermanentAddress(addr tcpip.AddressWithPrefix, peb stack.PrimaryEndpointBehavior, configType stack.AddressConfigType, deprecated bool) (stack.AddressEndpoint, tcpip.Error) {
 	// TODO(b/169350103): add checks here after making sure we no longer receive
 	// an empty address.
-	e.mu.RLock()
-	defer e.mu.RUnlock()
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	return e.addAndAcquirePermanentAddressLocked(addr, peb, configType, deprecated)
 }
 
@@ -1631,8 +1669,8 @@ func (e *endpoint) addAndAcquirePermanentAddressLocked(addr tcpip.AddressWithPre
 
 // RemovePermanentAddress implements stack.AddressableEndpoint.
 func (e *endpoint) RemovePermanentAddress(addr tcpip.Address) tcpip.Error {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
+	e.mu.Lock()
+	defer e.mu.Unlock()
 
 	addressEndpoint := e.getAddressRLocked(addr)
 	if addressEndpoint == nil || !addressEndpoint.GetKind().IsPermanent() {
@@ -1932,7 +1970,6 @@ func (e *endpoint) Stats() stack.NetworkEndpointStats {
 	return &e.stats.localStats
 }
 
-var _ stack.ForwardingNetworkProtocol = (*protocol)(nil)
 var _ stack.NetworkProtocol = (*protocol)(nil)
 var _ fragmentation.TimeoutHandler = (*protocol)(nil)
 
@@ -1957,12 +1994,6 @@ type protocol struct {
 	// Must be accessed using atomic operations.
 	defaultTTL uint32
 
-	// forwarding is set to 1 when the protocol has forwarding enabled and 0
-	// when it is disabled.
-	//
-	// Must be accessed using atomic operations.
-	forwarding uint32
-
 	fragmentation *fragmentation.Fragmentation
 }
 
@@ -1981,7 +2012,7 @@ func (p *protocol) DefaultPrefixLen() int {
 	return header.IPv6AddressSize * 8
 }
 
-// ParseAddresses implements NetworkProtocol.ParseAddresses.
+// ParseAddresses implements stack.NetworkProtocol.
 func (*protocol) ParseAddresses(v buffer.View) (src, dst tcpip.Address) {
 	h := header.IPv6(v)
 	return h.SourceAddress(), h.DestinationAddress()
@@ -2058,7 +2089,7 @@ func (p *protocol) forgetEndpoint(nicID tcpip.NICID) {
 	delete(p.mu.eps, nicID)
 }
 
-// SetOption implements NetworkProtocol.SetOption.
+// SetOption implements stack.NetworkProtocol.
 func (p *protocol) SetOption(option tcpip.SettableNetworkProtocolOption) tcpip.Error {
 	switch v := option.(type) {
 	case *tcpip.DefaultTTLOption:
@@ -2069,7 +2100,7 @@ func (p *protocol) SetOption(option tcpip.SettableNetworkProtocolOption) tcpip.E
 	}
 }
 
-// Option implements NetworkProtocol.Option.
+// Option implements stack.NetworkProtocol.
 func (p *protocol) Option(option tcpip.GettableNetworkProtocolOption) tcpip.Error {
 	switch v := option.(type) {
 	case *tcpip.DefaultTTLOption:
@@ -2090,10 +2121,10 @@ func (p *protocol) DefaultTTL() uint8 {
 	return uint8(atomic.LoadUint32(&p.defaultTTL))
 }
 
-// Close implements stack.TransportProtocol.Close.
+// Close implements stack.TransportProtocol.
 func (*protocol) Close() {}
 
-// Wait implements stack.TransportProtocol.Wait.
+// Wait implements stack.TransportProtocol.
 func (*protocol) Wait() {}
 
 // parseAndValidate parses the packet (including its transport layer header) and
@@ -2127,7 +2158,7 @@ func (p *protocol) parseAndValidate(pkt *stack.PacketBuffer) (header.IPv6, bool)
 	return h, true
 }
 
-// Parse implements stack.NetworkProtocol.Parse.
+// Parse implements stack.NetworkProtocol.
 func (*protocol) Parse(pkt *stack.PacketBuffer) (proto tcpip.TransportProtocolNumber, hasTransportHdr bool, ok bool) {
 	proto, _, fragOffset, fragMore, ok := parse.IPv6(pkt)
 	if !ok {
@@ -2135,35 +2166,6 @@ func (*protocol) Parse(pkt *stack.PacketBuffer) (proto tcpip.TransportProtocolNu
 	}
 
 	return proto, !fragMore && fragOffset == 0, true
-}
-
-// Forwarding implements stack.ForwardingNetworkProtocol.
-func (p *protocol) Forwarding() bool {
-	return uint8(atomic.LoadUint32(&p.forwarding)) == 1
-}
-
-// setForwarding sets the forwarding status for the protocol.
-//
-// Returns true if the forwarding status was updated.
-func (p *protocol) setForwarding(v bool) bool {
-	if v {
-		return atomic.CompareAndSwapUint32(&p.forwarding, 0 /* old */, 1 /* new */)
-	}
-	return atomic.CompareAndSwapUint32(&p.forwarding, 1 /* old */, 0 /* new */)
-}
-
-// SetForwarding implements stack.ForwardingNetworkProtocol.
-func (p *protocol) SetForwarding(v bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if !p.setForwarding(v) {
-		return
-	}
-
-	for _, ep := range p.mu.eps {
-		ep.transitionForwarding(v)
-	}
 }
 
 // calculateNetworkMTU calculates the network-layer payload MTU based on the
@@ -2186,7 +2188,7 @@ func calculateNetworkMTU(linkMTU, networkHeadersLen uint32) (uint32, tcpip.Error
 		return 0, &tcpip.ErrMalformedHeader{}
 	}
 
-	networkMTU := linkMTU - uint32(networkHeadersLen)
+	networkMTU := linkMTU - networkHeadersLen
 	if networkMTU > maxPayloadSize {
 		networkMTU = maxPayloadSize
 	}
@@ -2205,7 +2207,7 @@ type Options struct {
 	// Note, setting this to true does not mean that a link-local address is
 	// assigned right away, or at all. If Duplicate Address Detection is enabled,
 	// an address is only assigned if it successfully resolves. If it fails, no
-	// further attempts are made to auto-generate a link-local adddress.
+	// further attempts are made to auto-generate a link-local address.
 	//
 	// The generated link-local address follows RFC 4291 Appendix A guidelines.
 	AutoGenLinkLocal bool
@@ -2221,7 +2223,7 @@ type Options struct {
 	// TempIIDSeed is used to seed the initial temporary interface identifier
 	// history value used to generate IIDs for temporary SLAAC addresses.
 	//
-	// Temporary SLAAC adresses are short-lived addresses which are unpredictable
+	// Temporary SLAAC addresses are short-lived addresses which are unpredictable
 	// and random from the perspective of other nodes on the network. It is
 	// recommended that the seed be a random byte buffer of at least
 	// header.IIDSize bytes to make sure that temporary SLAAC addresses are
