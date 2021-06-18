@@ -76,19 +76,9 @@ const (
 type UContext64 struct {
 	Flags    uint64
 	Link     uint64
-	Stack    SignalStack
+	Stack    linux.SignalStack
 	MContext SignalContext64
 	Sigset   linux.SignalSet
-}
-
-// NewSignalAct implements Context.NewSignalAct.
-func (c *context64) NewSignalAct() NativeSignalAct {
-	return &SignalAct{}
-}
-
-// NewSignalStack implements Context.NewSignalStack.
-func (c *context64) NewSignalStack() NativeSignalStack {
-	return &SignalStack{}
 }
 
 // From Linux 'arch/x86/include/uapi/asm/sigcontext.h' the following is the
@@ -110,7 +100,7 @@ func (c *context64) fpuFrameSize() (size int, useXsave bool) {
 
 // SignalSetup implements Context.SignalSetup. (Compare to Linux's
 // arch/x86/kernel/signal.c:__setup_rt_frame().)
-func (c *context64) SignalSetup(st *Stack, act *SignalAct, info *SignalInfo, alt *SignalStack, sigset linux.SignalSet) error {
+func (c *context64) SignalSetup(st *Stack, act *linux.SigAction, info *linux.SignalInfo, alt *linux.SignalStack, sigset linux.SignalSet) error {
 	sp := st.Bottom
 
 	// "The 128-byte area beyond the location pointed to by %rsp is considered
@@ -187,7 +177,7 @@ func (c *context64) SignalSetup(st *Stack, act *SignalAct, info *SignalInfo, alt
 	// Prior to proceeding, figure out if the frame will exhaust the range
 	// for the signal stack. This is not allowed, and should immediately
 	// force signal delivery (reverting to the default handler).
-	if act.IsOnStack() && alt.IsEnabled() && !alt.Contains(frameBottom) {
+	if act.Flags&linux.SA_ONSTACK != 0 && alt.IsEnabled() && !alt.Contains(frameBottom) {
 		return unix.EFAULT
 	}
 
@@ -203,7 +193,7 @@ func (c *context64) SignalSetup(st *Stack, act *SignalAct, info *SignalInfo, alt
 		return err
 	}
 	ucAddr := st.Bottom
-	if act.HasRestorer() {
+	if act.Flags&linux.SA_RESTORER != 0 {
 		// Push the restorer return address.
 		// Note that this doesn't need to be popped.
 		if _, err := primitive.CopyUint64Out(st, StackBottomMagic, act.Restorer); err != nil {
@@ -237,15 +227,15 @@ func (c *context64) SignalSetup(st *Stack, act *SignalAct, info *SignalInfo, alt
 
 // SignalRestore implements Context.SignalRestore. (Compare to Linux's
 // arch/x86/kernel/signal.c:sys_rt_sigreturn().)
-func (c *context64) SignalRestore(st *Stack, rt bool) (linux.SignalSet, SignalStack, error) {
+func (c *context64) SignalRestore(st *Stack, rt bool) (linux.SignalSet, linux.SignalStack, error) {
 	// Copy out the stack frame.
 	var uc UContext64
 	if _, err := uc.CopyIn(st, StackBottomMagic); err != nil {
-		return 0, SignalStack{}, err
+		return 0, linux.SignalStack{}, err
 	}
-	var info SignalInfo
+	var info linux.SignalInfo
 	if _, err := info.CopyIn(st, StackBottomMagic); err != nil {
-		return 0, SignalStack{}, err
+		return 0, linux.SignalStack{}, err
 	}
 
 	// Restore registers.

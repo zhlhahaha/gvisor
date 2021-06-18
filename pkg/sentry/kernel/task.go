@@ -22,7 +22,6 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/bpf"
 	"gvisor.dev/gvisor/pkg/hostarch"
-	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/fs"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
@@ -151,7 +150,7 @@ type Task struct {
 	// which the SA_ONSTACK flag is set.
 	//
 	// signalStack is exclusive to the task goroutine.
-	signalStack arch.SignalStack
+	signalStack linux.SignalStack
 
 	// signalQueue is a set of registered waiters for signal-related events.
 	//
@@ -395,7 +394,7 @@ type Task struct {
 	// ptraceSiginfo is analogous to Linux's task_struct::last_siginfo.
 	//
 	// ptraceSiginfo is protected by the TaskSet mutex.
-	ptraceSiginfo *arch.SignalInfo
+	ptraceSiginfo *linux.SignalInfo
 
 	// ptraceEventMsg is the value set by PTRACE_EVENT stops and returned to
 	// the tracer by ptrace(PTRACE_GETEVENTMSG).
@@ -853,15 +852,13 @@ func (t *Task) SetOOMScoreAdj(adj int32) error {
 	return nil
 }
 
-// UID returns t's uid.
-// TODO(gvisor.dev/issue/170): This method is not namespaced yet.
-func (t *Task) UID() uint32 {
+// KUID returns t's kuid.
+func (t *Task) KUID() uint32 {
 	return uint32(t.Credentials().EffectiveKUID)
 }
 
-// GID returns t's gid.
-// TODO(gvisor.dev/issue/170): This method is not namespaced yet.
-func (t *Task) GID() uint32 {
+// KGID returns t's kgid.
+func (t *Task) KGID() uint32 {
 	return uint32(t.Credentials().EffectiveKGID)
 }
 

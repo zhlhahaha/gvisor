@@ -36,6 +36,7 @@ import (
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/abi/linux/errno"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
@@ -289,7 +290,7 @@ const DefaultTTL = 64
 
 const sizeOfInt32 int = 4
 
-var errStackType = syserr.New("expected but did not receive a netstack.Stack", linux.EINVAL)
+var errStackType = syserr.New("expected but did not receive a netstack.Stack", errno.EINVAL)
 
 // commonEndpoint represents the intersection of a tcpip.Endpoint and a
 // transport.Endpoint.
@@ -2105,10 +2106,10 @@ func setSockOptIPv6(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name 
 			return syserr.ErrNoDevice
 		}
 		// Stack must be a netstack stack.
-		return netfilter.SetEntries(stack.(*Stack).Stack, optVal, true)
+		return netfilter.SetEntries(t, stack.(*Stack).Stack, optVal, true)
 
 	case linux.IP6T_SO_SET_ADD_COUNTERS:
-		// TODO(gvisor.dev/issue/170): Counter support.
+		log.Infof("IP6T_SO_SET_ADD_COUNTERS is not supported")
 		return nil
 
 	default:
@@ -2348,10 +2349,10 @@ func setSockOptIP(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name in
 			return syserr.ErrNoDevice
 		}
 		// Stack must be a netstack stack.
-		return netfilter.SetEntries(stack.(*Stack).Stack, optVal, false)
+		return netfilter.SetEntries(t, stack.(*Stack).Stack, optVal, false)
 
 	case linux.IPT_SO_SET_ADD_COUNTERS:
-		// TODO(gvisor.dev/issue/170): Counter support.
+		log.Infof("IPT_SO_SET_ADD_COUNTERS is not supported")
 		return nil
 
 	case linux.IP_ADD_SOURCE_MEMBERSHIP,

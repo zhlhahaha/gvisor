@@ -84,9 +84,9 @@ func Kill(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallC
 			if !mayKill(t, target, sig) {
 				return 0, nil, syserror.EPERM
 			}
-			info := &arch.SignalInfo{
+			info := &linux.SignalInfo{
 				Signo: int32(sig),
-				Code:  arch.SignalInfoUser,
+				Code:  linux.SI_USER,
 			}
 			info.SetPID(int32(target.PIDNamespace().IDOfTask(t)))
 			info.SetUID(int32(t.Credentials().RealKUID.In(target.UserNamespace()).OrOverflow()))
@@ -123,9 +123,9 @@ func Kill(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallC
 			// depend on the iteration order. We at least implement the
 			// semantics documented by the man page: "On success (at least
 			// one signal was sent), zero is returned."
-			info := &arch.SignalInfo{
+			info := &linux.SignalInfo{
 				Signo: int32(sig),
-				Code:  arch.SignalInfoUser,
+				Code:  linux.SI_USER,
 			}
 			info.SetPID(int32(tg.PIDNamespace().IDOfTask(t)))
 			info.SetUID(int32(t.Credentials().RealKUID.In(tg.Leader().UserNamespace()).OrOverflow()))
@@ -167,9 +167,9 @@ func Kill(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallC
 					continue
 				}
 
-				info := &arch.SignalInfo{
+				info := &linux.SignalInfo{
 					Signo: int32(sig),
-					Code:  arch.SignalInfoUser,
+					Code:  linux.SI_USER,
 				}
 				info.SetPID(int32(tg.PIDNamespace().IDOfTask(t)))
 				info.SetUID(int32(t.Credentials().RealKUID.In(tg.Leader().UserNamespace()).OrOverflow()))
@@ -184,10 +184,10 @@ func Kill(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallC
 	}
 }
 
-func tkillSigInfo(sender, receiver *kernel.Task, sig linux.Signal) *arch.SignalInfo {
-	info := &arch.SignalInfo{
+func tkillSigInfo(sender, receiver *kernel.Task, sig linux.Signal) *linux.SignalInfo {
+	info := &linux.SignalInfo{
 		Signo: int32(sig),
-		Code:  arch.SignalInfoTkill,
+		Code:  linux.SI_TKILL,
 	}
 	info.SetPID(int32(receiver.PIDNamespace().IDOfThreadGroup(sender.ThreadGroup())))
 	info.SetUID(int32(sender.Credentials().RealKUID.In(receiver.UserNamespace()).OrOverflow()))
@@ -251,20 +251,20 @@ func RtSigaction(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.S
 		return 0, nil, syserror.EINVAL
 	}
 
-	var newactptr *arch.SignalAct
+	var newactptr *linux.SigAction
 	if newactarg != 0 {
-		newact, err := t.CopyInSignalAct(newactarg)
-		if err != nil {
+		var newact linux.SigAction
+		if _, err := newact.CopyIn(t, newactarg); err != nil {
 			return 0, nil, err
 		}
 		newactptr = &newact
 	}
-	oldact, err := t.ThreadGroup().SetSignalAct(sig, newactptr)
+	oldact, err := t.ThreadGroup().SetSigAction(sig, newactptr)
 	if err != nil {
 		return 0, nil, err
 	}
 	if oldactarg != 0 {
-		if err := t.CopyOutSignalAct(oldactarg, &oldact); err != nil {
+		if _, err := oldact.CopyOut(t, oldactarg); err != nil {
 			return 0, nil, err
 		}
 	}
@@ -325,13 +325,12 @@ func Sigaltstack(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.S
 
 	alt := t.SignalStack()
 	if oldaddr != 0 {
-		if err := t.CopyOutSignalStack(oldaddr, &alt); err != nil {
+		if _, err := alt.CopyOut(t, oldaddr); err != nil {
 			return 0, nil, err
 		}
 	}
 	if setaddr != 0 {
-		alt, err := t.CopyInSignalStack(setaddr)
-		if err != nil {
+		if _, err := alt.CopyIn(t, setaddr); err != nil {
 			return 0, nil, err
 		}
 		// The signal stack cannot be changed if the task is currently
@@ -410,7 +409,7 @@ func RtSigqueueinfo(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kerne
 	// We must ensure that the Signo is set (Linux overrides this in the
 	// same way), and that the code is in the allowed set. This same logic
 	// appears below in RtSigtgqueueinfo and should be kept in sync.
-	var info arch.SignalInfo
+	var info linux.SignalInfo
 	if _, err := info.CopyIn(t, infoAddr); err != nil {
 		return 0, nil, err
 	}
@@ -426,7 +425,7 @@ func RtSigqueueinfo(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kerne
 
 		// If the sender is not the receiver, it can't use si_codes used by the
 		// kernel or SI_TKILL.
-		if (info.Code >= 0 || info.Code == arch.SignalInfoTkill) && target != t {
+		if (info.Code >= 0 || info.Code == linux.SI_TKILL) && target != t {
 			return 0, nil, syserror.EPERM
 		}
 
@@ -454,7 +453,7 @@ func RtTgsigqueueinfo(t *kernel.Task, args arch.SyscallArguments) (uintptr, *ker
 	}
 
 	// Copy in the info. See RtSigqueueinfo above.
-	var info arch.SignalInfo
+	var info linux.SignalInfo
 	if _, err := info.CopyIn(t, infoAddr); err != nil {
 		return 0, nil, err
 	}
@@ -469,7 +468,7 @@ func RtTgsigqueueinfo(t *kernel.Task, args arch.SyscallArguments) (uintptr, *ker
 
 	// If the sender is not the receiver, it can't use si_codes used by the
 	// kernel or SI_TKILL.
-	if (info.Code >= 0 || info.Code == arch.SignalInfoTkill) && target != t {
+	if (info.Code >= 0 || info.Code == linux.SI_TKILL) && target != t {
 		return 0, nil, syserror.EPERM
 	}
 

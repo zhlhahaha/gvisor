@@ -37,7 +37,6 @@ import (
 	"gvisor.dev/gvisor/pkg/rand"
 	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/refsvfs2"
-	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/sentry/fdimport"
 	"gvisor.dev/gvisor/pkg/sentry/fs"
@@ -279,19 +278,15 @@ func New(args Args) (*Loader, error) {
 	}
 
 	// Create timekeeper.
-	tk, err := kernel.NewTimekeeper(k, vdso.ParamPage.FileRange())
-	if err != nil {
-		return nil, fmt.Errorf("creating timekeeper: %w", err)
-	}
+	tk := kernel.NewTimekeeper(k, vdso.ParamPage.FileRange())
 	tk.SetClocks(time.NewCalibratedClocks())
-	k.SetTimekeeper(tk)
 
 	if err := enableStrace(args.Conf); err != nil {
 		return nil, fmt.Errorf("enabling strace: %w", err)
 	}
 
 	// Create root network namespace/stack.
-	netns, err := newRootNetworkNamespace(args.Conf, k, k)
+	netns, err := newRootNetworkNamespace(args.Conf, tk, k)
 	if err != nil {
 		return nil, fmt.Errorf("creating network: %w", err)
 	}
@@ -333,6 +328,7 @@ func New(args Args) (*Loader, error) {
 	// to createVFS in order to mount (among other things) procfs.
 	if err = k.Init(kernel.InitKernelArgs{
 		FeatureSet:                  cpuid.HostFeatureSet(),
+		Timekeeper:                  tk,
 		RootUserNamespace:           creds.UserNamespace,
 		RootNetworkNamespace:        netns,
 		ApplicationCores:            uint(args.NumCPU),
@@ -964,10 +960,15 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 		}
 		args.Envv = envv
 	}
+	args.PIDNamespace = tg.PIDNamespace()
+
+	args.Limits, err = createLimitSet(l.root.spec)
+	if err != nil {
+		return 0, fmt.Errorf("creating limits: %w", err)
+	}
 
 	// Start the process.
 	proc := control.Proc{Kernel: l.k}
-	args.PIDNamespace = tg.PIDNamespace()
 	newTG, tgid, ttyFile, ttyFileVFS2, err := control.ExecAsync(&proc, args)
 	if err != nil {
 		return 0, err
@@ -1221,7 +1222,7 @@ func (l *Loader) signalProcess(cid string, tgid kernel.ThreadID, signo int32) er
 	execTG, err := l.threadGroupFromID(execID{cid: cid, pid: tgid})
 	if err == nil {
 		// Send signal directly to the identified process.
-		return l.k.SendExternalSignalThreadGroup(execTG, &arch.SignalInfo{Signo: signo})
+		return l.k.SendExternalSignalThreadGroup(execTG, &linux.SignalInfo{Signo: signo})
 	}
 
 	// The caller may be signaling a process not started directly via exec.
@@ -1234,7 +1235,7 @@ func (l *Loader) signalProcess(cid string, tgid kernel.ThreadID, signo int32) er
 	if tg.Leader().ContainerID() != cid {
 		return fmt.Errorf("process %d belongs to a different container: %q", tgid, tg.Leader().ContainerID())
 	}
-	return l.k.SendExternalSignalThreadGroup(tg, &arch.SignalInfo{Signo: signo})
+	return l.k.SendExternalSignalThreadGroup(tg, &linux.SignalInfo{Signo: signo})
 }
 
 // signalForegrondProcessGroup looks up foreground process group from the TTY
@@ -1270,7 +1271,7 @@ func (l *Loader) signalForegrondProcessGroup(cid string, tgid kernel.ThreadID, s
 		// No foreground process group has been set. Signal the
 		// original thread group.
 		log.Warningf("No foreground process group for container %q and PID %d. Sending signal directly to PID %d.", cid, tgid, tgid)
-		return l.k.SendExternalSignalThreadGroup(tg, &arch.SignalInfo{Signo: signo})
+		return l.k.SendExternalSignalThreadGroup(tg, &linux.SignalInfo{Signo: signo})
 	}
 	// Send the signal to all processes in the process group.
 	var lastErr error
@@ -1278,7 +1279,7 @@ func (l *Loader) signalForegrondProcessGroup(cid string, tgid kernel.ThreadID, s
 		if tg.ProcessGroup() != pg {
 			continue
 		}
-		if err := l.k.SendExternalSignalThreadGroup(tg, &arch.SignalInfo{Signo: signo}); err != nil {
+		if err := l.k.SendExternalSignalThreadGroup(tg, &linux.SignalInfo{Signo: signo}); err != nil {
 			lastErr = err
 		}
 	}
@@ -1293,7 +1294,7 @@ func (l *Loader) signalAllProcesses(cid string, signo int32) error {
 	// sent to the entire container.
 	l.k.Pause()
 	defer l.k.Unpause()
-	return l.k.SendContainerSignal(cid, &arch.SignalInfo{Signo: signo})
+	return l.k.SendContainerSignal(cid, &linux.SignalInfo{Signo: signo})
 }
 
 // threadGroupFromID is similar to tryThreadGroupFromIDLocked except that it

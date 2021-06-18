@@ -20,6 +20,7 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/abi/linux"
 )
 
 // maxRegisterSize is the maximum register size used in memcpy and memclr. It
@@ -342,12 +343,7 @@ func errorFromFaultSignal(addr uintptr, sig int32) error {
 // handler however, and if this is function is being used externally then the
 // same courtesy is expected.
 func ReplaceSignalHandler(sig unix.Signal, handler uintptr, previous *uintptr) error {
-	var sa struct {
-		handler  uintptr
-		flags    uint64
-		restorer uintptr
-		mask     uint64
-	}
+	var sa linux.SigAction
 	const maskLen = 8
 
 	// Get the existing signal handler information, and save the current
@@ -358,14 +354,14 @@ func ReplaceSignalHandler(sig unix.Signal, handler uintptr, previous *uintptr) e
 	}
 
 	// Fail if there isn't a previous handler.
-	if sa.handler == 0 {
+	if sa.Handler == 0 {
 		return fmt.Errorf("previous handler for signal %x isn't set", sig)
 	}
 
-	*previous = sa.handler
+	*previous = uintptr(sa.Handler)
 
 	// Install our own handler.
-	sa.handler = handler
+	sa.Handler = uint64(handler)
 	if _, _, e := unix.RawSyscall6(unix.SYS_RT_SIGACTION, uintptr(sig), uintptr(unsafe.Pointer(&sa)), 0, maskLen, 0, 0); e != 0 {
 		return e
 	}

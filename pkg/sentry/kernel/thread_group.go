@@ -19,7 +19,6 @@ import (
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
-	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/fs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
@@ -279,7 +278,7 @@ func (k *Kernel) NewThreadGroup(mntns *fs.MountNamespace, pidns *PIDNamespace, s
 		limits:            limits,
 		mounts:            mntns,
 	}
-	tg.itimerRealTimer = ktime.NewTimer(k.monotonicClock, &itimerRealListener{tg: tg})
+	tg.itimerRealTimer = ktime.NewTimer(k.timekeeper.monotonicClock, &itimerRealListener{tg: tg})
 	tg.timers = make(map[linux.TimerID]*IntervalTimer)
 	tg.oldRSeqCritical.Store(&OldRSeqCriticalRegion{})
 	return tg
@@ -446,10 +445,10 @@ func (tg *ThreadGroup) ReleaseControllingTTY(tty *TTY) error {
 			othertg.signalHandlers.mu.Lock()
 			othertg.tty = nil
 			if othertg.processGroup == tg.processGroup.session.foreground {
-				if err := othertg.leader.sendSignalLocked(&arch.SignalInfo{Signo: int32(linux.SIGHUP)}, true /* group */); err != nil {
+				if err := othertg.leader.sendSignalLocked(&linux.SignalInfo{Signo: int32(linux.SIGHUP)}, true /* group */); err != nil {
 					lastErr = err
 				}
-				if err := othertg.leader.sendSignalLocked(&arch.SignalInfo{Signo: int32(linux.SIGCONT)}, true /* group */); err != nil {
+				if err := othertg.leader.sendSignalLocked(&linux.SignalInfo{Signo: int32(linux.SIGCONT)}, true /* group */); err != nil {
 					lastErr = err
 				}
 			}
@@ -490,10 +489,10 @@ func (tg *ThreadGroup) SetForegroundProcessGroup(tty *TTY, pgid ProcessGroupID) 
 	tg.signalHandlers.mu.Lock()
 	defer tg.signalHandlers.mu.Unlock()
 
-	// TODO(b/129283598): "If tcsetpgrp() is called by a member of a
-	// background process group in its session, and the calling process is
-	// not blocking or ignoring SIGTTOU, a SIGTTOU signal is sent to all
-	// members of this background process group."
+	// TODO(gvisor.dev/issue/6148): "If tcsetpgrp() is called by a member of a
+	// background process group in its session, and the calling process is not
+	// blocking or ignoring SIGTTOU, a SIGTTOU signal is sent to all members of
+	// this background process group."
 
 	// tty must be the controlling terminal.
 	if tg.tty != tty {

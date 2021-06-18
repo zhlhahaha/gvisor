@@ -74,6 +74,105 @@ func (b *BPFInstruction) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(3, &b.K)
 }
 
+func (s *SigAction) StateTypeName() string {
+	return "pkg/abi/linux.SigAction"
+}
+
+func (s *SigAction) StateFields() []string {
+	return []string{
+		"Handler",
+		"Flags",
+		"Restorer",
+		"Mask",
+	}
+}
+
+func (s *SigAction) beforeSave() {}
+
+// +checklocksignore
+func (s *SigAction) StateSave(stateSinkObject state.Sink) {
+	s.beforeSave()
+	stateSinkObject.Save(0, &s.Handler)
+	stateSinkObject.Save(1, &s.Flags)
+	stateSinkObject.Save(2, &s.Restorer)
+	stateSinkObject.Save(3, &s.Mask)
+}
+
+func (s *SigAction) afterLoad() {}
+
+// +checklocksignore
+func (s *SigAction) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &s.Handler)
+	stateSourceObject.Load(1, &s.Flags)
+	stateSourceObject.Load(2, &s.Restorer)
+	stateSourceObject.Load(3, &s.Mask)
+}
+
+func (s *SignalStack) StateTypeName() string {
+	return "pkg/abi/linux.SignalStack"
+}
+
+func (s *SignalStack) StateFields() []string {
+	return []string{
+		"Addr",
+		"Flags",
+		"Size",
+	}
+}
+
+func (s *SignalStack) beforeSave() {}
+
+// +checklocksignore
+func (s *SignalStack) StateSave(stateSinkObject state.Sink) {
+	s.beforeSave()
+	stateSinkObject.Save(0, &s.Addr)
+	stateSinkObject.Save(1, &s.Flags)
+	stateSinkObject.Save(2, &s.Size)
+}
+
+func (s *SignalStack) afterLoad() {}
+
+// +checklocksignore
+func (s *SignalStack) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &s.Addr)
+	stateSourceObject.Load(1, &s.Flags)
+	stateSourceObject.Load(2, &s.Size)
+}
+
+func (s *SignalInfo) StateTypeName() string {
+	return "pkg/abi/linux.SignalInfo"
+}
+
+func (s *SignalInfo) StateFields() []string {
+	return []string{
+		"Signo",
+		"Errno",
+		"Code",
+		"Fields",
+	}
+}
+
+func (s *SignalInfo) beforeSave() {}
+
+// +checklocksignore
+func (s *SignalInfo) StateSave(stateSinkObject state.Sink) {
+	s.beforeSave()
+	stateSinkObject.Save(0, &s.Signo)
+	stateSinkObject.Save(1, &s.Errno)
+	stateSinkObject.Save(2, &s.Code)
+	stateSinkObject.Save(3, &s.Fields)
+}
+
+func (s *SignalInfo) afterLoad() {}
+
+// +checklocksignore
+func (s *SignalInfo) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &s.Signo)
+	stateSourceObject.Load(1, &s.Errno)
+	stateSourceObject.Load(2, &s.Code)
+	stateSourceObject.Load(3, &s.Fields)
+}
+
 func (c *ControlMessageIPPacketInfo) StateTypeName() string {
 	return "pkg/abi/linux.ControlMessageIPPacketInfo"
 }
@@ -182,6 +281,9 @@ func (w *WindowSize) StateLoad(stateSourceObject state.Source) {
 func init() {
 	state.Register((*IOEvent)(nil))
 	state.Register((*BPFInstruction)(nil))
+	state.Register((*SigAction)(nil))
+	state.Register((*SignalStack)(nil))
+	state.Register((*SignalInfo)(nil))
 	state.Register((*ControlMessageIPPacketInfo)(nil))
 	state.Register((*KernelTermios)(nil))
 	state.Register((*WindowSize)(nil))
