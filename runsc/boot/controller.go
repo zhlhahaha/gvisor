@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	gtime "time"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
@@ -165,8 +166,11 @@ func newController(fd int, l *Loader) (*controller, error) {
 	return ctrl, nil
 }
 
+// stopRPCTimeout is the time for clients to complete ongoing RPCs.
+const stopRPCTimeout = 15 * gtime.Second
+
 func (c *controller) stop() {
-	c.srv.Stop()
+	c.srv.Stop(stopRPCTimeout)
 }
 
 // containerManager manages sandbox containers.
@@ -330,6 +334,11 @@ func (cm *containerManager) ExecuteAsync(args *control.ExecArgs, pid *int32) err
 // Checkpoint pauses a sandbox and saves its state.
 func (cm *containerManager) Checkpoint(o *control.SaveOpts, _ *struct{}) error {
 	log.Debugf("containerManager.Checkpoint")
+	// TODO(gvisor.dev/issues/6243): save/restore not supported w/ hostinet
+	if cm.l.root.conf.Network == config.NetworkHost {
+		return errors.New("checkpoint not supported when using hostinet")
+	}
+
 	state := control.State{
 		Kernel:   cm.l.k,
 		Watchdog: cm.l.watchdog,
@@ -340,6 +349,10 @@ func (cm *containerManager) Checkpoint(o *control.SaveOpts, _ *struct{}) error {
 // Pause suspends a container.
 func (cm *containerManager) Pause(_, _ *struct{}) error {
 	log.Debugf("containerManager.Pause")
+	// TODO(gvisor.dev/issues/6243): save/restore not supported w/ hostinet
+	if cm.l.root.conf.Network == config.NetworkHost {
+		return errors.New("pause not supported when using hostinet")
+	}
 	cm.l.k.Pause()
 	return nil
 }
